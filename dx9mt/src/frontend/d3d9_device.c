@@ -22,6 +22,18 @@
 #define DX9MT_MAX_SHADER_INT_CONSTANTS 16
 #define DX9MT_MAX_SHADER_BOOL_CONSTANTS 16
 
+static WINBOOL dx9mt_should_log_method_sample(LONG *counter, LONG first_n,
+                                              LONG every_n) {
+  LONG count = InterlockedIncrement(counter);
+  if (count <= first_n) {
+    return TRUE;
+  }
+  if (every_n > 0 && (count % every_n) == 0) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
 typedef struct dx9mt_device dx9mt_device;
 typedef struct dx9mt_surface dx9mt_surface;
 typedef struct dx9mt_swapchain dx9mt_swapchain;
@@ -31,6 +43,7 @@ typedef struct dx9mt_vertex_decl dx9mt_vertex_decl;
 typedef struct dx9mt_vertex_shader dx9mt_vertex_shader;
 typedef struct dx9mt_pixel_shader dx9mt_pixel_shader;
 typedef struct dx9mt_texture dx9mt_texture;
+typedef struct dx9mt_cube_texture dx9mt_cube_texture;
 typedef struct dx9mt_query dx9mt_query;
 
 struct dx9mt_surface {
@@ -102,6 +115,20 @@ struct dx9mt_texture {
   D3DPOOL pool;
   UINT width;
   UINT height;
+  UINT levels;
+  DWORD lod;
+  D3DTEXTUREFILTERTYPE autogen_filter;
+  IDirect3DSurface9 **surfaces;
+};
+
+struct dx9mt_cube_texture {
+  IDirect3DCubeTexture9 iface;
+  LONG refcount;
+  dx9mt_device *device;
+  DWORD usage;
+  D3DFORMAT format;
+  D3DPOOL pool;
+  UINT edge_length;
   UINT levels;
   DWORD lod;
   D3DTEXTUREFILTERTYPE autogen_filter;
@@ -208,6 +235,11 @@ static dx9mt_pixel_shader *dx9mt_pshader_from_iface(IDirect3DPixelShader9 *iface
 
 static dx9mt_texture *dx9mt_texture_from_iface(IDirect3DTexture9 *iface) {
   return (dx9mt_texture *)iface;
+}
+
+static dx9mt_cube_texture *dx9mt_cube_texture_from_iface(
+    IDirect3DCubeTexture9 *iface) {
+  return (dx9mt_cube_texture *)iface;
 }
 
 static dx9mt_query *dx9mt_query_from_iface(IDirect3DQuery9 *iface) {
@@ -1303,6 +1335,372 @@ static HRESULT WINAPI dx9mt_texture_AddDirtyRect(IDirect3DTexture9 *iface,
                                                   const RECT *dirty_rect) {
   (void)iface;
   (void)dirty_rect;
+  return D3D_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* IDirect3DCubeTexture9                                                      */
+/* -------------------------------------------------------------------------- */
+
+static HRESULT WINAPI dx9mt_cube_texture_QueryInterface(
+    IDirect3DCubeTexture9 *iface, REFIID riid, void **ppv_object);
+static ULONG WINAPI dx9mt_cube_texture_AddRef(IDirect3DCubeTexture9 *iface);
+static ULONG WINAPI dx9mt_cube_texture_Release(IDirect3DCubeTexture9 *iface);
+static HRESULT WINAPI dx9mt_cube_texture_GetDevice(
+    IDirect3DCubeTexture9 *iface, IDirect3DDevice9 **pp_device);
+static HRESULT WINAPI dx9mt_cube_texture_SetPrivateData(
+    IDirect3DCubeTexture9 *iface, REFGUID guid, const void *data,
+    DWORD data_size, DWORD flags);
+static HRESULT WINAPI dx9mt_cube_texture_GetPrivateData(
+    IDirect3DCubeTexture9 *iface, REFGUID guid, void *data, DWORD *data_size);
+static HRESULT WINAPI dx9mt_cube_texture_FreePrivateData(
+    IDirect3DCubeTexture9 *iface, REFGUID guid);
+static DWORD WINAPI dx9mt_cube_texture_SetPriority(IDirect3DCubeTexture9 *iface,
+                                                   DWORD priority_new);
+static DWORD WINAPI dx9mt_cube_texture_GetPriority(IDirect3DCubeTexture9 *iface);
+static void WINAPI dx9mt_cube_texture_PreLoad(IDirect3DCubeTexture9 *iface);
+static D3DRESOURCETYPE WINAPI dx9mt_cube_texture_GetType(
+    IDirect3DCubeTexture9 *iface);
+static DWORD WINAPI dx9mt_cube_texture_SetLOD(IDirect3DCubeTexture9 *iface,
+                                              DWORD lod_new);
+static DWORD WINAPI dx9mt_cube_texture_GetLOD(IDirect3DCubeTexture9 *iface);
+static DWORD WINAPI dx9mt_cube_texture_GetLevelCount(
+    IDirect3DCubeTexture9 *iface);
+static HRESULT WINAPI dx9mt_cube_texture_SetAutoGenFilterType(
+    IDirect3DCubeTexture9 *iface, D3DTEXTUREFILTERTYPE filter_type);
+static D3DTEXTUREFILTERTYPE WINAPI dx9mt_cube_texture_GetAutoGenFilterType(
+    IDirect3DCubeTexture9 *iface);
+static void WINAPI dx9mt_cube_texture_GenerateMipSubLevels(
+    IDirect3DCubeTexture9 *iface);
+static HRESULT WINAPI dx9mt_cube_texture_GetLevelDesc(
+    IDirect3DCubeTexture9 *iface, UINT level, D3DSURFACE_DESC *desc);
+static HRESULT WINAPI dx9mt_cube_texture_GetCubeMapSurface(
+    IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type, UINT level,
+    IDirect3DSurface9 **surface);
+static HRESULT WINAPI dx9mt_cube_texture_LockRect(
+    IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type, UINT level,
+    D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags);
+static HRESULT WINAPI dx9mt_cube_texture_UnlockRect(
+    IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type, UINT level);
+static HRESULT WINAPI dx9mt_cube_texture_AddDirtyRect(
+    IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type,
+    const RECT *dirty_rect);
+
+static IDirect3DCubeTexture9Vtbl g_dx9mt_cube_texture_vtbl = {
+    dx9mt_cube_texture_QueryInterface,
+    dx9mt_cube_texture_AddRef,
+    dx9mt_cube_texture_Release,
+    dx9mt_cube_texture_GetDevice,
+    dx9mt_cube_texture_SetPrivateData,
+    dx9mt_cube_texture_GetPrivateData,
+    dx9mt_cube_texture_FreePrivateData,
+    dx9mt_cube_texture_SetPriority,
+    dx9mt_cube_texture_GetPriority,
+    dx9mt_cube_texture_PreLoad,
+    dx9mt_cube_texture_GetType,
+    dx9mt_cube_texture_SetLOD,
+    dx9mt_cube_texture_GetLOD,
+    dx9mt_cube_texture_GetLevelCount,
+    dx9mt_cube_texture_SetAutoGenFilterType,
+    dx9mt_cube_texture_GetAutoGenFilterType,
+    dx9mt_cube_texture_GenerateMipSubLevels,
+    dx9mt_cube_texture_GetLevelDesc,
+    dx9mt_cube_texture_GetCubeMapSurface,
+    dx9mt_cube_texture_LockRect,
+    dx9mt_cube_texture_UnlockRect,
+    dx9mt_cube_texture_AddDirtyRect,
+};
+
+static WINBOOL dx9mt_cube_face_valid(D3DCUBEMAP_FACES face_type) {
+  return face_type >= D3DCUBEMAP_FACE_POSITIVE_X &&
+         face_type <= D3DCUBEMAP_FACE_NEGATIVE_Z;
+}
+
+static UINT dx9mt_cube_surface_index(UINT levels, D3DCUBEMAP_FACES face_type,
+                                     UINT level) {
+  return ((UINT)face_type * levels) + level;
+}
+
+static HRESULT dx9mt_cube_texture_create(dx9mt_device *device, UINT edge_length,
+                                         UINT levels, DWORD usage,
+                                         D3DFORMAT format, D3DPOOL pool,
+                                         IDirect3DCubeTexture9 **out_cube) {
+  dx9mt_cube_texture *cube;
+  UINT face;
+  UINT level;
+  UINT level_edge;
+  WINBOOL lockable;
+
+  if (!out_cube || edge_length == 0) {
+    return D3DERR_INVALIDCALL;
+  }
+  *out_cube = NULL;
+
+  if (levels == 0) {
+    levels = 1;
+  }
+
+  cube = (dx9mt_cube_texture *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                         sizeof(dx9mt_cube_texture));
+  if (!cube) {
+    return E_OUTOFMEMORY;
+  }
+
+  cube->surfaces = (IDirect3DSurface9 **)HeapAlloc(
+      GetProcessHeap(), HEAP_ZERO_MEMORY,
+      (SIZE_T)(levels * 6) * sizeof(IDirect3DSurface9 *));
+  if (!cube->surfaces) {
+    HeapFree(GetProcessHeap(), 0, cube);
+    return E_OUTOFMEMORY;
+  }
+
+  cube->iface.lpVtbl = &g_dx9mt_cube_texture_vtbl;
+  cube->refcount = 1;
+  cube->device = device;
+  cube->usage = usage;
+  cube->format = format;
+  cube->pool = pool;
+  cube->edge_length = edge_length;
+  cube->levels = levels;
+  cube->autogen_filter = D3DTEXF_LINEAR;
+
+  lockable = ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) == 0);
+
+  for (face = 0; face < 6; ++face) {
+    level_edge = edge_length;
+    for (level = 0; level < levels; ++level) {
+      UINT index = dx9mt_cube_surface_index(levels, (D3DCUBEMAP_FACES)face, level);
+      HRESULT hr = dx9mt_surface_create(
+          device, level_edge, level_edge, format, pool, usage,
+          D3DMULTISAMPLE_NONE, 0, lockable, (IUnknown *)&cube->iface,
+          &cube->surfaces[index]);
+      if (FAILED(hr)) {
+        UINT cleanup;
+        for (cleanup = 0; cleanup < (levels * 6); ++cleanup) {
+          if (cube->surfaces[cleanup]) {
+            IDirect3DSurface9_Release(cube->surfaces[cleanup]);
+          }
+        }
+        HeapFree(GetProcessHeap(), 0, cube->surfaces);
+        HeapFree(GetProcessHeap(), 0, cube);
+        return hr;
+      }
+
+      if (level_edge > 1) {
+        level_edge /= 2;
+      }
+    }
+  }
+
+  *out_cube = &cube->iface;
+  return D3D_OK;
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_QueryInterface(
+    IDirect3DCubeTexture9 *iface, REFIID riid, void **ppv_object) {
+  if (!ppv_object) {
+    return E_POINTER;
+  }
+
+  if (IsEqualGUID(riid, &IID_IUnknown) ||
+      IsEqualGUID(riid, &IID_IDirect3DResource9) ||
+      IsEqualGUID(riid, &IID_IDirect3DBaseTexture9) ||
+      IsEqualGUID(riid, &IID_IDirect3DCubeTexture9)) {
+    *ppv_object = iface;
+    dx9mt_cube_texture_AddRef(iface);
+    return S_OK;
+  }
+
+  *ppv_object = NULL;
+  return E_NOINTERFACE;
+}
+
+static ULONG WINAPI dx9mt_cube_texture_AddRef(IDirect3DCubeTexture9 *iface) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  return (ULONG)InterlockedIncrement(&self->refcount);
+}
+
+static ULONG WINAPI dx9mt_cube_texture_Release(IDirect3DCubeTexture9 *iface) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  LONG refcount = InterlockedDecrement(&self->refcount);
+  UINT i;
+
+  if (refcount == 0) {
+    for (i = 0; i < (self->levels * 6); ++i) {
+      if (self->surfaces[i]) {
+        dx9mt_surface *surface = dx9mt_surface_from_iface(self->surfaces[i]);
+        surface->container = NULL;
+        IDirect3DSurface9_Release(self->surfaces[i]);
+      }
+    }
+    HeapFree(GetProcessHeap(), 0, self->surfaces);
+    HeapFree(GetProcessHeap(), 0, self);
+  }
+
+  return (ULONG)refcount;
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_GetDevice(
+    IDirect3DCubeTexture9 *iface, IDirect3DDevice9 **pp_device) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  if (!pp_device) {
+    return D3DERR_INVALIDCALL;
+  }
+
+  *pp_device = self->device ? &self->device->iface : NULL;
+  if (*pp_device) {
+    IDirect3DDevice9_AddRef(*pp_device);
+  }
+  return D3D_OK;
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_SetPrivateData(
+    IDirect3DCubeTexture9 *iface, REFGUID guid, const void *data,
+    DWORD data_size, DWORD flags) {
+  (void)iface;
+  (void)guid;
+  (void)data;
+  (void)data_size;
+  (void)flags;
+  return D3D_OK;
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_GetPrivateData(
+    IDirect3DCubeTexture9 *iface, REFGUID guid, void *data, DWORD *data_size) {
+  (void)iface;
+  (void)guid;
+  (void)data;
+  (void)data_size;
+  return D3DERR_NOTFOUND;
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_FreePrivateData(
+    IDirect3DCubeTexture9 *iface, REFGUID guid) {
+  (void)iface;
+  (void)guid;
+  return D3D_OK;
+}
+
+static DWORD WINAPI dx9mt_cube_texture_SetPriority(IDirect3DCubeTexture9 *iface,
+                                                   DWORD priority_new) {
+  (void)iface;
+  (void)priority_new;
+  return 0;
+}
+
+static DWORD WINAPI dx9mt_cube_texture_GetPriority(IDirect3DCubeTexture9 *iface) {
+  (void)iface;
+  return 0;
+}
+
+static void WINAPI dx9mt_cube_texture_PreLoad(IDirect3DCubeTexture9 *iface) {
+  (void)iface;
+}
+
+static D3DRESOURCETYPE WINAPI dx9mt_cube_texture_GetType(
+    IDirect3DCubeTexture9 *iface) {
+  (void)iface;
+  return D3DRTYPE_CUBETEXTURE;
+}
+
+static DWORD WINAPI dx9mt_cube_texture_SetLOD(IDirect3DCubeTexture9 *iface,
+                                              DWORD lod_new) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  DWORD old_lod = self->lod;
+  if (lod_new < self->levels) {
+    self->lod = lod_new;
+  }
+  return old_lod;
+}
+
+static DWORD WINAPI dx9mt_cube_texture_GetLOD(IDirect3DCubeTexture9 *iface) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  return self->lod;
+}
+
+static DWORD WINAPI dx9mt_cube_texture_GetLevelCount(
+    IDirect3DCubeTexture9 *iface) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  return self->levels;
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_SetAutoGenFilterType(
+    IDirect3DCubeTexture9 *iface, D3DTEXTUREFILTERTYPE filter_type) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  self->autogen_filter = filter_type;
+  return D3D_OK;
+}
+
+static D3DTEXTUREFILTERTYPE WINAPI dx9mt_cube_texture_GetAutoGenFilterType(
+    IDirect3DCubeTexture9 *iface) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  return self->autogen_filter;
+}
+
+static void WINAPI dx9mt_cube_texture_GenerateMipSubLevels(
+    IDirect3DCubeTexture9 *iface) {
+  (void)iface;
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_GetLevelDesc(
+    IDirect3DCubeTexture9 *iface, UINT level, D3DSURFACE_DESC *desc) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  if (!desc || level >= self->levels) {
+    return D3DERR_INVALIDCALL;
+  }
+  return IDirect3DSurface9_GetDesc(
+      self->surfaces[dx9mt_cube_surface_index(self->levels,
+                                              D3DCUBEMAP_FACE_POSITIVE_X,
+                                              level)],
+      desc);
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_GetCubeMapSurface(
+    IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type, UINT level,
+    IDirect3DSurface9 **surface) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  UINT index;
+
+  if (!surface || !dx9mt_cube_face_valid(face_type) || level >= self->levels) {
+    return D3DERR_INVALIDCALL;
+  }
+
+  index = dx9mt_cube_surface_index(self->levels, face_type, level);
+  *surface = self->surfaces[index];
+  IDirect3DSurface9_AddRef(*surface);
+  return D3D_OK;
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_LockRect(
+    IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type, UINT level,
+    D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  if (!dx9mt_cube_face_valid(face_type) || level >= self->levels) {
+    return D3DERR_INVALIDCALL;
+  }
+  return IDirect3DSurface9_LockRect(
+      self->surfaces[dx9mt_cube_surface_index(self->levels, face_type, level)],
+      locked_rect, rect, flags);
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_UnlockRect(
+    IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type, UINT level) {
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  if (!dx9mt_cube_face_valid(face_type) || level >= self->levels) {
+    return D3DERR_INVALIDCALL;
+  }
+  return IDirect3DSurface9_UnlockRect(
+      self->surfaces[dx9mt_cube_surface_index(self->levels, face_type, level)]);
+}
+
+static HRESULT WINAPI dx9mt_cube_texture_AddDirtyRect(
+    IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type,
+    const RECT *dirty_rect) {
+  (void)iface;
+  (void)dirty_rect;
+  if (!dx9mt_cube_face_valid(face_type)) {
+    return D3DERR_INVALIDCALL;
+  }
   return D3D_OK;
 }
 
@@ -2957,17 +3355,17 @@ static HRESULT WINAPI dx9mt_device_CreateVolumeTexture(
     IDirect3DDevice9 *iface, UINT width, UINT height, UINT depth, UINT levels,
     DWORD usage, D3DFORMAT format, D3DPOOL pool,
     IDirect3DVolumeTexture9 **volume_texture, HANDLE *shared_handle) {
+  static LONG log_counter = 0;
   (void)iface;
-  (void)width;
-  (void)height;
-  (void)depth;
-  (void)levels;
-  (void)usage;
-  (void)format;
-  (void)pool;
   (void)shared_handle;
   if (volume_texture) {
     *volume_texture = NULL;
+  }
+  if (dx9mt_should_log_method_sample(&log_counter, 4, 128)) {
+    dx9mt_logf("device",
+               "CreateVolumeTexture unsupported width=%u height=%u depth=%u levels=%u usage=0x%08x fmt=%u pool=%u -> NOTAVAILABLE",
+               width, height, depth, levels, (unsigned)usage, (unsigned)format,
+               (unsigned)pool);
   }
   return D3DERR_NOTAVAILABLE;
 }
@@ -2976,17 +3374,24 @@ static HRESULT WINAPI dx9mt_device_CreateCubeTexture(
     IDirect3DDevice9 *iface, UINT edge_length, UINT levels, DWORD usage,
     D3DFORMAT format, D3DPOOL pool, IDirect3DCubeTexture9 **cube_texture,
     HANDLE *shared_handle) {
-  (void)iface;
-  (void)edge_length;
-  (void)levels;
-  (void)usage;
-  (void)format;
-  (void)pool;
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
+  static LONG log_counter = 0;
   (void)shared_handle;
-  if (cube_texture) {
-    *cube_texture = NULL;
+  if (!cube_texture) {
+    return D3DERR_INVALIDCALL;
   }
-  return D3DERR_NOTAVAILABLE;
+
+  hr = dx9mt_cube_texture_create(self, edge_length, levels, usage, format, pool,
+                                 cube_texture);
+
+  if (dx9mt_should_log_method_sample(&log_counter, 4, 128)) {
+    dx9mt_logf("device",
+               "CreateCubeTexture edge=%u levels=%u usage=0x%08x fmt=%u pool=%u -> hr=0x%08x",
+               edge_length, levels, (unsigned)usage, (unsigned)format,
+               (unsigned)pool, (unsigned)hr);
+  }
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateVertexBuffer(
@@ -3266,13 +3671,23 @@ static HRESULT WINAPI dx9mt_device_Clear(IDirect3DDevice9 *iface,
                                           const D3DRECT *rects, DWORD flags,
                                           D3DCOLOR color, float z,
                                           DWORD stencil) {
-  (void)iface;
-  (void)rect_count;
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  dx9mt_packet_clear packet;
+
   (void)rects;
-  (void)flags;
-  (void)color;
-  (void)z;
-  (void)stencil;
+
+  memset(&packet, 0, sizeof(packet));
+  packet.header.type = DX9MT_PACKET_CLEAR;
+  packet.header.size = (uint16_t)sizeof(packet);
+  packet.header.sequence = self->frame_id + 1;
+  packet.frame_id = self->frame_id;
+  packet.rect_count = rect_count;
+  packet.flags = flags;
+  packet.color = color;
+  packet.z = z;
+  packet.stencil = stencil;
+
+  dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
   return D3D_OK;
 }
 
@@ -3508,10 +3923,14 @@ static HRESULT WINAPI dx9mt_device_DrawPrimitive(IDirect3DDevice9 *iface,
                                                   D3DPRIMITIVETYPE primitive_type,
                                                   UINT start_vertex,
                                                   UINT primitive_count) {
+  static LONG log_counter = 0;
   (void)iface;
-  (void)primitive_type;
-  (void)start_vertex;
-  (void)primitive_count;
+
+  if (dx9mt_should_log_method_sample(&log_counter, 4, 256)) {
+    dx9mt_logf("device",
+               "DrawPrimitive stub primitive_type=%u start_vertex=%u primitive_count=%u",
+               (unsigned)primitive_type, start_vertex, primitive_count);
+  }
   return D3D_OK;
 }
 

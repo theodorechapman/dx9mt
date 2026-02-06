@@ -12,6 +12,7 @@ enum dx9mt_packet_type {
   DX9MT_PACKET_DRAW_INDEXED = 3,
   DX9MT_PACKET_PRESENT = 4,
   DX9MT_PACKET_SHUTDOWN = 5,
+  DX9MT_PACKET_CLEAR = 6,
 };
 
 typedef struct dx9mt_packet_header {
@@ -50,5 +51,15 @@ typedef struct dx9mt_packet_present {
   uint32_t frame_id;
   uint32_t flags;
 } dx9mt_packet_present;
+
+typedef struct dx9mt_packet_clear {
+  dx9mt_packet_header header;
+  uint32_t frame_id;
+  uint32_t rect_count;
+  uint32_t flags;
+  uint32_t color;
+  float z;
+  uint32_t stencil;
+} dx9mt_packet_clear;
 
 #endif

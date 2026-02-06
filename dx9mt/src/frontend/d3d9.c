@@ -3,6 +3,7 @@
 #define INITGUID
 #include <d3d9.h>
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "dx9mt/d3d9_device.h"
@@ -78,6 +79,44 @@ static const IDirect3D9Vtbl g_dx9mt_d3d9_vtbl = {
     dx9mt_d3d9_GetAdapterMonitor,
     dx9mt_d3d9_CreateDevice,
 };
+
+static int g_trace_probe_logs = -1;
+
+static WINBOOL dx9mt_trace_probe_logs_enabled(void) {
+  const char *value;
+
+  if (g_trace_probe_logs >= 0) {
+    return g_trace_probe_logs ? TRUE : FALSE;
+  }
+
+  value = getenv("DX9MT_TRACE_PROBES");
+  if (!value || !*value || strcmp(value, "0") == 0 ||
+      strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0) {
+    g_trace_probe_logs = 0;
+  } else {
+    g_trace_probe_logs = 1;
+  }
+
+  return g_trace_probe_logs ? TRUE : FALSE;
+}
+
+static WINBOOL dx9mt_should_log_probe(LONG *counter, LONG first_n, LONG every_n) {
+  LONG count;
+
+  if (dx9mt_trace_probe_logs_enabled()) {
+    return TRUE;
+  }
+
+  count = InterlockedIncrement(counter);
+  if (count <= first_n) {
+    return TRUE;
+  }
+  if (every_n > 0 && (count % every_n) == 0) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
 
 static WINBOOL dx9mt_is_color_format(D3DFORMAT format) {
   switch (format) {
@@ -275,6 +314,7 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDeviceType(
     IDirect3D9 *iface, UINT adapter, D3DDEVTYPE device_type,
     D3DFORMAT display_format, D3DFORMAT backbuffer_format, WINBOOL windowed) {
   HRESULT hr = D3D_OK;
+  static LONG log_counter = 0;
 
   (void)iface;
 
@@ -293,10 +333,12 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDeviceType(
     hr = D3DERR_NOTAVAILABLE;
   }
 
-  dx9mt_logf("d3d9",
-             "CheckDeviceType adapter=%u type=%u display=%u backbuffer=%u windowed=%u -> hr=0x%08x",
-             adapter, (unsigned)device_type, (unsigned)display_format,
-             (unsigned)backbuffer_format, (unsigned)windowed, (unsigned)hr);
+  if (dx9mt_should_log_probe(&log_counter, 64, 512)) {
+    dx9mt_logf("d3d9",
+               "CheckDeviceType adapter=%u type=%u display=%u backbuffer=%u windowed=%u -> hr=0x%08x",
+               adapter, (unsigned)device_type, (unsigned)display_format,
+               (unsigned)backbuffer_format, (unsigned)windowed, (unsigned)hr);
+  }
   return hr;
 }
 
@@ -305,6 +347,7 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDeviceFormat(
     D3DFORMAT adapter_format, DWORD usage, D3DRESOURCETYPE resource_type,
     D3DFORMAT check_format) {
   HRESULT hr = D3D_OK;
+  static LONG log_counter = 0;
 
   (void)iface;
 
@@ -324,11 +367,13 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDeviceFormat(
     }
   }
 
-  dx9mt_logf("d3d9",
-             "CheckDeviceFormat adapter=%u type=%u adapter_fmt=%u usage=0x%08x rtype=%u check_fmt=%u -> hr=0x%08x",
-             adapter, (unsigned)device_type, (unsigned)adapter_format,
-             (unsigned)usage, (unsigned)resource_type, (unsigned)check_format,
-             (unsigned)hr);
+  if (dx9mt_should_log_probe(&log_counter, 64, 512)) {
+    dx9mt_logf("d3d9",
+               "CheckDeviceFormat adapter=%u type=%u adapter_fmt=%u usage=0x%08x rtype=%u check_fmt=%u -> hr=0x%08x",
+               adapter, (unsigned)device_type, (unsigned)adapter_format,
+               (unsigned)usage, (unsigned)resource_type, (unsigned)check_format,
+               (unsigned)hr);
+  }
   return hr;
 }
 
@@ -337,6 +382,7 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDeviceMultiSampleType(
     D3DFORMAT surface_format, WINBOOL windowed,
     D3DMULTISAMPLE_TYPE multisample_type, DWORD *quality_levels) {
   HRESULT hr = D3DERR_NOTAVAILABLE;
+  static LONG log_counter = 0;
 
   (void)iface;
 
@@ -381,9 +427,7 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDeviceMultiSampleType(
     }
   }
 
-  /* Probe loops can be extremely large; log only useful sample points. */
-  if (hr == D3D_OK || multisample_type == D3DMULTISAMPLE_NONMASKABLE ||
-      multisample_type == D3DMULTISAMPLE_16_SAMPLES) {
+  if (dx9mt_should_log_probe(&log_counter, 64, 1024)) {
     dx9mt_logf("d3d9",
                "CheckDeviceMultiSampleType adapter=%u type=%u fmt=%u windowed=%u ms=%u -> hr=0x%08x q=%u",
                adapter, (unsigned)device_type, (unsigned)surface_format,
@@ -398,6 +442,7 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDepthStencilMatch(
     IDirect3D9 *iface, UINT adapter, D3DDEVTYPE device_type,
     D3DFORMAT adapter_format, D3DFORMAT rt_format, D3DFORMAT ds_format) {
   HRESULT hr = D3D_OK;
+  static LONG log_counter = 0;
 
   (void)iface;
 
@@ -411,10 +456,12 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDepthStencilMatch(
     hr = D3DERR_NOTAVAILABLE;
   }
 
-  dx9mt_logf("d3d9",
-             "CheckDepthStencilMatch adapter=%u type=%u adapter_fmt=%u rt_fmt=%u ds_fmt=%u -> hr=0x%08x",
-             adapter, (unsigned)device_type, (unsigned)adapter_format,
-             (unsigned)rt_format, (unsigned)ds_format, (unsigned)hr);
+  if (dx9mt_should_log_probe(&log_counter, 64, 512)) {
+    dx9mt_logf("d3d9",
+               "CheckDepthStencilMatch adapter=%u type=%u adapter_fmt=%u rt_fmt=%u ds_fmt=%u -> hr=0x%08x",
+               adapter, (unsigned)device_type, (unsigned)adapter_format,
+               (unsigned)rt_format, (unsigned)ds_format, (unsigned)hr);
+  }
   return hr;
 }
 
@@ -436,6 +483,7 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDeviceFormatConversion(
 static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
                                                 D3DDEVTYPE device_type,
                                                 D3DCAPS9 *caps) {
+  static LONG log_counter = 0;
   (void)iface;
 
   if (!caps) {
@@ -629,10 +677,13 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
   caps->MaxPShaderInstructionsExecuted = 65535;
   caps->MaxVertexShader30InstructionSlots = 32768;
   caps->MaxPixelShader30InstructionSlots = 32768;
-  dx9mt_logf("d3d9",
-             "GetDeviceCaps adapter=%u type=%u -> ok vs=0x%08x ps=0x%08x",
-             adapter, (unsigned)device_type, (unsigned)caps->VertexShaderVersion,
-             (unsigned)caps->PixelShaderVersion);
+  if (dx9mt_should_log_probe(&log_counter, 32, 256)) {
+    dx9mt_logf("d3d9",
+               "GetDeviceCaps adapter=%u type=%u -> ok vs=0x%08x ps=0x%08x",
+               adapter, (unsigned)device_type,
+               (unsigned)caps->VertexShaderVersion,
+               (unsigned)caps->PixelShaderVersion);
+  }
   return D3D_OK;
 }
 

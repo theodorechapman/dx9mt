@@ -14,6 +14,7 @@ STEAM_STARTUP_WAIT ?= 12
 DX9MT_RUNTIME_LOG ?= /tmp/dx9mt_runtime.log
 DX9MT_LAUNCHER_LOG ?= /tmp/fnv_dx9mt_probe.log
 DX9MT_STEAM_LOG ?= /tmp/steam_probe.log
+DX9MT_ANALYZE_TOP ?= 20
 
 WINEDLLOVERRIDES := dxsetup.exe=d
 
@@ -21,7 +22,7 @@ export WINEPREFIX
 export WINEDLLOVERRIDES
 
 .DEFAULT_GOAL := run
-.PHONY: run show-logs clear dx9mt-build install-dx9mt-fnv configure-fnv-dx9mt-override show-fnv-dx9mt-override wine-restart
+.PHONY: run show-logs analyze-logs clear dx9mt-build install-dx9mt-fnv configure-fnv-dx9mt-override show-fnv-dx9mt-override wine-restart
 
 wine-restart:
 	@echo "Restarting wineserver"; \
@@ -104,6 +105,14 @@ show-logs:
 		rg -n -i "err:|Unhandled exception|c000|steam exited|dx9mt/" "$(DX9MT_STEAM_LOG)" || tail -n 80 "$(DX9MT_STEAM_LOG)"; \
 	else \
 		echo "(no steam log yet)"; \
+	fi
+
+analyze-logs:
+	@if command -v uv >/dev/null 2>&1; then \
+		uv run tools/analyze_dx9mt_log.py "$(DX9MT_RUNTIME_LOG)" --top "$(DX9MT_ANALYZE_TOP)" 2>/dev/null || \
+			python3 tools/analyze_dx9mt_log.py "$(DX9MT_RUNTIME_LOG)" --top "$(DX9MT_ANALYZE_TOP)"; \
+	else \
+		python3 tools/analyze_dx9mt_log.py "$(DX9MT_RUNTIME_LOG)" --top "$(DX9MT_ANALYZE_TOP)"; \
 	fi
 
 show-fnv-dx9mt-override: wine-restart

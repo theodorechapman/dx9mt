@@ -49,7 +49,12 @@ __declspec(dllexport) void WINAPI DebugSetLevel(DWORD level) {
 }
 
 __declspec(dllexport) void WINAPI DebugSetMute(void) {
-  dx9mt_logf("perf", "DebugSetMute called");
+  static LONG call_count = 0;
+  LONG count = InterlockedIncrement(&call_count);
+
+  if (count <= 1 || (count % 512) == 0) {
+    dx9mt_logf("perf", "DebugSetMute called count=%ld", (long)count);
+  }
 }
 
 __declspec(dllexport) void *WINAPI Direct3DShaderValidatorCreate9(void) {

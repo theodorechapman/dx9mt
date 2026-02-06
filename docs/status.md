@@ -53,6 +53,17 @@ Ship a high-performance direct `d3d9.dll` replacement for 32-bit DX9 games under
   - `wine-restart` hook before override-sensitive targets.
 - `CreateQuery` implemented (minimal `IDirect3DQuery9` COM object) to unblock launcher device detection.
 - `GetDeviceCaps` expanded to a more realistic HAL profile for Gamebryo expectations.
+- Added `DX9MT_PACKET_CLEAR` emission from `IDirect3DDevice9::Clear`.
+- Backend stub logging changed from per-packet spam to per-frame summaries (`packets/draws/clears/last_clear`) with optional packet trace via `DX9MT_BACKEND_TRACE_PACKETS=1`.
+- Probe/perf log throttling to keep runtime logs readable by default:
+  - set `DX9MT_TRACE_PROBES=1` to restore full probe verbosity.
+  - `DebugSetMute` now logs sampled counts instead of every call.
+  - capability-probe failure loops now sampled (not logged every time).
+- Added targeted runtime instrumentation for unimplemented/high-risk paths:
+  - `CreateCubeTexture` call-path log (sampled).
+  - `CreateVolumeTexture` unsupported log (sampled).
+  - `DrawPrimitive` stub-use log (sampled).
+- Implemented minimal `IDirect3DCubeTexture9` object + `CreateCubeTexture` success path for common startup usage.
 - Added/kept analyzer tooling:
   - `tools/analyze_dx9mt_log.py`
   - `uv` project setup (`pyproject.toml`, `uv.lock`).
@@ -66,12 +77,21 @@ Ship a high-performance direct `d3d9.dll` replacement for 32-bit DX9 games under
   - `Direct3DCreate9` called.
   - `CreateDevice` succeeds.
   - `GetDeviceCaps` succeeds.
-  - Game still exits with user-visible error: `failed to initialize gamebryo renderer`.
+  - `CreateCubeTexture` now succeeds in the game startup path (`hr=0x00000000`).
+  - Game progresses past previous `failed to initialize gamebryo renderer` error.
+  - Runtime reaches active frame loop with large `DRAW_INDEXED` + `PRESENT` traffic.
+  - Latest run sustained through at least frame `4080` with no new startup-time API failure signal.
+  - No `CreateVolumeTexture unsupported` or `DrawPrimitive stub` signal in the latest capture window.
+  - User-observed behavior: black screen with active audio/input cues.
 
 ## Current Blocker
-- Renderer initialization fails after successful `CreateDevice`.
-- This is now a post-device initialization compatibility issue (not an early load/export/override failure).
-- No obvious remaining "default stub" call appears in the latest captured path around the failure point.
+- Backend present/render path is still intentionally `no-op`; black screen is currently expected.
+- Current issue is no longer early launcher/device init failure, it is missing real backend rendering.
+- Remaining compatibility gaps still exist (`CreateVolumeTexture` and other unimplemented methods), with instrumentation to confirm call impact.
+
+## Backend Plan
+- Detailed backend bring-up plan is tracked in:
+  - `docs/rendering-backend-plan.md`
 
 ## Operational Workflow
 - `make run`
@@ -92,6 +112,6 @@ Ship a high-performance direct `d3d9.dll` replacement for 32-bit DX9 games under
 Step 1 is complete only when FNV progresses past Gamebryo renderer initialization into stable in-game rendering path under `dx9mt`.
 
 ## Next 1-3 Actions
-1. Retest with the expanded caps patch now in tree and capture fresh logs.
-2. Instrument first failure window immediately after `CreateDevice`/`GetDeviceCaps` to identify the next rejected contract.
-3. Patch the next concrete incompatibility (caps bit, method behavior, or init-time object contract), then retest.
+1. Implement backend milestone `RB0`/`RB1` from `docs/rendering-backend-plan.md` to replace present `no-op` with first visible output path.
+2. Keep probe tracing off by default for readability; only enable `DX9MT_TRACE_PROBES=1` for focused compatibility dives.
+3. After first visible frame, begin `RB2` packet-driven pass replay scaffolding while keeping launcher/startup behavior stable.
