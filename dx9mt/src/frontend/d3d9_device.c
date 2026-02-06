@@ -8,7 +8,9 @@
 
 #include "dx9mt/backend_bridge.h"
 #include "dx9mt/log.h"
+#include "dx9mt/object_ids.h"
 #include "dx9mt/packets.h"
+#include "dx9mt/runtime.h"
 
 #define DX9MT_MAX_RENDER_TARGETS 4
 #define DX9MT_MAX_TEXTURE_STAGES 16
@@ -34,6 +36,8 @@ static WINBOOL dx9mt_should_log_method_sample(LONG *counter, LONG first_n,
   return FALSE;
 }
 
+static LONG g_object_id_counters[DX9MT_OBJECT_KIND_VERTEX_DECL + 1];
+
 typedef struct dx9mt_device dx9mt_device;
 typedef struct dx9mt_surface dx9mt_surface;
 typedef struct dx9mt_swapchain dx9mt_swapchain;
@@ -49,6 +53,7 @@ typedef struct dx9mt_query dx9mt_query;
 struct dx9mt_surface {
   IDirect3DSurface9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   IUnknown *container;
   D3DSURFACE_DESC desc;
@@ -60,6 +65,7 @@ struct dx9mt_surface {
 struct dx9mt_swapchain {
   IDirect3DSwapChain9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   D3DPRESENT_PARAMETERS params;
   IDirect3DSurface9 *backbuffer;
@@ -69,6 +75,7 @@ struct dx9mt_swapchain {
 struct dx9mt_vertex_buffer {
   IDirect3DVertexBuffer9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   D3DVERTEXBUFFER_DESC desc;
   unsigned char *data;
@@ -77,6 +84,7 @@ struct dx9mt_vertex_buffer {
 struct dx9mt_index_buffer {
   IDirect3DIndexBuffer9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   D3DINDEXBUFFER_DESC desc;
   unsigned char *data;
@@ -85,6 +93,7 @@ struct dx9mt_index_buffer {
 struct dx9mt_vertex_decl {
   IDirect3DVertexDeclaration9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   D3DVERTEXELEMENT9 *elements;
   UINT count;
@@ -93,6 +102,7 @@ struct dx9mt_vertex_decl {
 struct dx9mt_vertex_shader {
   IDirect3DVertexShader9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   DWORD *byte_code;
   UINT dword_count;
@@ -101,6 +111,7 @@ struct dx9mt_vertex_shader {
 struct dx9mt_pixel_shader {
   IDirect3DPixelShader9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   DWORD *byte_code;
   UINT dword_count;
@@ -109,6 +120,7 @@ struct dx9mt_pixel_shader {
 struct dx9mt_texture {
   IDirect3DTexture9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   DWORD usage;
   D3DFORMAT format;
@@ -124,6 +136,7 @@ struct dx9mt_texture {
 struct dx9mt_cube_texture {
   IDirect3DCubeTexture9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   DWORD usage;
   D3DFORMAT format;
@@ -138,6 +151,7 @@ struct dx9mt_cube_texture {
 struct dx9mt_query {
   IDirect3DQuery9 iface;
   LONG refcount;
+  dx9mt_object_id object_id;
   dx9mt_device *device;
   D3DQUERYTYPE type;
   DWORD data_size;
@@ -167,6 +181,7 @@ struct dx9mt_device {
   float n_patch_mode;
   DWORD fvf;
   UINT frame_id;
+  uint64_t present_target_id;
 
   DWORD render_states[DX9MT_MAX_RENDER_STATES];
   DWORD sampler_states[DX9MT_MAX_SAMPLERS][DX9MT_MAX_SAMPLER_STATES];
@@ -244,6 +259,138 @@ static dx9mt_cube_texture *dx9mt_cube_texture_from_iface(
 
 static dx9mt_query *dx9mt_query_from_iface(IDirect3DQuery9 *iface) {
   return (dx9mt_query *)iface;
+}
+
+static dx9mt_object_id dx9mt_alloc_object_id(enum dx9mt_object_kind kind) {
+  LONG next;
+  uint32_t serial;
+
+  if (kind <= DX9MT_OBJECT_KIND_INVALID ||
+      kind > DX9MT_OBJECT_KIND_VERTEX_DECL) {
+    return 0;
+  }
+
+  next = InterlockedIncrement(&g_object_id_counters[kind]);
+  serial = (uint32_t)next & 0x00FFFFFFu;
+  if (serial == 0) {
+    serial = 1;
+  }
+
+  return ((uint32_t)kind << 24) | serial;
+}
+
+static dx9mt_object_id
+dx9mt_surface_object_id_from_iface(IDirect3DSurface9 *iface) {
+  if (!iface) {
+    return 0;
+  }
+  return dx9mt_surface_from_iface(iface)->object_id;
+}
+
+static dx9mt_object_id
+dx9mt_vb_object_id_from_iface(IDirect3DVertexBuffer9 *iface) {
+  if (!iface) {
+    return 0;
+  }
+  return dx9mt_vb_from_iface(iface)->object_id;
+}
+
+static dx9mt_object_id
+dx9mt_ib_object_id_from_iface(IDirect3DIndexBuffer9 *iface) {
+  if (!iface) {
+    return 0;
+  }
+  return dx9mt_ib_from_iface(iface)->object_id;
+}
+
+static dx9mt_object_id
+dx9mt_vdecl_object_id_from_iface(IDirect3DVertexDeclaration9 *iface) {
+  if (!iface) {
+    return 0;
+  }
+  return dx9mt_vdecl_from_iface(iface)->object_id;
+}
+
+static dx9mt_object_id
+dx9mt_vshader_object_id_from_iface(IDirect3DVertexShader9 *iface) {
+  if (!iface) {
+    return 0;
+  }
+  return dx9mt_vshader_from_iface(iface)->object_id;
+}
+
+static dx9mt_object_id
+dx9mt_pshader_object_id_from_iface(IDirect3DPixelShader9 *iface) {
+  if (!iface) {
+    return 0;
+  }
+  return dx9mt_pshader_from_iface(iface)->object_id;
+}
+
+static uint32_t dx9mt_hash_u32(uint32_t hash, uint32_t value) {
+  hash ^= value;
+  hash *= 16777619u;
+  return hash;
+}
+
+static uint32_t dx9mt_hash_float_bits(float value) {
+  uint32_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+static uint32_t dx9mt_hash_viewport(const D3DVIEWPORT9 *viewport) {
+  uint32_t hash = 2166136261u;
+
+  if (!viewport) {
+    return 0;
+  }
+
+  hash = dx9mt_hash_u32(hash, viewport->X);
+  hash = dx9mt_hash_u32(hash, viewport->Y);
+  hash = dx9mt_hash_u32(hash, viewport->Width);
+  hash = dx9mt_hash_u32(hash, viewport->Height);
+  hash = dx9mt_hash_u32(hash, dx9mt_hash_float_bits(viewport->MinZ));
+  hash = dx9mt_hash_u32(hash, dx9mt_hash_float_bits(viewport->MaxZ));
+  return hash;
+}
+
+static uint32_t dx9mt_hash_rect(const RECT *rect) {
+  uint32_t hash = 2166136261u;
+
+  if (!rect) {
+    return 0;
+  }
+
+  hash = dx9mt_hash_u32(hash, (uint32_t)rect->left);
+  hash = dx9mt_hash_u32(hash, (uint32_t)rect->top);
+  hash = dx9mt_hash_u32(hash, (uint32_t)rect->right);
+  hash = dx9mt_hash_u32(hash, (uint32_t)rect->bottom);
+  return hash;
+}
+
+static uint32_t
+dx9mt_hash_draw_state(const dx9mt_packet_draw_indexed *packet) {
+  uint32_t hash = 2166136261u;
+
+  if (!packet) {
+    return 0;
+  }
+
+  hash = dx9mt_hash_u32(hash, packet->render_target_id);
+  hash = dx9mt_hash_u32(hash, packet->depth_stencil_id);
+  hash = dx9mt_hash_u32(hash, packet->vertex_buffer_id);
+  hash = dx9mt_hash_u32(hash, packet->index_buffer_id);
+  hash = dx9mt_hash_u32(hash, packet->vertex_decl_id);
+  hash = dx9mt_hash_u32(hash, packet->vertex_shader_id);
+  hash = dx9mt_hash_u32(hash, packet->pixel_shader_id);
+  hash = dx9mt_hash_u32(hash, packet->fvf);
+  hash = dx9mt_hash_u32(hash, packet->stream0_offset);
+  hash = dx9mt_hash_u32(hash, packet->stream0_stride);
+  hash = dx9mt_hash_u32(hash, packet->primitive_type);
+  hash = dx9mt_hash_u32(hash, packet->viewport_hash);
+  hash = dx9mt_hash_u32(hash, packet->scissor_hash);
+  return hash;
 }
 
 static UINT dx9mt_bytes_per_pixel(D3DFORMAT format) {
@@ -432,6 +579,58 @@ static HRESULT dx9mt_surface_copy_rect(dx9mt_surface *dst, const RECT *dst_rect,
   return D3D_OK;
 }
 
+static UINT dx9mt_resolve_backbuffer_width(const D3DPRESENT_PARAMETERS *params) {
+  return params && params->BackBufferWidth ? params->BackBufferWidth : 1280;
+}
+
+static UINT dx9mt_resolve_backbuffer_height(const D3DPRESENT_PARAMETERS *params) {
+  return params && params->BackBufferHeight ? params->BackBufferHeight : 720;
+}
+
+static D3DFORMAT
+dx9mt_resolve_backbuffer_format(const D3DPRESENT_PARAMETERS *params) {
+  D3DFORMAT format;
+
+  format = params ? params->BackBufferFormat : D3DFMT_UNKNOWN;
+  if (format == D3DFMT_UNKNOWN) {
+    format = D3DFMT_X8R8G8B8;
+  }
+  return format;
+}
+
+static HRESULT dx9mt_device_publish_present_target(dx9mt_device *self) {
+  dx9mt_backend_present_target_desc desc;
+
+  if (!self) {
+    return D3DERR_INVALIDCALL;
+  }
+  if (self->present_target_id == 0) {
+    if (self->swapchain && self->swapchain->object_id != 0) {
+      self->present_target_id = self->swapchain->object_id;
+    } else {
+      self->present_target_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_SWAPCHAIN);
+    }
+  }
+
+  memset(&desc, 0, sizeof(desc));
+  desc.target_id = self->present_target_id;
+  desc.width = dx9mt_resolve_backbuffer_width(&self->params);
+  desc.height = dx9mt_resolve_backbuffer_height(&self->params);
+  desc.format = (uint32_t)dx9mt_resolve_backbuffer_format(&self->params);
+  desc.windowed = self->params.Windowed ? 1u : 0u;
+
+  if (dx9mt_backend_bridge_update_present_target(&desc) != 0) {
+    dx9mt_logf(
+        "device",
+        "failed to publish present target metadata target=%llu size=%ux%u fmt=%u windowed=%u",
+        (unsigned long long)desc.target_id, desc.width, desc.height, desc.format,
+        desc.windowed);
+    return D3DERR_DRIVERINTERNALERROR;
+  }
+
+  return D3D_OK;
+}
+
 static HRESULT dx9mt_surface_fill_rect(dx9mt_surface *surface, const RECT *rect,
                                        D3DCOLOR color) {
   RECT fill_rect;
@@ -566,6 +765,7 @@ static HRESULT dx9mt_surface_create(dx9mt_device *device, UINT width, UINT heigh
 
   surface->iface.lpVtbl = &g_dx9mt_surface_vtbl;
   surface->refcount = 1;
+  surface->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_SURFACE);
   surface->device = device;
   surface->container = container;
   surface->lockable = lockable;
@@ -829,6 +1029,7 @@ static HRESULT dx9mt_swapchain_create(dx9mt_device *device,
 
   swapchain->iface.lpVtbl = &g_dx9mt_swapchain_vtbl;
   swapchain->refcount = 1;
+  swapchain->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_SWAPCHAIN);
   swapchain->device = device;
   swapchain->params = *params;
 
@@ -898,15 +1099,11 @@ static HRESULT WINAPI dx9mt_swapchain_Present(IDirect3DSwapChain9 *iface,
                                                const RGNDATA *dirty_region,
                                                DWORD flags) {
   dx9mt_swapchain *self = dx9mt_swapchain_from_iface(iface);
-  (void)src_rect;
-  (void)dst_rect;
-  (void)dst_window_override;
-  (void)dirty_region;
   (void)flags;
 
   ++self->present_count;
-  return dx9mt_backend_bridge_present(self->device->frame_id) == 0 ? D3D_OK
-                                                                    : D3DERR_DEVICELOST;
+  return IDirect3DDevice9_Present(&self->device->iface, src_rect, dst_rect,
+                                  dst_window_override, dirty_region);
 }
 
 static HRESULT WINAPI dx9mt_swapchain_GetFrontBufferData(
@@ -1099,6 +1296,7 @@ static HRESULT dx9mt_texture_create(dx9mt_device *device, UINT width, UINT heigh
 
   texture->iface.lpVtbl = &g_dx9mt_texture_vtbl;
   texture->refcount = 1;
+  texture->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_TEXTURE);
   texture->device = device;
   texture->usage = usage;
   texture->format = format;
@@ -1456,6 +1654,7 @@ static HRESULT dx9mt_cube_texture_create(dx9mt_device *device, UINT edge_length,
 
   cube->iface.lpVtbl = &g_dx9mt_cube_texture_vtbl;
   cube->refcount = 1;
+  cube->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_TEXTURE);
   cube->device = device;
   cube->usage = usage;
   cube->format = format;
@@ -1799,6 +1998,7 @@ static HRESULT dx9mt_vb_create(dx9mt_device *device, UINT length, DWORD usage,
 
   vb->iface.lpVtbl = &g_dx9mt_vb_vtbl;
   vb->refcount = 1;
+  vb->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_BUFFER);
   vb->device = device;
   vb->desc.Format = D3DFMT_VERTEXDATA;
   vb->desc.Type = D3DRTYPE_VERTEXBUFFER;
@@ -2011,6 +2211,7 @@ static HRESULT dx9mt_ib_create(dx9mt_device *device, UINT length, DWORD usage,
 
   ib->iface.lpVtbl = &g_dx9mt_ib_vtbl;
   ib->refcount = 1;
+  ib->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_BUFFER);
   ib->device = device;
   ib->desc.Format = format;
   ib->desc.Type = D3DRTYPE_INDEXBUFFER;
@@ -2210,6 +2411,7 @@ static HRESULT dx9mt_vdecl_create(dx9mt_device *device,
 
   decl->iface.lpVtbl = &g_dx9mt_vdecl_vtbl;
   decl->refcount = 1;
+  decl->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_VERTEX_DECL);
   decl->device = device;
   decl->count = count;
   decl->elements = (D3DVERTEXELEMENT9 *)HeapAlloc(GetProcessHeap(), 0,
@@ -2333,6 +2535,7 @@ static HRESULT dx9mt_vshader_create(dx9mt_device *device, const DWORD *byte_code
 
   shader->iface.lpVtbl = &g_dx9mt_vshader_vtbl;
   shader->refcount = 1;
+  shader->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_VERTEX_SHADER);
   shader->device = device;
 
   hr = dx9mt_copy_shader_blob(byte_code, &shader->byte_code,
@@ -2454,6 +2657,7 @@ static HRESULT dx9mt_pshader_create(dx9mt_device *device, const DWORD *byte_code
 
   shader->iface.lpVtbl = &g_dx9mt_pshader_vtbl;
   shader->refcount = 1;
+  shader->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_PIXEL_SHADER);
   shader->device = device;
 
   hr = dx9mt_copy_shader_blob(byte_code, &shader->byte_code,
@@ -3137,6 +3341,12 @@ static HRESULT dx9mt_device_reset_internal(dx9mt_device *self,
   self->scissor_rect.right = (LONG)self->viewport.Width;
   self->scissor_rect.bottom = (LONG)self->viewport.Height;
 
+  self->present_target_id = self->swapchain ? self->swapchain->object_id : 0;
+  hr = dx9mt_device_publish_present_target(self);
+  if (FAILED(hr)) {
+    return hr;
+  }
+
   return D3D_OK;
 }
 
@@ -3280,7 +3490,7 @@ static HRESULT WINAPI dx9mt_device_Present(IDirect3DDevice9 *iface,
   memset(&packet, 0, sizeof(packet));
   packet.header.type = DX9MT_PACKET_PRESENT;
   packet.header.size = (uint16_t)sizeof(packet);
-  packet.header.sequence = self->frame_id + 1;
+  packet.header.sequence = dx9mt_runtime_next_packet_sequence();
   packet.frame_id = self->frame_id;
 
   dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
@@ -3679,7 +3889,7 @@ static HRESULT WINAPI dx9mt_device_Clear(IDirect3DDevice9 *iface,
   memset(&packet, 0, sizeof(packet));
   packet.header.type = DX9MT_PACKET_CLEAR;
   packet.header.size = (uint16_t)sizeof(packet);
-  packet.header.sequence = self->frame_id + 1;
+  packet.header.sequence = dx9mt_runtime_next_packet_sequence();
   packet.frame_id = self->frame_id;
   packet.rect_count = rect_count;
   packet.flags = flags;
@@ -3941,21 +4151,35 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   dx9mt_packet_draw_indexed packet;
 
-  (void)base_vertex_index;
-  (void)min_vertex_index;
-  (void)num_vertices;
-  (void)start_index;
-
   memset(&packet, 0, sizeof(packet));
   packet.header.type = DX9MT_PACKET_DRAW_INDEXED;
   packet.header.size = (uint16_t)sizeof(packet);
-  packet.header.sequence = self->frame_id + 1;
+  packet.header.sequence = dx9mt_runtime_next_packet_sequence();
   packet.primitive_type = primitive_type;
   packet.base_vertex = base_vertex_index;
   packet.min_vertex_index = min_vertex_index;
   packet.num_vertices = num_vertices;
   packet.start_index = start_index;
   packet.primitive_count = prim_count;
+  packet.render_target_id =
+      dx9mt_surface_object_id_from_iface(self->render_targets[0]);
+  packet.depth_stencil_id =
+      dx9mt_surface_object_id_from_iface(self->depth_stencil);
+  packet.vertex_buffer_id =
+      dx9mt_vb_object_id_from_iface(self->streams[0]);
+  packet.index_buffer_id = dx9mt_ib_object_id_from_iface(self->indices);
+  packet.vertex_decl_id =
+      dx9mt_vdecl_object_id_from_iface(self->vertex_decl);
+  packet.vertex_shader_id =
+      dx9mt_vshader_object_id_from_iface(self->vertex_shader);
+  packet.pixel_shader_id =
+      dx9mt_pshader_object_id_from_iface(self->pixel_shader);
+  packet.fvf = self->fvf;
+  packet.stream0_offset = self->stream_offsets[0];
+  packet.stream0_stride = self->stream_strides[0];
+  packet.viewport_hash = dx9mt_hash_viewport(&self->viewport);
+  packet.scissor_hash = dx9mt_hash_rect(&self->scissor_rect);
+  packet.state_block_hash = dx9mt_hash_draw_state(&packet);
 
   dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
   return D3D_OK;
@@ -4319,6 +4543,7 @@ static HRESULT WINAPI dx9mt_device_CreateQuery(IDirect3DDevice9 *iface,
 
   object->iface.lpVtbl = (IDirect3DQuery9Vtbl *)&g_dx9mt_query_vtbl;
   object->refcount = 1;
+  object->object_id = dx9mt_alloc_object_id(DX9MT_OBJECT_KIND_QUERY);
   object->device = self;
   object->type = type;
   object->data_size = dx9mt_query_data_size(type);

@@ -10,7 +10,11 @@
 #include "dx9mt/upload_arena.h"
 
 static LONG g_runtime_state;
-static uint32_t g_packet_seq;
+static LONG g_packet_seq;
+
+uint32_t dx9mt_runtime_next_packet_sequence(void) {
+  return (uint32_t)InterlockedIncrement(&g_packet_seq);
+}
 
 void dx9mt_runtime_ensure_initialized(void) {
   LONG previous = InterlockedCompareExchange(&g_runtime_state, 1, 0);
@@ -41,7 +45,7 @@ void dx9mt_runtime_ensure_initialized(void) {
     memset(&packet, 0, sizeof(packet));
     packet.header.type = DX9MT_PACKET_INIT;
     packet.header.size = (uint16_t)sizeof(packet);
-    packet.header.sequence = ++g_packet_seq;
+    packet.header.sequence = dx9mt_runtime_next_packet_sequence();
     packet.protocol_version = init_desc.protocol_version;
     packet.ring_capacity_bytes = init_desc.ring_capacity_bytes;
     packet.upload_desc = init_desc.upload_desc;
@@ -59,5 +63,6 @@ void dx9mt_runtime_shutdown(void) {
 
   dx9mt_backend_bridge_shutdown();
   dx9mt_log_shutdown();
+  InterlockedExchange(&g_packet_seq, 0);
   InterlockedExchange(&g_runtime_state, 0);
 }

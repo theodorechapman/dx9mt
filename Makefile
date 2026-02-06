@@ -22,7 +22,7 @@ export WINEPREFIX
 export WINEDLLOVERRIDES
 
 .DEFAULT_GOAL := run
-.PHONY: run show-logs analyze-logs clear dx9mt-build install-dx9mt-fnv configure-fnv-dx9mt-override show-fnv-dx9mt-override wine-restart
+.PHONY: run show-logs analyze-logs test clear dx9mt-build dx9mt-test install-dx9mt-fnv configure-fnv-dx9mt-override show-fnv-dx9mt-override wine-restart
 
 wine-restart:
 	@echo "Restarting wineserver"; \
@@ -32,6 +32,11 @@ wine-restart:
 
 dx9mt-build:
 	@$(MAKE) --no-print-directory -s -C "$(DX9MT_DIR)"
+
+dx9mt-test:
+	@$(MAKE) --no-print-directory -s -C "$(DX9MT_DIR)" test-native
+
+test: dx9mt-test
 
 configure-fnv-dx9mt-override: wine-restart
 	@set -e; \

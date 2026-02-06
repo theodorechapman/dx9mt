@@ -12,7 +12,17 @@ typedef struct dx9mt_backend_init_desc {
   dx9mt_upload_arena_desc upload_desc;
 } dx9mt_backend_init_desc;
 
+typedef struct dx9mt_backend_present_target_desc {
+  uint64_t target_id;
+  uint32_t width;
+  uint32_t height;
+  uint32_t format;
+  uint32_t windowed;
+} dx9mt_backend_present_target_desc;
+
 int dx9mt_backend_bridge_init(const dx9mt_backend_init_desc *desc);
+int dx9mt_backend_bridge_update_present_target(
+    const dx9mt_backend_present_target_desc *desc);
 int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
                                         uint32_t packet_bytes);
 int dx9mt_backend_bridge_begin_frame(uint32_t frame_id);

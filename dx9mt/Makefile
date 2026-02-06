@@ -10,6 +10,7 @@ FRONTEND_DEF := src/frontend/d3d9.def
 
 BACKEND_CFLAGS := -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude
 BACKEND_LDFLAGS := -dynamiclib
+TEST_CFLAGS := -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude
 
 FRONTEND_SRCS := \
 	src/common/log.c \
@@ -24,10 +25,16 @@ BACKEND_SRCS := \
 	src/common/log.c \
 	src/backend/backend_bridge_stub.c
 
+TEST_SRCS := \
+	tests/backend_bridge_contract_test.c \
+	src/common/log.c \
+	src/backend/backend_bridge_stub.c
+
 FRONTEND_OBJS := $(patsubst %.c,$(OBJ_DIR)/frontend/%.o,$(FRONTEND_SRCS))
 BACKEND_OBJS := $(patsubst %.c,$(OBJ_DIR)/backend/%.o,$(BACKEND_SRCS))
+TEST_BIN := $(BUILD_DIR)/backend_bridge_contract_test
 
-.PHONY: all clean
+.PHONY: all clean test-native
 
 all: $(BUILD_DIR)/d3d9.dll $(BUILD_DIR)/libdx9mt_unixlib.dylib
 
@@ -38,6 +45,13 @@ $(BUILD_DIR)/d3d9.dll: $(FRONTEND_OBJS) $(FRONTEND_DEF)
 $(BUILD_DIR)/libdx9mt_unixlib.dylib: $(BACKEND_OBJS)
 	@mkdir -p $(BUILD_DIR)
 	$(BACKEND_CC) $(BACKEND_LDFLAGS) -o $@ $^
+
+$(TEST_BIN): $(TEST_SRCS)
+	@mkdir -p $(BUILD_DIR)
+	$(BACKEND_CC) $(TEST_CFLAGS) -o $@ $(TEST_SRCS)
+
+test-native: $(TEST_BIN)
+	@"$(TEST_BIN)"
 
 $(OBJ_DIR)/frontend/%.o: %.c
 	@mkdir -p $(dir $@)

@@ -42,6 +42,18 @@ typedef struct dx9mt_packet_draw_indexed {
   uint32_t num_vertices;
   uint32_t start_index;
   uint32_t primitive_count;
+  uint32_t render_target_id;
+  uint32_t depth_stencil_id;
+  uint32_t vertex_buffer_id;
+  uint32_t index_buffer_id;
+  uint32_t vertex_decl_id;
+  uint32_t vertex_shader_id;
+  uint32_t pixel_shader_id;
+  uint32_t fvf;
+  uint32_t stream0_offset;
+  uint32_t stream0_stride;
+  uint32_t viewport_hash;
+  uint32_t scissor_hash;
   dx9mt_upload_ref constants_vs;
   dx9mt_upload_ref constants_ps;
 } dx9mt_packet_draw_indexed;
