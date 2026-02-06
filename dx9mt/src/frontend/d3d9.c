@@ -454,15 +454,181 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
   memset(caps, 0, sizeof(*caps));
   caps->AdapterOrdinal = adapter;
   caps->DeviceType = device_type;
-  caps->Caps2 = D3DCAPS2_DYNAMICTEXTURES;
-  caps->DevCaps = D3DDEVCAPS_HWTRANSFORMANDLIGHT;
-  caps->VertexShaderVersion = D3DVS_VERSION(3, 0);
-  caps->PixelShaderVersion = D3DPS_VERSION(3, 0);
+  caps->Caps = D3DCAPS_READ_SCANLINE;
+  caps->Caps2 = D3DCAPS2_CANAUTOGENMIPMAP | D3DCAPS2_FULLSCREENGAMMA |
+                D3DCAPS2_DYNAMICTEXTURES;
+  caps->Caps3 = D3DCAPS3_ALPHA_FULLSCREEN_FLIP_OR_DISCARD |
+                D3DCAPS3_COPY_TO_VIDMEM | D3DCAPS3_COPY_TO_SYSTEMMEM;
+  caps->PresentationIntervals = D3DPRESENT_INTERVAL_IMMEDIATE |
+                                D3DPRESENT_INTERVAL_ONE |
+                                D3DPRESENT_INTERVAL_TWO |
+                                D3DPRESENT_INTERVAL_THREE |
+                                D3DPRESENT_INTERVAL_FOUR;
+  caps->CursorCaps = D3DCURSORCAPS_COLOR | D3DCURSORCAPS_LOWRES;
+  caps->DevCaps = D3DDEVCAPS_EXECUTESYSTEMMEMORY |
+                  D3DDEVCAPS_EXECUTEVIDEOMEMORY |
+                  D3DDEVCAPS_TLVERTEXSYSTEMMEMORY |
+                  D3DDEVCAPS_TLVERTEXVIDEOMEMORY |
+                  D3DDEVCAPS_TEXTURESYSTEMMEMORY |
+                  D3DDEVCAPS_TEXTUREVIDEOMEMORY |
+                  D3DDEVCAPS_DRAWPRIMTLVERTEX |
+                  D3DDEVCAPS_CANRENDERAFTERFLIP |
+                  D3DDEVCAPS_TEXTURENONLOCALVIDMEM |
+                  D3DDEVCAPS_DRAWPRIMITIVES2 |
+                  D3DDEVCAPS_DRAWPRIMITIVES2EX |
+                  D3DDEVCAPS_HWTRANSFORMANDLIGHT |
+                  D3DDEVCAPS_PUREDEVICE | D3DDEVCAPS_HWRASTERIZATION;
+  caps->PrimitiveMiscCaps = D3DPMISCCAPS_CULLNONE | D3DPMISCCAPS_CULLCW |
+                            D3DPMISCCAPS_CULLCCW |
+                            D3DPMISCCAPS_COLORWRITEENABLE |
+                            D3DPMISCCAPS_CLIPPLANESCALEDPOINTS |
+                            D3DPMISCCAPS_BLENDOP | D3DPMISCCAPS_TSSARGTEMP;
+  caps->RasterCaps = D3DPRASTERCAPS_DITHER | D3DPRASTERCAPS_ZTEST |
+                     D3DPRASTERCAPS_FOGVERTEX | D3DPRASTERCAPS_FOGTABLE |
+                     D3DPRASTERCAPS_MIPMAPLODBIAS |
+                     D3DPRASTERCAPS_ZBUFFERLESSHSR | D3DPRASTERCAPS_FOGRANGE |
+                     D3DPRASTERCAPS_ANISOTROPY | D3DPRASTERCAPS_COLORPERSPECTIVE |
+                     D3DPRASTERCAPS_SCISSORTEST | D3DPRASTERCAPS_SLOPESCALEDEPTHBIAS |
+                     D3DPRASTERCAPS_DEPTHBIAS;
+  caps->ZCmpCaps = D3DPCMPCAPS_NEVER | D3DPCMPCAPS_LESS | D3DPCMPCAPS_EQUAL |
+                   D3DPCMPCAPS_LESSEQUAL | D3DPCMPCAPS_GREATER |
+                   D3DPCMPCAPS_NOTEQUAL | D3DPCMPCAPS_GREATEREQUAL |
+                   D3DPCMPCAPS_ALWAYS;
+  caps->SrcBlendCaps = D3DPBLENDCAPS_ZERO | D3DPBLENDCAPS_ONE |
+                       D3DPBLENDCAPS_SRCCOLOR | D3DPBLENDCAPS_INVSRCCOLOR |
+                       D3DPBLENDCAPS_SRCALPHA | D3DPBLENDCAPS_INVSRCALPHA |
+                       D3DPBLENDCAPS_DESTALPHA | D3DPBLENDCAPS_INVDESTALPHA |
+                       D3DPBLENDCAPS_DESTCOLOR | D3DPBLENDCAPS_INVDESTCOLOR |
+                       D3DPBLENDCAPS_SRCALPHASAT | D3DPBLENDCAPS_BOTHSRCALPHA |
+                       D3DPBLENDCAPS_BOTHINVSRCALPHA | D3DPBLENDCAPS_BLENDFACTOR;
+  caps->DestBlendCaps = D3DPBLENDCAPS_ZERO | D3DPBLENDCAPS_ONE |
+                        D3DPBLENDCAPS_SRCCOLOR | D3DPBLENDCAPS_INVSRCCOLOR |
+                        D3DPBLENDCAPS_SRCALPHA | D3DPBLENDCAPS_INVSRCALPHA |
+                        D3DPBLENDCAPS_DESTALPHA | D3DPBLENDCAPS_INVDESTALPHA |
+                        D3DPBLENDCAPS_DESTCOLOR | D3DPBLENDCAPS_INVDESTCOLOR |
+                        D3DPBLENDCAPS_SRCALPHASAT | D3DPBLENDCAPS_BLENDFACTOR;
+  caps->AlphaCmpCaps = caps->ZCmpCaps;
+  caps->ShadeCaps = D3DPSHADECAPS_COLORGOURAUDRGB |
+                    D3DPSHADECAPS_SPECULARGOURAUDRGB |
+                    D3DPSHADECAPS_ALPHAGOURAUDBLEND | D3DPSHADECAPS_FOGGOURAUD;
+  caps->TextureCaps = D3DPTEXTURECAPS_ALPHA | D3DPTEXTURECAPS_PERSPECTIVE |
+                      D3DPTEXTURECAPS_PROJECTED |
+                      D3DPTEXTURECAPS_TEXREPEATNOTSCALEDBYSIZE |
+                      D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_MIPMAP;
+  caps->TextureFilterCaps = D3DPTFILTERCAPS_MINFPOINT |
+                            D3DPTFILTERCAPS_MINFLINEAR |
+                            D3DPTFILTERCAPS_MINFANISOTROPIC |
+                            D3DPTFILTERCAPS_MIPFPOINT |
+                            D3DPTFILTERCAPS_MIPFLINEAR |
+                            D3DPTFILTERCAPS_MAGFPOINT |
+                            D3DPTFILTERCAPS_MAGFLINEAR |
+                            D3DPTFILTERCAPS_MAGFANISOTROPIC;
+  caps->CubeTextureFilterCaps = caps->TextureFilterCaps;
+  caps->VolumeTextureFilterCaps = D3DPTFILTERCAPS_MINFPOINT |
+                                  D3DPTFILTERCAPS_MINFLINEAR |
+                                  D3DPTFILTERCAPS_MIPFPOINT |
+                                  D3DPTFILTERCAPS_MIPFLINEAR |
+                                  D3DPTFILTERCAPS_MAGFPOINT |
+                                  D3DPTFILTERCAPS_MAGFLINEAR;
+  caps->TextureAddressCaps = D3DPTADDRESSCAPS_WRAP | D3DPTADDRESSCAPS_MIRROR |
+                             D3DPTADDRESSCAPS_CLAMP | D3DPTADDRESSCAPS_BORDER;
+  caps->VolumeTextureAddressCaps = caps->TextureAddressCaps;
+  caps->LineCaps = D3DLINECAPS_TEXTURE | D3DLINECAPS_ZTEST |
+                   D3DLINECAPS_BLEND | D3DLINECAPS_ALPHACMP |
+                   D3DLINECAPS_FOG | D3DLINECAPS_ANTIALIAS;
   caps->MaxTextureWidth = 4096;
   caps->MaxTextureHeight = 4096;
-  caps->MaxStreams = 16;
+  caps->MaxVolumeExtent = 2048;
+  caps->MaxTextureRepeat = 8192;
+  caps->MaxTextureAspectRatio = 8192;
+  caps->MaxAnisotropy = 16;
+  caps->MaxVertexW = 1.0e10f;
+  caps->GuardBandLeft = -8192.0f;
+  caps->GuardBandTop = -8192.0f;
+  caps->GuardBandRight = 8192.0f;
+  caps->GuardBandBottom = 8192.0f;
+  caps->ExtentsAdjust = 0.0f;
+  caps->StencilCaps = D3DSTENCILCAPS_KEEP | D3DSTENCILCAPS_ZERO |
+                      D3DSTENCILCAPS_REPLACE | D3DSTENCILCAPS_INCRSAT |
+                      D3DSTENCILCAPS_DECRSAT | D3DSTENCILCAPS_INVERT |
+                      D3DSTENCILCAPS_INCR | D3DSTENCILCAPS_DECR |
+                      D3DSTENCILCAPS_TWOSIDED;
+  caps->FVFCaps = D3DFVFCAPS_DONOTSTRIPELEMENTS | (8u << 16);
+  caps->TextureOpCaps = D3DTEXOPCAPS_DISABLE | D3DTEXOPCAPS_SELECTARG1 |
+                        D3DTEXOPCAPS_SELECTARG2 | D3DTEXOPCAPS_MODULATE |
+                        D3DTEXOPCAPS_MODULATE2X | D3DTEXOPCAPS_MODULATE4X |
+                        D3DTEXOPCAPS_ADD | D3DTEXOPCAPS_ADDSIGNED |
+                        D3DTEXOPCAPS_ADDSIGNED2X | D3DTEXOPCAPS_SUBTRACT |
+                        D3DTEXOPCAPS_ADDSMOOTH |
+                        D3DTEXOPCAPS_BLENDDIFFUSEALPHA |
+                        D3DTEXOPCAPS_BLENDTEXTUREALPHA |
+                        D3DTEXOPCAPS_BLENDFACTORALPHA |
+                        D3DTEXOPCAPS_BLENDTEXTUREALPHAPM |
+                        D3DTEXOPCAPS_BLENDCURRENTALPHA |
+                        D3DTEXOPCAPS_PREMODULATE | D3DTEXOPCAPS_MODULATEALPHA_ADDCOLOR |
+                        D3DTEXOPCAPS_MODULATECOLOR_ADDALPHA |
+                        D3DTEXOPCAPS_MODULATEINVALPHA_ADDCOLOR |
+                        D3DTEXOPCAPS_MODULATEINVCOLOR_ADDALPHA |
+                        D3DTEXOPCAPS_BUMPENVMAP |
+                        D3DTEXOPCAPS_BUMPENVMAPLUMINANCE |
+                        D3DTEXOPCAPS_DOTPRODUCT3 | D3DTEXOPCAPS_MULTIPLYADD |
+                        D3DTEXOPCAPS_LERP;
+  caps->MaxTextureBlendStages = 8;
   caps->MaxSimultaneousTextures = 16;
-  caps->MaxPrimitiveCount = 0xFFFFFu;
+  caps->VertexProcessingCaps = D3DVTXPCAPS_TEXGEN |
+                               D3DVTXPCAPS_MATERIALSOURCE7 |
+                               D3DVTXPCAPS_DIRECTIONALLIGHTS |
+                               D3DVTXPCAPS_POSITIONALLIGHTS |
+                               D3DVTXPCAPS_LOCALVIEWER |
+                               D3DVTXPCAPS_TWEENING;
+  caps->MaxActiveLights = 8;
+  caps->MaxUserClipPlanes = 6;
+  caps->MaxVertexBlendMatrices = 4;
+  caps->MaxVertexBlendMatrixIndex = 255;
+  caps->MaxPointSize = 256.0f;
+  caps->MaxPrimitiveCount = 0x00ffffffu;
+  caps->MaxVertexIndex = 0x00ffffffu;
+  caps->MaxStreams = 16;
+  caps->MaxStreamStride = 255;
+  caps->VertexShaderVersion = D3DVS_VERSION(3, 0);
+  caps->MaxVertexShaderConst = 256;
+  caps->PixelShaderVersion = D3DPS_VERSION(3, 0);
+  caps->PixelShader1xMaxValue = 3.402823466e+38f;
+  caps->DevCaps2 = D3DDEVCAPS2_STREAMOFFSET |
+                   D3DDEVCAPS2_VERTEXELEMENTSCANSHARESTREAMOFFSET;
+  caps->MaxNpatchTessellationLevel = 1.0f;
+  caps->MasterAdapterOrdinal = adapter;
+  caps->AdapterOrdinalInGroup = 0;
+  caps->NumberOfAdaptersInGroup = 1;
+  caps->DeclTypes = D3DDTCAPS_UBYTE4 | D3DDTCAPS_UBYTE4N |
+                    D3DDTCAPS_SHORT2N | D3DDTCAPS_SHORT4N |
+                    D3DDTCAPS_USHORT2N | D3DDTCAPS_USHORT4N |
+                    D3DDTCAPS_UDEC3 | D3DDTCAPS_DEC3N |
+                    D3DDTCAPS_FLOAT16_2 | D3DDTCAPS_FLOAT16_4;
+  caps->NumSimultaneousRTs = 4;
+  caps->StretchRectFilterCaps = D3DPTFILTERCAPS_MINFPOINT |
+                                D3DPTFILTERCAPS_MINFLINEAR |
+                                D3DPTFILTERCAPS_MAGFPOINT |
+                                D3DPTFILTERCAPS_MAGFLINEAR;
+  caps->VS20Caps.Caps = D3DVS20CAPS_PREDICATION;
+  caps->VS20Caps.DynamicFlowControlDepth = 24;
+  caps->VS20Caps.NumTemps = 32;
+  caps->VS20Caps.StaticFlowControlDepth = 4;
+  caps->PS20Caps.Caps = D3DPS20CAPS_ARBITRARYSWIZZLE |
+                        D3DPS20CAPS_GRADIENTINSTRUCTIONS |
+                        D3DPS20CAPS_PREDICATION;
+  caps->PS20Caps.DynamicFlowControlDepth = 24;
+  caps->PS20Caps.NumTemps = 32;
+  caps->PS20Caps.StaticFlowControlDepth = 4;
+  caps->PS20Caps.NumInstructionSlots = 512;
+  caps->VertexTextureFilterCaps = D3DPTFILTERCAPS_MINFPOINT |
+                                  D3DPTFILTERCAPS_MINFLINEAR |
+                                  D3DPTFILTERCAPS_MAGFPOINT |
+                                  D3DPTFILTERCAPS_MAGFLINEAR;
+  caps->MaxVShaderInstructionsExecuted = 65535;
+  caps->MaxPShaderInstructionsExecuted = 65535;
+  caps->MaxVertexShader30InstructionSlots = 32768;
+  caps->MaxPixelShader30InstructionSlots = 32768;
   dx9mt_logf("d3d9",
              "GetDeviceCaps adapter=%u type=%u -> ok vs=0x%08x ps=0x%08x",
              adapter, (unsigned)device_type, (unsigned)caps->VertexShaderVersion,

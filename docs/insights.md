@@ -1,71 +1,80 @@
 # dx9mt Insights
 
-Last updated: 2026-02-06
+Last updated: 2026-02-06  
 Source inputs: `research.md`, `frame3172-api-calls.txt`, `frame3172-unique-api-calls.txt`, live `/tmp/dx9mt_runtime.log`, `dxmt/`
 
-## Bottleneck Thesis (Confirmed)
-- The key issue is not raw draw count alone.
-- The dominant cost comes from CPU overhead:
-  - state-chatter translation around each draw
-  - repeated WoW64-to-native crossings
-  - redundant binding/pipeline work
+## Core Performance Thesis (Unchanged)
+- The dominant cost target is CPU-side translation overhead:
+  - high-frequency state churn
+  - too many boundary crossings
+  - redundant bind/pipeline work
+- Not just raw draw count.
 
-## FNV Trace Facts Driving Implementation Order
-- 34 unique API calls, 32,647 total records in sampled frame.
-- Highest-frequency calls are state/constant churn, not just draws.
-- `StretchRect` and `GetRenderTargetData` appear in-frame and are correctness-critical barriers.
+## Bring-Up Timeline (Most Important)
+1. Early state:
+   - `dx9mt` loaded but FNV exited before `CreateDevice`.
+2. Capability bring-up phase:
+   - Implemented non-trivial responses for `CheckDevice*` and `GetDeviceCaps`.
+   - Call volume reduced enough to isolate pivots.
+3. Launcher-path breakthrough:
+   - Overrode launcher to also use `dx9mt`.
+   - Exposed launcher-side failure at `CreateQuery` default stub.
+4. `CreateQuery` fix:
+   - Added minimal `IDirect3DQuery9`, launcher detect path stabilized.
+5. Game-path breakthrough:
+   - `FalloutNV.exe` now reaches `CreateDevice` and succeeds.
+6. Current state:
+   - Game still fails with `failed to initialize gamebryo renderer` after `CreateDevice` and `GetDeviceCaps`.
 
-## Architecture Principles (Still Valid)
-- Front-end:
-  - PE32 `d3d9.dll` COM implementation with shadow state.
-  - Emits compact command packets keyed by IDs/snapshots.
-- Backend:
-  - ARM64 `unixlib` consumes packets and owns Metal objects/caches.
-- Design rule:
-  - avoid 1:1 forwarding of every `Set*` call across boundaries.
+## High-Value Technical Insights
+- Per-app override granularity matters:
+  - overriding only `FalloutNV.exe` was insufficient for reliable launch behavior.
+  - launcher and game both needed `d3d9=native,builtin` for consistent detection and handoff.
+- Hard Wine restart before override application is required for reliable state:
+  - stale wineserver state can mask or delay override changes.
+- Missing-method failures are now moving later and are easier to isolate:
+  - once `CreateQuery` was implemented, failure advanced to post-device renderer init.
+- Current failure is likely contract/fidelity related, not loader/export related:
+  - exports/ordinals and COM shape are now good enough for launcher and device creation.
 
-## Startup Probe Insights (Current Priority)
-- FNV currently reaches `Direct3DCreate9`, then runs large capability probes before detaching.
-- The dominant startup chatter is still probe-heavy:
-  - `CheckDeviceMultiSampleType` dominates logs.
-  - `CheckDeviceFormat` and `CheckDepthStencilMatch` are the next largest sets.
-- Tightening capability semantics reduced log volume from ~24,570 to ~1,246 lines in a single run, which made failure pivots visible.
-- Latest pre-patch pivot found in logs:
-  - Last call before detach was `GetDeviceCaps adapter=0 type=2 -> NOTAVAILABLE`.
-  - This led to adding a `D3DDEVTYPE_REF` fallback compatibility path.
+## What the Logs Tell Us Now
+- Confirmed in latest runs:
+  - attach to `FalloutNVLauncher.exe`
+  - attach to `FalloutNV.exe`
+  - `CreateDevice` success on game process
+  - process still detaches shortly after initialization
+- No obvious `default stub:` log line in the immediate failing window of the newest run.
+- This shifts focus to:
+  - capability fidelity (`D3DCAPS9` fields/flags)
+  - behavior of methods used right after device creation (even if implemented).
 
-## Key Practical Insight From This Iteration
-- Silent-success defaults on D3D9 capability checks are dangerous.
-- Over-advertising capabilities produces very large probe trees and can push apps into unsupported settings.
-- Under-advertising certain legacy paths (for example `D3DDEVTYPE_REF` checks) can terminate startup before `CreateDevice`.
-- Startup bring-up requires a narrow compatibility band:
-  - honest enough to avoid bad mode selection
-  - permissive enough to pass old launcher/game negotiation code
+## Current Hypothesis
+- Gamebryo renderer init is rejecting the device contract after creation.
+- Most likely causes:
+  - one or more critical `D3DCAPS9` bits/limits are missing or unrealistic
+  - post-create method behavior mismatch during renderer bootstrap
 
-## Current Risk Register
-- No observed `CreateDevice` call yet in FNV runtime path.
-- D3D9Ex path is still missing (`Direct3DCreate9Ex`, `PresentEx`-related behavior).
-- Texture family is incomplete (`CreateCubeTexture`, `CreateVolumeTexture` still return not available).
-- Backend is still a stub, so current progress is startup negotiation + front-end correctness only.
-
-## Validation Signals To Keep Watching
-- Under per-app override (`FalloutNV.exe: d3d9=native,builtin`):
-  - first appearance of `CreateDevice` in `/tmp/dx9mt_runtime.log`
-  - last call before first `PROCESS_DETACH`
-  - whether capability checks settle on a stable mode tuple instead of exiting
-
-## Tooling Notes
-- Analyzer script: `tools/analyze_dx9mt_log.py`
-- Typical usage:
+## Practical Validation Pattern
+- Always validate with:
+  - `make run`
+  - reproduce (`Detect`, then `Play`)
+  - `make show-logs`
+- Optional deep summary:
   - `uv run tools/analyze_dx9mt_log.py /tmp/dx9mt_runtime.log --top 20`
-- The script now handles PID-tagged detach lines (`PROCESS_DETACH pid=...`) correctly.
+- Target query for progression:
+  - `rg -n "PROCESS_ATTACH|CreateDevice|GetDeviceCaps|default stub:|PROCESS_DETACH" /tmp/dx9mt_runtime.log`
+
+## Risk Register
+- `Direct3DCreate9Ex` path still unimplemented (`D3DERR_NOTAVAILABLE`).
+- Texture family still incomplete (`CreateCubeTexture`, `CreateVolumeTexture` currently return not available).
+- Backend remains stub/no-op for real rendering work.
+- Startup probe logs are still large; precision logging is required to keep debugging efficient.
 
 ## Decision Log
-- 2026-02-06: Adopt PE32 front-end + ARM64 backend command-stream architecture.
-- 2026-02-06: Completed M1 scaffold and M2 minimal correctness baseline.
-- 2026-02-06: Prioritized frame-visible correctness gates (`StretchRect`, `GetRenderTargetData`) before performance phases.
-- 2026-02-06: Added explicit unsupported returns for unimplemented texture families to avoid false-positive success behavior.
-- 2026-02-06: Matched Wine `d3d9.dll` export ordinals via `dx9mt/src/frontend/d3d9.def`.
-- 2026-02-06: Simplified operator workflow to `make run` + `make show-logs`.
-- 2026-02-06: Added runtime log analyzer and moved tooling to `uv` project workflow.
-- 2026-02-06: Shifted immediate focus to startup capability negotiation before device creation.
+- 2026-02-06: Adopted PE32 front-end + ARM64 backend bridge architecture.
+- 2026-02-06: Matched Wine ordinal/export compatibility for `d3d9.dll`.
+- 2026-02-06: Standardized operator workflow around `make run` + `make show-logs`.
+- 2026-02-06: Added wineserver restart guard before override-sensitive operations.
+- 2026-02-06: Implemented launcher-critical `CreateQuery` path.
+- 2026-02-06: Reached first successful `CreateDevice` in `FalloutNV.exe` path.
+- 2026-02-06: Shifted immediate target to post-`CreateDevice` Gamebryo renderer initialization.
