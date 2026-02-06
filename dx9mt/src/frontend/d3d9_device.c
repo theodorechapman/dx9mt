@@ -411,6 +411,38 @@ static UINT dx9mt_bytes_per_pixel(D3DFORMAT format) {
   }
 }
 
+static int dx9mt_env_flag_enabled(const char *name) {
+  const char *value;
+
+  if (!name) {
+    return 0;
+  }
+
+  value = getenv(name);
+  if (!value || !*value || strcmp(value, "0") == 0 ||
+      strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+      strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+      strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+    return 0;
+  }
+
+  return 1;
+}
+
+static int dx9mt_frontend_soft_present_enabled(void) {
+  static LONG cached = -1;
+  LONG current;
+
+  current = InterlockedCompareExchange(&cached, -1, -1);
+  if (current >= 0) {
+    return (int)current;
+  }
+
+  current = dx9mt_env_flag_enabled("DX9MT_FRONTEND_SOFT_PRESENT") ? 1 : 0;
+  InterlockedExchange(&cached, current);
+  return (int)current;
+}
+
 static UINT dx9mt_surface_pitch(const D3DSURFACE_DESC *desc) {
   return desc->Width * dx9mt_bytes_per_pixel(desc->Format);
 }
@@ -600,6 +632,7 @@ dx9mt_resolve_backbuffer_format(const D3DPRESENT_PARAMETERS *params) {
 
 static HRESULT dx9mt_device_publish_present_target(dx9mt_device *self) {
   dx9mt_backend_present_target_desc desc;
+  HWND present_window;
 
   if (!self) {
     return D3DERR_INVALIDCALL;
@@ -613,7 +646,10 @@ static HRESULT dx9mt_device_publish_present_target(dx9mt_device *self) {
   }
 
   memset(&desc, 0, sizeof(desc));
+  present_window =
+      self->params.hDeviceWindow ? self->params.hDeviceWindow : self->focus_window;
   desc.target_id = self->present_target_id;
+  desc.window_handle = (uint64_t)(uintptr_t)present_window;
   desc.width = dx9mt_resolve_backbuffer_width(&self->params);
   desc.height = dx9mt_resolve_backbuffer_height(&self->params);
   desc.format = (uint32_t)dx9mt_resolve_backbuffer_format(&self->params);
@@ -622,8 +658,9 @@ static HRESULT dx9mt_device_publish_present_target(dx9mt_device *self) {
   if (dx9mt_backend_bridge_update_present_target(&desc) != 0) {
     dx9mt_logf(
         "device",
-        "failed to publish present target metadata target=%llu size=%ux%u fmt=%u windowed=%u",
-        (unsigned long long)desc.target_id, desc.width, desc.height, desc.format,
+        "failed to publish present target metadata target=%llu hwnd=0x%llx size=%ux%u fmt=%u windowed=%u",
+        (unsigned long long)desc.target_id,
+        (unsigned long long)desc.window_handle, desc.width, desc.height, desc.format,
         desc.windowed);
     return D3DERR_DRIVERINTERNALERROR;
   }
@@ -678,6 +715,127 @@ static HRESULT dx9mt_surface_fill_rect(dx9mt_surface *surface, const RECT *rect,
       BYTE value8 = (BYTE)(color & 0xFFu);
       memset(dst_row, value8, width);
     }
+  }
+
+  return D3D_OK;
+}
+
+static HWND dx9mt_device_resolve_present_window(const dx9mt_device *self,
+                                                HWND dst_window_override) {
+  if (!self) {
+    return NULL;
+  }
+  if (dst_window_override) {
+    return dst_window_override;
+  }
+  if (self->params.hDeviceWindow) {
+    return self->params.hDeviceWindow;
+  }
+  return self->focus_window;
+}
+
+static void dx9mt_surface_apply_debug_overlay(dx9mt_surface *surface,
+                                              uint32_t frame_id) {
+  UINT overlay_w;
+  UINT overlay_h;
+  UINT x;
+  UINT y;
+  DWORD base_color;
+
+  if (!surface || !surface->sysmem || dx9mt_bytes_per_pixel(surface->desc.Format) != 4) {
+    return;
+  }
+
+  overlay_w = surface->desc.Width < 96u ? surface->desc.Width : 96u;
+  overlay_h = surface->desc.Height < 16u ? surface->desc.Height : 16u;
+  if (overlay_w == 0 || overlay_h == 0) {
+    return;
+  }
+
+  base_color = 0xFF000000u | (((frame_id * 13u) & 0xFFu) << 16) |
+               (((frame_id * 29u) & 0xFFu) << 8) | ((frame_id * 47u) & 0xFFu);
+
+  for (y = 0; y < overlay_h; ++y) {
+    DWORD *row = (DWORD *)(surface->sysmem + (SIZE_T)y * surface->pitch);
+    for (x = 0; x < overlay_w; ++x) {
+      DWORD color = base_color;
+      if (((x >> 3) + y + frame_id) & 1u) {
+        color ^= 0x00FFFFFFu;
+      }
+      row[x] = color;
+    }
+  }
+}
+
+static HRESULT dx9mt_device_soft_present(dx9mt_device *self,
+                                         HWND dst_window_override) {
+  dx9mt_surface *backbuffer;
+  HWND hwnd;
+  HDC hdc;
+  BITMAPINFO bmi;
+  HRESULT hr;
+  int stretch_result;
+  static LONG log_counter = 0;
+
+  if (!self || !dx9mt_frontend_soft_present_enabled()) {
+    return D3D_OK;
+  }
+  if (!self->swapchain || !self->swapchain->backbuffer) {
+    return D3D_OK;
+  }
+
+  backbuffer = dx9mt_surface_from_iface(self->swapchain->backbuffer);
+  if (!backbuffer) {
+    return D3D_OK;
+  }
+
+  hr = dx9mt_surface_ensure_sysmem(backbuffer);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  if (dx9mt_bytes_per_pixel(backbuffer->desc.Format) != 4) {
+    if (dx9mt_should_log_method_sample(&log_counter, 4, 256)) {
+      dx9mt_logf("device", "soft present skipped unsupported format=%u",
+                 (unsigned)backbuffer->desc.Format);
+    }
+    return D3D_OK;
+  }
+
+  dx9mt_surface_apply_debug_overlay(backbuffer, self->frame_id);
+
+  hwnd = dx9mt_device_resolve_present_window(self, dst_window_override);
+  if (!hwnd || !IsWindow(hwnd)) {
+    if (dx9mt_should_log_method_sample(&log_counter, 4, 256)) {
+      dx9mt_logf("device", "soft present skipped invalid window hwnd=%p", hwnd);
+    }
+    return D3D_OK;
+  }
+
+  hdc = GetDC(hwnd);
+  if (!hdc) {
+    if (dx9mt_should_log_method_sample(&log_counter, 4, 256)) {
+      dx9mt_logf("device", "soft present GetDC failed hwnd=%p", hwnd);
+    }
+    return D3D_OK;
+  }
+
+  memset(&bmi, 0, sizeof(bmi));
+  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bmi.bmiHeader.biWidth = (LONG)backbuffer->desc.Width;
+  bmi.bmiHeader.biHeight = -(LONG)backbuffer->desc.Height;
+  bmi.bmiHeader.biPlanes = 1;
+  bmi.bmiHeader.biBitCount = 32;
+  bmi.bmiHeader.biCompression = BI_RGB;
+
+  stretch_result = StretchDIBits(
+      hdc, 0, 0, (int)backbuffer->desc.Width, (int)backbuffer->desc.Height, 0, 0,
+      (int)backbuffer->desc.Width, (int)backbuffer->desc.Height, backbuffer->sysmem,
+      &bmi, DIB_RGB_COLORS, SRCCOPY);
+  ReleaseDC(hwnd, hdc);
+
+  if (stretch_result <= 0 && dx9mt_should_log_method_sample(&log_counter, 4, 256)) {
+    dx9mt_logf("device", "soft present StretchDIBits failed result=%d frame=%u",
+               stretch_result, self->frame_id);
   }
 
   return D3D_OK;
@@ -3484,7 +3642,6 @@ static HRESULT WINAPI dx9mt_device_Present(IDirect3DDevice9 *iface,
 
   (void)src_rect;
   (void)dst_rect;
-  (void)dst_window_override;
   (void)dirty_region;
 
   memset(&packet, 0, sizeof(packet));
@@ -3495,6 +3652,12 @@ static HRESULT WINAPI dx9mt_device_Present(IDirect3DDevice9 *iface,
 
   dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
   hr = dx9mt_backend_bridge_present(self->frame_id) == 0 ? D3D_OK : D3DERR_DEVICELOST;
+  if (SUCCEEDED(hr)) {
+    HRESULT soft_hr = dx9mt_device_soft_present(self, dst_window_override);
+    if (FAILED(soft_hr)) {
+      hr = soft_hr;
+    }
+  }
 
   ++self->frame_id;
   return hr;
@@ -3883,8 +4046,31 @@ static HRESULT WINAPI dx9mt_device_Clear(IDirect3DDevice9 *iface,
                                           DWORD stencil) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   dx9mt_packet_clear packet;
+  HRESULT hr;
+  dx9mt_surface *rt0;
+  DWORD i;
 
-  (void)rects;
+  rt0 = dx9mt_surface_from_iface(self->render_targets[0]);
+  if ((flags & D3DCLEAR_TARGET) != 0 && rt0) {
+    if (rect_count == 0 || !rects) {
+      hr = dx9mt_surface_fill_rect(rt0, NULL, color);
+      if (FAILED(hr)) {
+        return hr;
+      }
+    } else {
+      for (i = 0; i < rect_count; ++i) {
+        RECT clear_rect;
+        clear_rect.left = rects[i].x1;
+        clear_rect.top = rects[i].y1;
+        clear_rect.right = rects[i].x2;
+        clear_rect.bottom = rects[i].y2;
+        hr = dx9mt_surface_fill_rect(rt0, &clear_rect, color);
+        if (FAILED(hr)) {
+          return hr;
+        }
+      }
+    }
+  }
 
   memset(&packet, 0, sizeof(packet));
   packet.header.type = DX9MT_PACKET_CLEAR;

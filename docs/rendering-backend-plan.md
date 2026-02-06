@@ -12,7 +12,15 @@ Move from backend `Present` no-op to visible, packet-driven rendering while pres
   - `CLEAR`
   - `DRAW_INDEXED`
   - `PRESENT`
+- Packet contract baseline from `RB0` is now active:
+  - monotonic per-packet sequence values.
+  - explicit present-target metadata (`target/size/format/windowed`).
+  - draw-critical object/state IDs in `DRAW_INDEXED`.
 - Backend currently logs frame summaries only and does not render.
+- Optional bootstrap path exists for visual validation while backend remains no-op:
+  - `DX9MT_BACKEND_SOFT_PRESENT=1` enables backend-side window clear/marker present using target window metadata.
+  - `DX9MT_FRONTEND_SOFT_PRESENT=1` enables frontend GDI blit + deterministic debug marker overlay.
+  - useful for confirming frame progress in-window under Wine while RB1 real replay path is still incomplete.
 - Latest observed sample frames (`~120` interval logs) are consistent:
   - `packets=21`
   - `draws=19`
@@ -21,10 +29,18 @@ Move from backend `Present` no-op to visible, packet-driven rendering while pres
 ## Implementation Findings From Source Audit (2026-02-06)
 - `BeginScene` is the current frame-open hook (`dx9mt_backend_bridge_begin_frame(self->frame_id)`).
 - `Present` emits `DX9MT_PACKET_PRESENT`, calls backend present, then increments `frame_id`.
-- `Clear` and `DrawIndexedPrimitive` currently emit packets, but draw packets do not yet include replay-critical bound-resource/state identity.
-- Packet `sequence` is currently frame-derived (`frame_id + 1`) rather than strictly monotonic per packet.
+- `SwapChain::Present` delegates to `Device::Present`, so present sequencing is unified in one code path.
+- `Clear` and `DrawIndexedPrimitive` emit packets with monotonic sequence via `dx9mt_runtime_next_packet_sequence()`.
+- `DRAW_INDEXED` now includes replay-critical IDs/hashes:
+  - RT/DS/VB/IB/vertex-decl/shader IDs.
+  - FVF, stream0 offset/stride, viewport/scissor hashes, state-block hash.
 - Backend stub only parses/counts packets and logs sampled frame summaries; it does not execute rendering.
-- Front-end tracks substantial device state (render/sampler/texture-stage state, stream/index bindings, shaders/constants, RT/DS bindings), but that state is not yet encoded into backend-replayable packet form.
+- Backend parser now rejects malformed/incomplete packet streams:
+  - parse-size/tail mismatch.
+  - non-monotonic packet sequence.
+  - draw packets missing required state IDs or too small payloads.
+- Front-end still tracks additional device state (render/sampler/texture-stage state, stream bindings beyond stream0, constant payload refs) that is not fully replayed yet.
+- Object IDs are kind-tagged (`kind << 24 | serial`), improving replay identity and log diagnostics.
 - `DrawPrimitive` is still a stub (`D3D_OK`, sampled log only) and not represented in backend work.
 - `CreateCubeTexture` now has minimal object support; `CreateVolumeTexture` remains `D3DERR_NOTAVAILABLE`.
 
@@ -69,26 +85,33 @@ Move from backend `Present` no-op to visible, packet-driven rendering while pres
 
 ## Implementation Phases
 
-### RB0 - Contract Cleanup And Guardrails
+### RB0 - Contract Cleanup And Guardrails (Completed 2026-02-06)
 - Purpose:
   - prepare bridge API and runtime metadata for non-no-op present.
 - Changes:
-  - define backend bridge ABI with fixed-width scalar types only; no raw pointer fields in packet-replay contracts.
-  - define explicit present-target metadata path (target handle, dimensions, format, windowed/fullscreen intent) from front-end to backend.
-  - add a strict packet-contract baseline:
+  - fixed-width bridge metadata contract in use for present target updates.
+  - explicit present-target metadata path wired through device create/reset.
+  - strict packet-contract baseline implemented:
     - monotonic per-packet sequence counter.
-    - explicit object/state identity payloads for draw-critical bindings.
-    - stable object handle namespace for VB/IB/texture/surface identity across packet submission and replay.
-  - add backend-side contract validation logs (missing target metadata, out-of-order frame events, unsupported packet/state combinations).
-  - keep no-op fallback behind a feature flag for safe rollback.
-  - ensure per-frame stats still log at sampled intervals.
+    - explicit draw-critical object/state identity payloads.
+    - stable object handle namespace for VB/IB/texture/surface/shader identity.
+  - backend-side contract validation logs implemented (missing target metadata, out-of-order sequence, malformed/incomplete draw packets).
+  - per-frame sampled stats remain active.
 - Touchpoints:
   - `dx9mt/include/dx9mt/backend_bridge.h`
+  - `dx9mt/include/dx9mt/packets.h`
   - `dx9mt/src/frontend/d3d9_device.c`
+  - `dx9mt/src/frontend/runtime.c`
   - `dx9mt/src/backend/backend_bridge_stub.c`
+  - `dx9mt/tests/backend_bridge_contract_test.c`
 - Acceptance:
-  - build passes.
-  - logs show present-target metadata received and updated on reset.
+  - `make test` passes (`backend_bridge_contract_test: PASS`).
+  - runtime logs show present-target metadata received (`present target updated: target=33554433 ...`).
+  - latest manual validation shows no active:
+    - `draw packet missing state ids`
+    - `draw packet too small`
+    - `packet parse error`
+    - `packet sequence out of order`
 
 ### RB1 - First Visible Present Path
 - Purpose:
@@ -181,17 +204,22 @@ Move from backend `Present` no-op to visible, packet-driven rendering while pres
 - Acceptance:
   - extended gameplay session without new fatal API rejects.
 
-## Work Breakdown For RB0/RB1 (Immediate)
-1. Define fixed-width backend bridge ABI updates (no replay-critical raw pointers) and wire present-target metadata through `CreateDevice` + `Reset`.
-2. Replace frame-derived packet sequence values with monotonic packet sequencing.
-3. Define stable object/state identity fields for first draw-critical packet extensions (minimum viable RB2/RB3 set).
-4. Implement first visible present path (clear + debug overlay) through a dedicated presenter boundary with no-op fallback flag.
-5. Keep `DX9MT_BACKEND_TRACE_PACKETS` support unchanged.
-6. Retest with:
+## Work Breakdown For RB1/RB2 (Immediate)
+1. Implement RB1 presenter boundary in backend and replace `present ... (no-op)` with first visible deterministic output path.
+2. Keep rollback/fallback control explicit so startup stability can be compared quickly across runs.
+3. Build RB2 frame-state recording in backend (`submit_packets` -> frame snapshot -> present consume/reset).
+4. Extend replay payload only where needed for first geometry pass:
+   - texture/sampler stage identity.
+   - shader constant payload references (currently ABI fields exist but are not populated).
+   - additional stream bindings beyond stream0 where required by observed scenes.
+5. Expand native tests alongside RB1/RB2:
+   - keep contract test coverage in `make test`.
+   - add focused frame-order/replay-state tests as backend replay logic grows.
+6. Retest loop:
+   - `make test`
    - `make run`
    - `make show-logs`
-   - `make analyze-logs`
-   - `rg -n "present frame|CreateDevice|PROCESS_ATTACH|PROCESS_DETACH|packet parse error|no-op" /tmp/dx9mt_runtime.log`
+   - `rg -n "present target updated|present frame=.*target=|draw packet missing state ids|draw packet too small|packet parse error|packet sequence out of order|no-op" /tmp/dx9mt_runtime.log`
 
 ## Definition Of Done For "Begin Rendering Backend"
 - Backend is no longer present no-op.

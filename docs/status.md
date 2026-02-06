@@ -67,6 +67,20 @@ Ship a high-performance direct `d3d9.dll` replacement for 32-bit DX9 games under
 - Added/kept analyzer tooling:
   - `tools/analyze_dx9mt_log.py`
   - `uv` project setup (`pyproject.toml`, `uv.lock`).
+- Backend contract hardening for rendering bring-up (`RB0`) landed:
+  - monotonic packet sequencing via `dx9mt_runtime_next_packet_sequence()`.
+  - present-target metadata publishing on device create/reset (`target/window/size/format/windowed`).
+  - swapchain present delegated to device present to keep one packet sequencing path.
+  - `DRAW_INDEXED` packets now include draw-critical IDs/hashes (RT/DS/VB/IB/decl/shaders/FVF/stream0/viewport/scissor).
+  - backend parser validates draw packet size and required state IDs.
+- Automated contract tests added:
+  - `dx9mt/tests/backend_bridge_contract_test.c`
+  - top-level `make test` / `make -C dx9mt test-native` pass.
+- RB1 bootstrap paths added (optional):
+  - `DX9MT_BACKEND_SOFT_PRESENT=1` enables backend-side window clear/marker present using present-target window metadata.
+  - `DX9MT_FRONTEND_SOFT_PRESENT=1` enables a software present path that blits backbuffer sysmem to the Wine window via GDI.
+  - `Clear(D3DCLEAR_TARGET)` now updates RT0 sysmem, and present overlays a deterministic frame marker for visual confirmation.
+  - these are temporary validation paths; real Metal/backend replay remains the long-term target.
 
 ## Current Verified Runtime State
 - Launcher path:
@@ -80,13 +94,24 @@ Ship a high-performance direct `d3d9.dll` replacement for 32-bit DX9 games under
   - `CreateCubeTexture` now succeeds in the game startup path (`hr=0x00000000`).
   - Game progresses past previous `failed to initialize gamebryo renderer` error.
   - Runtime reaches active frame loop with large `DRAW_INDEXED` + `PRESENT` traffic.
-  - Latest run sustained through at least frame `4080` with no new startup-time API failure signal.
-  - No `CreateVolumeTexture unsupported` or `DrawPrimitive stub` signal in the latest capture window.
-  - User-observed behavior: black screen with active audio/input cues.
+  - Latest manual validation sustained through at least frame `2760` with stable present target metadata:
+    - `present target updated: target=33554433 size=1280x720 fmt=22 windowed=1`
+    - repeated `present frame=... target=33554433 size=1280x720 fmt=22 (no-op)`
+  - Latest manual validation had no contract errors:
+    - no `packet parse error`
+    - no `packet sequence out of order`
+    - no `draw packet missing state ids`
+    - no `draw packet too small`
+  - No `CreateVolumeTexture unsupported` or `DrawPrimitive stub` signal in latest runtime slices.
+  - Automated contract validation currently passes (`backend_bridge_contract_test: PASS` via `make test`).
+  - User-observed behavior in bootstrap mode: top-left marker/texture changes color frame-to-frame (expected).
+  - Without bootstrap mode: black screen with active audio/input cues.
 
 ## Current Blocker
 - Backend present/render path is still intentionally `no-op`; black screen is currently expected.
-- Current issue is no longer early launcher/device init failure, it is missing real backend rendering.
+- Current issue is no longer early launcher/device init failure; it is missing real backend rendering.
+- `RB0` bridge/packet guardrails are in place and validated.
+- Next blocker to clear is `RB1`: first visible backend present path (real backend path, not frontend bootstrap).
 - Remaining compatibility gaps still exist (`CreateVolumeTexture` and other unimplemented methods), with instrumentation to confirm call impact.
 
 ## Backend Plan
@@ -112,6 +137,12 @@ Ship a high-performance direct `d3d9.dll` replacement for 32-bit DX9 games under
 Step 1 is complete only when FNV progresses past Gamebryo renderer initialization into stable in-game rendering path under `dx9mt`.
 
 ## Next 1-3 Actions
-1. Implement backend milestone `RB0`/`RB1` from `docs/rendering-backend-plan.md` to replace present `no-op` with first visible output path.
-2. Keep probe tracing off by default for readability; only enable `DX9MT_TRACE_PROBES=1` for focused compatibility dives.
-3. After first visible frame, begin `RB2` packet-driven pass replay scaffolding while keeping launcher/startup behavior stable.
+1. Implement `RB1` first-visible present path (replace backend present no-op with a deterministic clear/output path).
+2. Start `RB2` frame-state replay scaffolding using the new draw packet identity fields and monotonic sequence contract.
+3. Keep the validation loop strict on every change:
+   - `make test`
+   - `make run`
+   - `rg -n "present target updated|present frame=.*target=|draw packet missing state ids|draw packet too small|packet parse error|packet sequence out of order" /tmp/dx9mt_runtime.log`
+   - optional visible bootstrap checks:
+     - `DX9MT_BACKEND_SOFT_PRESENT=1 make run`
+     - `DX9MT_FRONTEND_SOFT_PRESENT=1 make run`

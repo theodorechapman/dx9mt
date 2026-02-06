@@ -5,7 +5,7 @@ BUILD_DIR := build
 OBJ_DIR := $(BUILD_DIR)/obj
 
 FRONTEND_CFLAGS := -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude -DWIN32_LEAN_AND_MEAN
-FRONTEND_LDFLAGS := -shared -Wl,--kill-at -luuid
+FRONTEND_LDFLAGS := -shared -Wl,--kill-at -luuid -lgdi32
 FRONTEND_DEF := src/frontend/d3d9.def
 
 BACKEND_CFLAGS := -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude
@@ -40,7 +40,7 @@ all: $(BUILD_DIR)/d3d9.dll $(BUILD_DIR)/libdx9mt_unixlib.dylib
 
 $(BUILD_DIR)/d3d9.dll: $(FRONTEND_OBJS) $(FRONTEND_DEF)
 	@mkdir -p $(BUILD_DIR)
-	$(FRONTEND_CC) $(FRONTEND_LDFLAGS) -o $@ $(FRONTEND_OBJS) $(FRONTEND_DEF)
+	$(FRONTEND_CC) -o $@ $(FRONTEND_OBJS) $(FRONTEND_DEF) $(FRONTEND_LDFLAGS)
 
 $(BUILD_DIR)/libdx9mt_unixlib.dylib: $(BACKEND_OBJS)
 	@mkdir -p $(BUILD_DIR)

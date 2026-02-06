@@ -4,6 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include "dx9mt/log.h"
 
 static int g_backend_ready;
@@ -20,6 +27,7 @@ static int g_have_present_target;
 static dx9mt_backend_present_target_desc g_present_target;
 static int g_frame_open;
 static int g_trace_packets = -1;
+static int g_soft_present = -1;
 
 static const char *dx9mt_packet_type_name(uint16_t type) {
   switch (type) {
@@ -58,6 +66,96 @@ static int dx9mt_backend_trace_packets_enabled(void) {
   return g_trace_packets;
 }
 
+ #ifdef _WIN32
+static int dx9mt_backend_soft_present_enabled(void) {
+  const char *value;
+
+  if (g_soft_present >= 0) {
+    return g_soft_present;
+  }
+
+  value = getenv("DX9MT_BACKEND_SOFT_PRESENT");
+  if (!value || !*value || strcmp(value, "0") == 0 ||
+      strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+      strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+      strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+    g_soft_present = 0;
+  } else {
+    g_soft_present = 1;
+  }
+
+  return g_soft_present;
+}
+#endif
+
+#ifdef _WIN32
+static COLORREF dx9mt_colorref_from_d3dcolor(uint32_t color) {
+  return RGB((color >> 16) & 0xffu, (color >> 8) & 0xffu, color & 0xffu);
+}
+
+static int dx9mt_backend_soft_present_to_window(uint32_t frame_id) {
+  HWND hwnd;
+  HDC hdc;
+  RECT client;
+  RECT marker;
+  HBRUSH clear_brush;
+  HBRUSH marker_brush;
+  COLORREF clear_color;
+  COLORREF marker_color;
+
+  if (!dx9mt_backend_soft_present_enabled()) {
+    return 0;
+  }
+  if (g_present_target.window_handle == 0) {
+    return 0;
+  }
+
+  hwnd = (HWND)(uintptr_t)g_present_target.window_handle;
+  if (!IsWindow(hwnd)) {
+    return 0;
+  }
+
+  hdc = GetDC(hwnd);
+  if (!hdc) {
+    return 0;
+  }
+  if (!GetClientRect(hwnd, &client)) {
+    ReleaseDC(hwnd, hdc);
+    return 0;
+  }
+
+  clear_color = dx9mt_colorref_from_d3dcolor(g_last_clear_color);
+  clear_brush = CreateSolidBrush(clear_color);
+  if (clear_brush) {
+    FillRect(hdc, &client, clear_brush);
+    DeleteObject((HGDIOBJ)clear_brush);
+  }
+
+  marker = client;
+  if (marker.right > marker.left + 96) {
+    marker.right = marker.left + 96;
+  }
+  if (marker.bottom > marker.top + 16) {
+    marker.bottom = marker.top + 16;
+  }
+  marker_color = RGB((frame_id * 13u) & 0xffu, (frame_id * 29u) & 0xffu,
+                     (frame_id * 47u) & 0xffu);
+  marker_brush = CreateSolidBrush(marker_color);
+  if (marker_brush) {
+    FillRect(hdc, &marker, marker_brush);
+    DeleteObject((HGDIOBJ)marker_brush);
+  }
+
+  ReleaseDC(hwnd, hdc);
+  return 1;
+}
+#else
+static int dx9mt_backend_soft_present_to_window(uint32_t frame_id) {
+  (void)frame_id;
+  return 0;
+}
+#endif
+
 static int dx9mt_backend_should_log_frame(uint32_t frame_id) {
   return frame_id < 10 || (frame_id % 120) == 0;
 }
@@ -87,6 +185,7 @@ int dx9mt_backend_bridge_init(const dx9mt_backend_init_desc *desc) {
   g_have_present_target = 0;
   memset(&g_present_target, 0, sizeof(g_present_target));
   g_frame_open = 0;
+  g_soft_present = -1;
   dx9mt_backend_reset_frame_stats();
   return 0;
 }
@@ -112,10 +211,10 @@ int dx9mt_backend_bridge_update_present_target(
 
   dx9mt_logf(
       "backend",
-      "present target updated: target=%llu size=%ux%u fmt=%u windowed=%u",
-      (unsigned long long)g_present_target.target_id, g_present_target.width,
-      g_present_target.height, g_present_target.format,
-      g_present_target.windowed);
+      "present target updated: target=%llu hwnd=0x%llx size=%ux%u fmt=%u windowed=%u",
+      (unsigned long long)g_present_target.target_id,
+      (unsigned long long)g_present_target.window_handle, g_present_target.width,
+      g_present_target.height, g_present_target.format, g_present_target.windowed);
   return 0;
 }
 
@@ -240,6 +339,9 @@ int dx9mt_backend_bridge_begin_frame(uint32_t frame_id) {
 }
 
 int dx9mt_backend_bridge_present(uint32_t frame_id) {
+  int soft_presented;
+  const char *present_mode = "no-op";
+
   if (!g_backend_ready) {
     return -1;
   }
@@ -254,12 +356,17 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
 
   g_frame_open = 0;
   g_last_frame_id = frame_id;
+  soft_presented = dx9mt_backend_soft_present_to_window(frame_id);
+  if (soft_presented) {
+    present_mode = "soft-present";
+  }
   if (dx9mt_backend_should_log_frame(frame_id)) {
     dx9mt_logf(
         "backend",
-        "present frame=%u target=%llu size=%ux%u fmt=%u (no-op) packets=%u draws=%u clears=%u last_clear=0x%08x flags=0x%08x z=%.3f stencil=%u",
+        "present frame=%u target=%llu size=%ux%u fmt=%u (%s) packets=%u draws=%u clears=%u last_clear=0x%08x flags=0x%08x z=%.3f stencil=%u",
         frame_id, (unsigned long long)g_present_target.target_id,
         g_present_target.width, g_present_target.height, g_present_target.format,
+        present_mode,
         g_frame_packet_count, g_frame_draw_indexed_count,
         g_frame_clear_count, g_last_clear_color, g_last_clear_flags,
         (double)g_last_clear_z, g_last_clear_stencil);

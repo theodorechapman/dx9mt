@@ -279,17 +279,21 @@ For each regression:
 - sampler and texture stage behavior not directly equivalent to modern shader-centric pipelines.
 - coordinate/system conventions and precision edge cases.
 
-### 12.3 Packet Contract Requirements (Current dx9mt Gap)
-Current `dx9mt` draw packets are intentionally too thin for real replay:
-- `DX9MT_PACKET_DRAW_INDEXED` currently carries primitive/index range metadata but no full bound-state/resource identity.
-- device state is stored in frontend object memory, not encoded for backend replay.
+### 12.3 Packet Contract Requirements (Current dx9mt Status)
+`dx9mt` now has a stronger replay contract baseline for `DRAW_INDEXED`:
+- draw packets include primitive/index range plus draw-critical replay identity:
+  - `render_target_id`, `depth_stencil_id`
+  - `vertex_buffer_id`, `index_buffer_id`
+  - `vertex_decl_id`, `vertex_shader_id`, `pixel_shader_id`
+  - `fvf`, stream0 offset/stride
+  - viewport/scissor hashes and state-block hash
+- packet sequence values are monotonic per packet (runtime-global counter), not frame-derived.
+- backend parser enforces packet ordering and draw packet shape/required IDs.
 
-To render correctly in backend, packet schema must evolve to include:
-- bound VB/IB identity + offsets/strides.
-- vertex declaration/FVF-derived layout identity.
-- shader identity and constant payload references.
-- render target/depth target identity and viewport/scissor.
-- render/sampler/texture-stage state deltas (or validated state blocks).
+Remaining payload work for full-fidelity replay:
+- texture/sampler stage identity and state deltas.
+- shader constant payload reference population (ABI fields exist, but data plumbing is still pending).
+- additional stream bindings beyond stream0 where required by scene content.
 
 ## 13. Backend Bring-Up Blueprint (Actionable)
 ### Phase A: First Visible Correctness
@@ -317,14 +321,19 @@ To render correctly in backend, packet schema must evolve to include:
 ## 14. dx9mt-Specific Implementation Notes (From Current Source Audit)
 Observed in current source tree:
 - Frontend emits packets for `CLEAR`, `DRAW_INDEXED`, and `PRESENT`.
+- `DRAW_INDEXED` packet payload now includes replay-critical object/state IDs and hashes.
+- present-target metadata is explicitly published to backend (`target_id`, dimensions, format, windowed).
+- packet sequencing is monotonic per packet via runtime counter.
+- swapchain present delegates to device present, keeping one present packet path.
 - Backend bridge parses packets and reports sampled per-frame stats, but does not render.
+- backend parser enforces contract checks (packet parse/sequence + draw packet size/state IDs).
 - `BeginScene` triggers backend `begin_frame`; `Present` submits present packet and increments frame id.
 - `DrawPrimitive` remains a stub (returns `D3D_OK` but no backend geometry packet).
 - `CreateVolumeTexture` returns `D3DERR_NOTAVAILABLE`; `CreateCubeTexture` has minimal object support.
-- Significant D3D9 state is tracked in frontend object state but not replayable by backend yet.
+- Significant D3D9 state is still tracked in frontend object state but not fully replayable by backend yet (notably texture-stage/sampler state and full shader-constant payload plumbing).
 
 Consequence:
-- Next backend milestone is primarily a contract and state-serialization problem, not a Metal API familiarity problem.
+- The contract baseline is now largely in place; next backend milestone is implementing visible present/replay execution on top of that contract.
 
 ## 15. Cross-Project Lessons from dxmt (DX10/11 -> Metal)
 ### 15.1 Wine Split Architecture Pattern

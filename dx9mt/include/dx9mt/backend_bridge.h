@@ -14,6 +14,7 @@ typedef struct dx9mt_backend_init_desc {
 
 typedef struct dx9mt_backend_present_target_desc {
   uint64_t target_id;
+  uint64_t window_handle;
   uint32_t width;
   uint32_t height;
   uint32_t format;
