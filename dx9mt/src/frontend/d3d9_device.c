@@ -23,6 +23,9 @@
 #define DX9MT_MAX_SHADER_FLOAT_CONSTANTS 256
 #define DX9MT_MAX_SHADER_INT_CONSTANTS 16
 #define DX9MT_MAX_SHADER_BOOL_CONSTANTS 16
+#define DX9MT_UPLOAD_BYTES_PER_SLOT (1u << 20)
+#define DX9MT_DRAW_SHADER_CONSTANT_BYTES                                          \
+  (DX9MT_MAX_SHADER_FLOAT_CONSTANTS * 4u * sizeof(float))
 
 static WINBOOL dx9mt_should_log_method_sample(LONG *counter, LONG first_n,
                                               LONG every_n) {
@@ -37,6 +40,28 @@ static WINBOOL dx9mt_should_log_method_sample(LONG *counter, LONG first_n,
 }
 
 static LONG g_object_id_counters[DX9MT_OBJECT_KIND_VERTEX_DECL + 1];
+
+typedef struct dx9mt_frontend_upload_state {
+  uint32_t frame_id;
+  uint16_t slot_index;
+  uint32_t next_offset;
+  unsigned char slots[DX9MT_UPLOAD_ARENA_SLOTS][DX9MT_UPLOAD_BYTES_PER_SLOT];
+} dx9mt_frontend_upload_state;
+
+static dx9mt_frontend_upload_state g_frontend_upload_state;
+
+const void *dx9mt_frontend_upload_resolve(const dx9mt_upload_ref *ref) {
+  if (!ref || ref->size == 0) {
+    return NULL;
+  }
+  if ((uint32_t)ref->arena_index >= DX9MT_UPLOAD_ARENA_SLOTS) {
+    return NULL;
+  }
+  if (ref->offset + ref->size > DX9MT_UPLOAD_BYTES_PER_SLOT) {
+    return NULL;
+  }
+  return g_frontend_upload_state.slots[ref->arena_index] + ref->offset;
+}
 
 typedef struct dx9mt_device dx9mt_device;
 typedef struct dx9mt_surface dx9mt_surface;
@@ -327,9 +352,152 @@ dx9mt_pshader_object_id_from_iface(IDirect3DPixelShader9 *iface) {
   return dx9mt_pshader_from_iface(iface)->object_id;
 }
 
+static dx9mt_object_id
+dx9mt_texture_object_id_from_base_iface(IDirect3DBaseTexture9 *iface) {
+  D3DRESOURCETYPE type;
+
+  if (!iface) {
+    return 0;
+  }
+
+  type = IDirect3DBaseTexture9_GetType(iface);
+  if (type == D3DRTYPE_TEXTURE) {
+    return dx9mt_texture_from_iface((IDirect3DTexture9 *)iface)->object_id;
+  }
+  if (type == D3DRTYPE_CUBETEXTURE) {
+    return dx9mt_cube_texture_from_iface((IDirect3DCubeTexture9 *)iface)->object_id;
+  }
+
+  return 0;
+}
+
 static uint32_t dx9mt_hash_u32(uint32_t hash, uint32_t value) {
   hash ^= value;
   hash *= 16777619u;
+  return hash;
+}
+
+static uint32_t dx9mt_align_up_u32(uint32_t value, uint32_t alignment) {
+  return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+static void dx9mt_frontend_upload_begin_frame(uint32_t frame_id) {
+  if (g_frontend_upload_state.frame_id == frame_id) {
+    return;
+  }
+
+  g_frontend_upload_state.frame_id = frame_id;
+  g_frontend_upload_state.slot_index =
+      (uint16_t)(frame_id % DX9MT_UPLOAD_ARENA_SLOTS);
+  g_frontend_upload_state.next_offset = 0;
+}
+
+static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
+                                                   const void *data,
+                                                   uint32_t size) {
+  dx9mt_upload_ref ref;
+  uint32_t aligned_size;
+  unsigned char *slot_base;
+
+  memset(&ref, 0, sizeof(ref));
+  if (!data || size == 0 || size > DX9MT_UPLOAD_BYTES_PER_SLOT) {
+    return ref;
+  }
+
+  aligned_size = dx9mt_align_up_u32(size, 16u);
+  if (aligned_size > DX9MT_UPLOAD_BYTES_PER_SLOT) {
+    return ref;
+  }
+
+  dx9mt_frontend_upload_begin_frame(frame_id);
+
+  /*
+   * Slot overflow: if this allocation doesn't fit in the remaining space,
+   * return a zero-ref instead of silently wrapping to offset 0. Wrapping
+   * would overwrite earlier constant uploads from the same frame, causing
+   * the backend to read corrupted shader constant data with no error.
+   *
+   * At ~19 draws/frame * 8KB constants = ~152KB per frame this won't trigger
+   * for FNV (slot is 1MB), but a heavier game could hit it. The backend
+   * validates upload refs and will reject draws with zero-size refs, so this
+   * surfaces cleanly in logs rather than producing silent visual corruption.
+   */
+  if (g_frontend_upload_state.next_offset >
+      DX9MT_UPLOAD_BYTES_PER_SLOT - aligned_size) {
+    static LONG overflow_counter = 0;
+    if (dx9mt_should_log_method_sample(&overflow_counter, 4, 256)) {
+      dx9mt_logf("upload",
+                 "slot overflow: frame=%u slot=%u offset=%u need=%u capacity=%u",
+                 frame_id, (unsigned)g_frontend_upload_state.slot_index,
+                 g_frontend_upload_state.next_offset, aligned_size,
+                 DX9MT_UPLOAD_BYTES_PER_SLOT);
+    }
+    return ref;
+  }
+
+  slot_base = g_frontend_upload_state.slots[g_frontend_upload_state.slot_index];
+  memcpy(slot_base + g_frontend_upload_state.next_offset, data, size);
+  ref.arena_index = g_frontend_upload_state.slot_index;
+  ref.offset = g_frontend_upload_state.next_offset;
+  ref.size = size;
+  g_frontend_upload_state.next_offset += aligned_size;
+  return ref;
+}
+
+static uint32_t dx9mt_hash_texture_stage_state(const dx9mt_device *self) {
+  uint32_t hash = 2166136261u;
+  uint32_t stage;
+  uint32_t type;
+
+  if (!self) {
+    return 0;
+  }
+
+  for (stage = 0; stage < DX9MT_MAX_TEXTURE_STAGES; ++stage) {
+    hash =
+        dx9mt_hash_u32(hash, dx9mt_texture_object_id_from_base_iface(self->textures[stage]));
+    for (type = 0; type < DX9MT_MAX_TEXTURE_STAGE_STATES; ++type) {
+      hash = dx9mt_hash_u32(hash, self->tex_stage_states[stage][type]);
+    }
+  }
+
+  return hash;
+}
+
+static uint32_t dx9mt_hash_sampler_state(const dx9mt_device *self) {
+  uint32_t hash = 2166136261u;
+  uint32_t sampler;
+  uint32_t type;
+
+  if (!self) {
+    return 0;
+  }
+
+  for (sampler = 0; sampler < DX9MT_MAX_SAMPLERS; ++sampler) {
+    for (type = 0; type < DX9MT_MAX_SAMPLER_STATES; ++type) {
+      hash = dx9mt_hash_u32(hash, self->sampler_states[sampler][type]);
+    }
+  }
+
+  return hash;
+}
+
+static uint32_t dx9mt_hash_stream_bindings(const dx9mt_device *self) {
+  uint32_t hash = 2166136261u;
+  uint32_t stream_index;
+
+  if (!self) {
+    return 0;
+  }
+
+  for (stream_index = 0; stream_index < DX9MT_MAX_STREAMS; ++stream_index) {
+    hash = dx9mt_hash_u32(
+        hash, dx9mt_vb_object_id_from_iface(self->streams[stream_index]));
+    hash = dx9mt_hash_u32(hash, self->stream_offsets[stream_index]);
+    hash = dx9mt_hash_u32(hash, self->stream_strides[stream_index]);
+    hash = dx9mt_hash_u32(hash, self->stream_freq[stream_index]);
+  }
+
   return hash;
 }
 
@@ -390,6 +558,9 @@ dx9mt_hash_draw_state(const dx9mt_packet_draw_indexed *packet) {
   hash = dx9mt_hash_u32(hash, packet->primitive_type);
   hash = dx9mt_hash_u32(hash, packet->viewport_hash);
   hash = dx9mt_hash_u32(hash, packet->scissor_hash);
+  hash = dx9mt_hash_u32(hash, packet->texture_stage_hash);
+  hash = dx9mt_hash_u32(hash, packet->sampler_state_hash);
+  hash = dx9mt_hash_u32(hash, packet->stream_binding_hash);
   return hash;
 }
 
@@ -461,18 +632,42 @@ static void dx9mt_safe_release(IUnknown *obj) {
   }
 }
 
+/*
+ * Scan D3D9 shader bytecode for the END token (0x0000FFFF).
+ *
+ * D3D9 vertex shaders start with 0xFFFE0300 (vs_3_0) and pixel shaders
+ * with 0xFFFF0300 (ps_3_0). We validate the version token first to avoid
+ * scanning up to 4MB of arbitrary memory if the caller passes garbage.
+ * The scan limit (64K DWORDs = 256KB) is generous for SM3.0 which supports
+ * at most 32768 instruction slots.
+ */
+#define DX9MT_SHADER_MAX_SCAN_DWORDS (1u << 16)
+
 static UINT dx9mt_shader_dword_count(const DWORD *byte_code) {
   UINT i;
+  DWORD version_token;
+
   if (!byte_code) {
     return 0;
   }
 
-  for (i = 0; i < (1u << 20); ++i) {
+  version_token = byte_code[0];
+  if ((version_token & 0xFFFF0000u) != 0xFFFE0000u &&
+      (version_token & 0xFFFF0000u) != 0xFFFF0000u) {
+    dx9mt_logf("device", "shader bytecode bad version token: 0x%08x",
+               (unsigned)version_token);
+    return 0;
+  }
+
+  for (i = 1; i < DX9MT_SHADER_MAX_SCAN_DWORDS; ++i) {
     if (byte_code[i] == 0x0000FFFFu) {
       return i + 1;
     }
   }
 
+  dx9mt_logf("device",
+             "shader bytecode END token not found within %u DWORDs (version=0x%08x)",
+             DX9MT_SHADER_MAX_SCAN_DWORDS, (unsigned)version_token);
   return 0;
 }
 
@@ -4020,12 +4215,31 @@ static HRESULT WINAPI dx9mt_device_GetDepthStencilSurface(
 
 static HRESULT WINAPI dx9mt_device_BeginScene(IDirect3DDevice9 *iface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  dx9mt_packet_begin_frame packet;
+
   if (self->in_scene) {
     return D3DERR_INVALIDCALL;
   }
 
   self->in_scene = TRUE;
-  dx9mt_backend_bridge_begin_frame(self->frame_id);
+
+  /*
+   * Emit BEGIN_FRAME through the packet stream rather than calling
+   * begin_frame() as a side-channel. This ensures the packet stream is
+   * self-describing -- every frame boundary is visible in the serialized
+   * packet log and will survive a future IPC/shared-memory transport
+   * without needing a separate control channel.
+   *
+   * The backend parser dispatches BEGIN_FRAME packets to the same
+   * begin_frame logic, so the behavior is identical.
+   */
+  memset(&packet, 0, sizeof(packet));
+  packet.header.type = DX9MT_PACKET_BEGIN_FRAME;
+  packet.header.size = (uint16_t)sizeof(packet);
+  packet.header.sequence = dx9mt_runtime_next_packet_sequence();
+  packet.frame_id = self->frame_id;
+  dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
+
   return D3D_OK;
 }
 
@@ -4315,6 +4529,17 @@ static float WINAPI dx9mt_device_GetNPatchMode(IDirect3DDevice9 *iface) {
   return self->n_patch_mode;
 }
 
+/*
+ * DrawPrimitive: stub -- returns D3D_OK without emitting a packet.
+ *
+ * FNV exclusively uses DrawIndexedPrimitive, so this no-op doesn't affect
+ * the primary target. Returning D3D_OK (rather than E_NOTIMPL) prevents
+ * games from falling back to software vertex processing or aborting.
+ *
+ * When a game that relies on non-indexed draws is targeted, this needs a
+ * DRAW_NON_INDEXED packet type and corresponding backend handling. Track
+ * via sampled logging to detect if any game actually calls this path.
+ */
 static HRESULT WINAPI dx9mt_device_DrawPrimitive(IDirect3DDevice9 *iface,
                                                   D3DPRIMITIVETYPE primitive_type,
                                                   UINT start_vertex,
@@ -4365,6 +4590,54 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
   packet.stream0_stride = self->stream_strides[0];
   packet.viewport_hash = dx9mt_hash_viewport(&self->viewport);
   packet.scissor_hash = dx9mt_hash_rect(&self->scissor_rect);
+  packet.texture_stage_hash = dx9mt_hash_texture_stage_state(self);
+  packet.sampler_state_hash = dx9mt_hash_sampler_state(self);
+  packet.stream_binding_hash = dx9mt_hash_stream_bindings(self);
+  packet.constants_vs = dx9mt_frontend_upload_copy(
+      self->frame_id, &self->vs_const_f[0][0], DX9MT_DRAW_SHADER_CONSTANT_BYTES);
+  packet.constants_ps = dx9mt_frontend_upload_copy(
+      self->frame_id, &self->ps_const_f[0][0], DX9MT_DRAW_SHADER_CONSTANT_BYTES);
+
+  /* RB3: actual viewport/scissor values */
+  packet.viewport_x = self->viewport.X;
+  packet.viewport_y = self->viewport.Y;
+  packet.viewport_width = self->viewport.Width;
+  packet.viewport_height = self->viewport.Height;
+  packet.viewport_min_z = self->viewport.MinZ;
+  packet.viewport_max_z = self->viewport.MaxZ;
+  packet.scissor_left = (int32_t)self->scissor_rect.left;
+  packet.scissor_top = (int32_t)self->scissor_rect.top;
+  packet.scissor_right = (int32_t)self->scissor_rect.right;
+  packet.scissor_bottom = (int32_t)self->scissor_rect.bottom;
+
+  /* RB3: geometry data -- VB/IB bytes and vertex declaration */
+  {
+    dx9mt_vertex_buffer *vb =
+        self->streams[0] ? dx9mt_vb_from_iface(self->streams[0]) : NULL;
+    dx9mt_index_buffer *ib =
+        self->indices ? dx9mt_ib_from_iface(self->indices) : NULL;
+    dx9mt_vertex_decl *decl =
+        self->vertex_decl ? dx9mt_vdecl_from_iface(self->vertex_decl) : NULL;
+
+    if (vb && vb->data && vb->desc.Size > 0) {
+      packet.vertex_data = dx9mt_frontend_upload_copy(
+          self->frame_id, vb->data, vb->desc.Size);
+      packet.vertex_data_size = vb->desc.Size;
+    }
+    if (ib && ib->data && ib->desc.Size > 0) {
+      packet.index_data = dx9mt_frontend_upload_copy(
+          self->frame_id, ib->data, ib->desc.Size);
+      packet.index_data_size = ib->desc.Size;
+      packet.index_format = (uint32_t)ib->desc.Format;
+    }
+    if (decl && decl->elements && decl->count > 0) {
+      packet.vertex_decl_data = dx9mt_frontend_upload_copy(
+          self->frame_id, decl->elements,
+          decl->count * (uint32_t)sizeof(D3DVERTEXELEMENT9));
+      packet.vertex_decl_count = (uint16_t)decl->count;
+    }
+  }
+
   packet.state_block_hash = dx9mt_hash_draw_state(&packet);
 
   dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));

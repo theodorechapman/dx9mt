@@ -1,124 +1,67 @@
-# dx9mt Insights
+# dx9mt Technical Insights
 
-Last updated: 2026-02-06  
-Source inputs: `research.md`, `frame3172-api-calls.txt`, `frame3172-unique-api-calls.txt`, live `/tmp/dx9mt_runtime.log`, `dxmt/`
+Hard-won lessons from bringing up the D3D9-to-Metal translation layer.
 
-## Core Performance Thesis (Unchanged)
-- The dominant cost target is CPU-side translation overhead:
-  - high-frequency state churn
-  - too many boundary crossings
-  - redundant bind/pipeline work
-- Not just raw draw count.
+## Architecture
 
-## Bring-Up Timeline (Most Important)
-1. Early state:
-   - `dx9mt` loaded but FNV exited before `CreateDevice`.
-2. Capability bring-up phase:
-   - Implemented non-trivial responses for `CheckDevice*` and `GetDeviceCaps`.
-   - Call volume reduced enough to isolate pivots.
-3. Launcher-path breakthrough:
-   - Overrode launcher to also use `dx9mt`.
-   - Exposed launcher-side failure at `CreateQuery` default stub.
-4. `CreateQuery` fix:
-   - Added minimal `IDirect3DQuery9`, launcher detect path stabilized.
-5. Game-path breakthrough:
-   - `FalloutNV.exe` now reaches `CreateDevice` and succeeds.
-6. Contract hardening phase (`RB0`):
-   - moved packet sequencing to runtime-global monotonic counter.
-   - added explicit present-target metadata bridge update (`target/size/format/windowed`).
-   - expanded `DRAW_INDEXED` packet contract with draw-critical object/state IDs and hashes.
-   - added backend-side draw packet size/state-ID validation and native contract tests.
-7. Current state:
-   - Game now progresses past previous renderer-init failure into active frame loop.
-   - Visible output is still black because backend present/render is currently no-op.
+### PE DLL cannot run Metal code
+The d3d9.dll is compiled with `i686-w64-mingw32-gcc` where `__APPLE__` is not defined. All Metal/Cocoa APIs are unavailable. The backend_bridge_stub.c is compiled into BOTH the PE DLL (mingw) and the native dylib (clang) -- Metal code is guarded by `#if defined(__APPLE__) && !defined(DX9MT_NO_METAL)` and stripped from the PE build automatically.
 
-## High-Value Technical Insights
-- Per-app override granularity matters:
-  - overriding only `FalloutNV.exe` was insufficient for reliable launch behavior.
-  - launcher and game both needed `d3d9=native,builtin` for consistent detection and handoff.
-- Hard Wine restart before override application is required for reliable state:
-  - stale wineserver state can mask or delay override changes.
-- Missing-method failures are now moving later and are easier to isolate:
-  - once `CreateQuery` was implemented, failure advanced to post-device renderer init.
-- Current rendering failure is now mostly backend-output related, not loader/export related:
-  - exports/ordinals and COM shape are now good enough for launcher and device creation.
-- Kind-tagged object IDs make log interpretation and contract checks clearer:
-  - example: `target=33554433` (`0x02000001`) encodes swapchain object kind (`0x02`) plus serial.
+### Shared-memory IPC bridges the PE/native gap
+Since the PE DLL can't call Metal, a standalone native Metal viewer process reads frame data from a 16MB memory-mapped file (`/tmp/dx9mt_metal_frame.bin`). The PE DLL writes via Win32 `CreateFileMapping`/`MapViewOfFile` on `Z:\tmp\...` (Wine maps Z: to /). The viewer mmaps the same file with POSIX. They synchronize via an atomic sequence counter with acquire/release semantics.
 
-## What the Logs Tell Us Now
-- Confirmed in latest runs:
-  - attach to `FalloutNVLauncher.exe`
-  - attach to `FalloutNV.exe`
-  - `CreateDevice` success on game process
-  - sustained `DRAW_INDEXED` + `PRESENT` activity at runtime
-- Backend confirms active frame loop with thousands of `DRAW_INDEXED` packets and repeated `Present`.
-- Present is still backend `no-op`, so black-screen + live audio is an expected transitional state.
-- Latest manual grep slice confirms present-target metadata path is active:
-  - `present target updated: target=33554433 size=1280x720 fmt=22 windowed=1`
-  - repeated `present frame=... target=33554433 ... (no-op)` through at least frame `2760`.
-- Latest manual grep slice confirms no active contract-parse failures:
-  - no `draw packet missing state ids`
-  - no `draw packet too small`
-  - no `packet parse error`
-  - no `packet sequence out of order`
-- Bootstrap present options now exist for visual validation while full backend replay is still no-op:
-  - backend side: `DX9MT_BACKEND_SOFT_PRESENT=1`
-  - frontend side: `DX9MT_FRONTEND_SOFT_PRESENT=1`
-- Manual validation observed top-left marker color changes frame-to-frame, consistent with bootstrap present behavior.
-- Added sampled instrumentation for unsupported paths (`CreateCubeTexture`, `CreateVolumeTexture`, `DrawPrimitive`) to verify whether remaining API gaps are affecting startup visuals.
-- Logs identified `CreateCubeTexture` as an active startup call path; minimal cube texture object support is now implemented.
-- Latest verification shows `CreateCubeTexture` now returns `hr=0x00000000` in the game path.
-- Latest verification reached at least frame `2760` with stable sampled packet cadence.
-- No `CreateVolumeTexture unsupported` and no `DrawPrimitive stub` signal in the newest capture window.
-- Probe/perf log noise is now throttled by default; full probe verbosity is opt-in via `DX9MT_TRACE_PROBES=1`.
-- Native contract test target currently passes via `make test` (`backend_bridge_contract_test: PASS`).
+### The native dylib exists but isn't loaded
+`libdx9mt_unixlib.dylib` is built with Metal support but Wine never loads it. The proper solution is Wine's `__wine_unix_call` mechanism, but the IPC approach works without Wine integration. The dylib is kept buildable for future use.
 
-## Current Hypothesis
-- Primary blocker is no-op backend present/render path, not early init rejection.
-- `RB0` packet/bridge contract baseline is now in place and validated.
-- Secondary risk remains compatibility drift between reported caps and unimplemented resource APIs.
+### Upload arena is frontend-only memory
+The triple-buffered upload arena (`g_frontend_upload_state.slots[]`) lives in the PE DLL's address space. The backend bridge stub (also in the PE DLL) resolves upload refs to pointers via `dx9mt_frontend_upload_resolve()` and copies data into the IPC bulk region.
 
-## Immediate Direction
-- The next meaningful milestone is not another caps tweak; it is `RB1` first-visible backend present.
-- Immediately after first visible output, move into `RB2` deterministic frame-state replay while preserving current packet-contract guardrails.
-- Backend implementation order is documented in `docs/rendering-backend-plan.md`.
+## Wine Integration
 
-## Practical Validation Pattern
-- Always validate with:
-  - `make test`
-  - `make run`
-  - reproduce (`Detect`, then `Play`)
-  - `make show-logs`
-- Optional visible-bootstrap run:
-  - `DX9MT_BACKEND_SOFT_PRESENT=1 make run`
-  - `DX9MT_FRONTEND_SOFT_PRESENT=1 make run`
-- Optional deep summary:
-  - `uv run tools/analyze_dx9mt_log.py /tmp/dx9mt_runtime.log --top 20`
-- Target query for progression:
-  - `rg -n "PROCESS_ATTACH|CreateDevice|GetDeviceCaps|default stub:|PROCESS_DETACH" /tmp/dx9mt_runtime.log`
-- Target query for backend contract health:
-  - `rg -n "present target updated|present frame=.*target=|draw packet missing state ids|draw packet too small|packet parse error|packet sequence out of order" /tmp/dx9mt_runtime.log`
-- For deep backend packet tracing only when needed:
-  - `DX9MT_BACKEND_TRACE_PACKETS=1 make run`
-- For full probe-call verbosity only when needed:
-  - `DX9MT_TRACE_PROBES=1 make run`
+### Both launcher and game need d3d9=native,builtin
+Wine's DLL override must apply to both `FalloutNVLauncher.exe` and `FalloutNV.exe` via per-app registry keys. Global overrides don't work reliably.
 
-## Risk Register
-- `Direct3DCreate9Ex` path still unimplemented (`D3DERR_NOTAVAILABLE`).
-- Texture family still incomplete (`CreateVolumeTexture` remains unsupported).
-- Backend remains stub/no-op for real rendering work.
-- Startup probe logs are now sampled by default; deep probes should be enabled only for targeted runs.
+### Wine restart required after override changes
+Stale wineserver state masks override changes. Always `wineserver --kill` before testing new builds.
 
-## Decision Log
-- 2026-02-06: Adopted PE32 front-end + ARM64 backend bridge architecture.
-- 2026-02-06: Matched Wine ordinal/export compatibility for `d3d9.dll`.
-- 2026-02-06: Standardized operator workflow around `make run` + `make show-logs`.
-- 2026-02-06: Added wineserver restart guard before override-sensitive operations.
-- 2026-02-06: Implemented launcher-critical `CreateQuery` path.
-- 2026-02-06: Reached first successful `CreateDevice` in `FalloutNV.exe` path.
-- 2026-02-06: Reached sustained in-game draw/present loop with black-screen output (expected while backend is no-op).
-- 2026-02-06: Implemented minimal `CreateCubeTexture` support after logs showed startup dependence.
-- 2026-02-06: Implemented monotonic packet sequencing and explicit present-target metadata publish/update path.
-- 2026-02-06: Expanded draw packet contract with replay-critical object/state IDs and hashes.
-- 2026-02-06: Added native backend contract tests (`make test`) and validated parser/order/state-ID guardrails.
-- 2026-02-06: Manual runtime validation confirmed stable present-target metadata (`target=33554433`) and no active parser/sequence/draw-state contract errors.
+### Win32 file paths through Wine
+The PE DLL accesses Unix paths via the Z: drive. `CreateFileA("Z:\\tmp\\foo")` maps to `/tmp/foo`. This is the standard Wine path mapping and is used for the IPC shared memory file.
+
+## Packet Protocol
+
+### BEGIN_FRAME is now in the packet stream
+Originally `BeginScene` called `begin_frame()` as a direct side-channel. Now it emits a `BEGIN_FRAME` packet through `submit_packets`, making the stream self-describing. The backend parser dispatches `BEGIN_FRAME` packets to the same `begin_frame()` logic.
+
+### Draw packet carries full geometry data
+`dx9mt_packet_draw_indexed` includes upload refs for VB data, IB data, vertex declaration, VS constants, and PS constants. The frontend copies all this into the upload arena on every `DrawIndexedPrimitive`. The IPC writer then copies from the arena into the shared memory bulk region.
+
+### Upload arena overflow returns zero-ref, not corrupt data
+When a slot runs out of space, `dx9mt_frontend_upload_copy` returns a zero-ref instead of wrapping to offset 0. The backend rejects draws with zero-size constant refs. This prevents silent shader constant corruption.
+
+## Metal Rendering
+
+### WVP matrix extraction works for FNV
+D3D9 SM3.0 vertex shaders commonly store the world-view-projection matrix in constants c0-c3. The Metal vertex shader reads these 4 float4s, transposes from D3D9 row-major to Metal column-major, and multiplies the position. FNV's main menu renders correctly with this approach.
+
+### D3D9 vertex declarations map cleanly to Metal vertex descriptors
+`D3DVERTEXELEMENT9` (stream, offset, type, usage) translates to `MTLVertexDescriptor` attributes. Type mapping: `D3DDECLTYPE_FLOAT3` -> `MTLVertexFormatFloat3`, `D3DDECLTYPE_D3DCOLOR` -> `MTLVertexFormatUChar4Normalized`, etc. The PSO is cached by vertex stride.
+
+### Metal buffer creation per-draw is wasteful but sufficient for now
+Each draw creates `newBufferWithBytes` for VB and IB. At ~19 draws/frame with small buffers this doesn't bottleneck. Optimization path: buffer ring allocator with sub-allocation.
+
+### Standalone NSWindow works alongside Wine
+The Metal viewer creates its own `NSWindow` with `CAMetalLayer`. Wine's macOS driver runs its own `NSApplication` event loop. The viewer runs a separate `NSApplication` in its own process, avoiding conflicts. `dispatch_sync(main_queue)` handles window creation from non-main threads.
+
+## Debugging
+
+### Sampled logging prevents log flooding
+High-frequency calls (GetDeviceCaps, CheckDeviceFormat, DebugSetMute) use `dx9mt_should_log_method_sample(&counter, first_n, every_n)`. First N calls logged in full, then every Nth call. Backend frames log on frames 0-9 then every 120th.
+
+### Kind-tagged object IDs
+Object IDs encode the type: `(kind << 24) | serial`. Kind values: 1=device, 2=swapchain, 3=buffer, 4=texture, 5=surface, 6=VS, 7=PS, 8=state_block, 9=query, 10=vertex_decl. Log line `target=33554433` = `0x02000001` = swapchain serial 1.
+
+### Shader bytecode validation
+`dx9mt_shader_dword_count` validates the version token (`0xFFFE` for VS, `0xFFFF` for PS) before scanning for the end marker. Scan limit reduced from 4MB to 256KB (64K DWORDs). Rejects bad input early with a log message.
+
+### Replay hash for frame fingerprinting
+Each frame's draw commands are hashed (FNV-1a) into a `replay_hash`. If the hash changes between frames, the draw content changed. If it's stable, the game is rendering the same scene. Visible in logs and in the overlay bar color.

@@ -54,11 +54,26 @@ install-dx9mt-fnv: dx9mt-build configure-fnv-dx9mt-override
 	@test -d "$(FNV_DIR)" || (echo "missing Fallout New Vegas dir: $(FNV_DIR)" && exit 1)
 	@install -m 0644 "$(DX9MT_DLL)" "$(FNV_DIR)/d3d9.dll"
 
+DX9MT_METAL_IPC_FILE := /tmp/dx9mt_metal_frame.bin
+DX9MT_METAL_VIEWER := $(DX9MT_DIR)/build/dx9mt_metal_viewer
+
 run: install-dx9mt-fnv
 	@set -e; \
+	pkill -f dx9mt_metal_viewer 2>/dev/null || true; \
 	: > "$(DX9MT_RUNTIME_LOG)"; \
 	: > "$(DX9MT_LAUNCHER_LOG)"; \
 	: > "$(DX9MT_STEAM_LOG)"; \
+	echo "Creating Metal IPC shared file"; \
+	dd if=/dev/zero of="$(DX9MT_METAL_IPC_FILE)" bs=1048576 count=16 >/dev/null 2>&1; \
+	if [ -x "$(DX9MT_METAL_VIEWER)" ]; then \
+		echo "Launching Metal viewer"; \
+		"$(DX9MT_METAL_VIEWER)" &  \
+		VIEWER_PID=$$!; \
+		echo "Metal viewer pid $$VIEWER_PID"; \
+		sleep 1; \
+	else \
+		echo "Metal viewer not found at $(DX9MT_METAL_VIEWER), skipping"; \
+	fi; \
 	echo "Starting wineserver"; \
 	"$(WINESERVER)" -p >/dev/null 2>&1 || true; \
 	echo "Starting Steam (log: $(DX9MT_STEAM_LOG))"; \
@@ -131,4 +146,6 @@ show-fnv-dx9mt-override: wine-restart
 	"$(WINE)" reg query "HKCU\Software\Wine\AppDefaults\FalloutNVLauncher.exe\DllOverrides" || true
 
 clear:
+	@-pkill -f dx9mt_metal_viewer 2>/dev/null || true
+	@-rm -f "$(DX9MT_METAL_IPC_FILE)"
 	@-"$(WINESERVER)" --kill

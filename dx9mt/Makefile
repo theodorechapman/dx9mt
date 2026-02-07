@@ -9,8 +9,9 @@ FRONTEND_LDFLAGS := -shared -Wl,--kill-at -luuid -lgdi32
 FRONTEND_DEF := src/frontend/d3d9.def
 
 BACKEND_CFLAGS := -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude
-BACKEND_LDFLAGS := -dynamiclib
-TEST_CFLAGS := -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude
+BACKEND_OBJCFLAGS := -Wall -Wextra -Wno-unused-parameter -Iinclude -fobjc-arc
+BACKEND_LDFLAGS := -dynamiclib -framework Metal -framework QuartzCore -framework Cocoa
+TEST_CFLAGS := -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude -DDX9MT_NO_METAL
 
 FRONTEND_SRCS := \
 	src/common/log.c \
@@ -25,18 +26,23 @@ BACKEND_SRCS := \
 	src/common/log.c \
 	src/backend/backend_bridge_stub.c
 
+BACKEND_OBJC_SRCS := \
+	src/backend/metal_presenter.m
+
 TEST_SRCS := \
 	tests/backend_bridge_contract_test.c \
 	src/common/log.c \
 	src/backend/backend_bridge_stub.c
 
 FRONTEND_OBJS := $(patsubst %.c,$(OBJ_DIR)/frontend/%.o,$(FRONTEND_SRCS))
-BACKEND_OBJS := $(patsubst %.c,$(OBJ_DIR)/backend/%.o,$(BACKEND_SRCS))
+BACKEND_OBJS := $(patsubst %.c,$(OBJ_DIR)/backend/%.o,$(BACKEND_SRCS)) \
+                $(patsubst %.m,$(OBJ_DIR)/backend/%.o,$(BACKEND_OBJC_SRCS))
 TEST_BIN := $(BUILD_DIR)/backend_bridge_contract_test
+VIEWER_BIN := $(BUILD_DIR)/dx9mt_metal_viewer
 
 .PHONY: all clean test-native
 
-all: $(BUILD_DIR)/d3d9.dll $(BUILD_DIR)/libdx9mt_unixlib.dylib
+all: $(BUILD_DIR)/d3d9.dll $(BUILD_DIR)/libdx9mt_unixlib.dylib $(VIEWER_BIN)
 
 $(BUILD_DIR)/d3d9.dll: $(FRONTEND_OBJS) $(FRONTEND_DEF)
 	@mkdir -p $(BUILD_DIR)
@@ -50,6 +56,10 @@ $(TEST_BIN): $(TEST_SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(BACKEND_CC) $(TEST_CFLAGS) -o $@ $(TEST_SRCS)
 
+$(VIEWER_BIN): src/tools/metal_viewer.m
+	@mkdir -p $(BUILD_DIR)
+	$(BACKEND_CC) $(BACKEND_OBJCFLAGS) -framework Metal -framework QuartzCore -framework Cocoa -o $@ $<
+
 test-native: $(TEST_BIN)
 	@"$(TEST_BIN)"
 
@@ -60,6 +70,10 @@ $(OBJ_DIR)/frontend/%.o: %.c
 $(OBJ_DIR)/backend/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(BACKEND_CC) $(BACKEND_CFLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/backend/%.o: %.m
+	@mkdir -p $(dir $@)
+	$(BACKEND_CC) $(BACKEND_OBJCFLAGS) -c -o $@ $<
 
 clean:
 	rm -rf $(BUILD_DIR)

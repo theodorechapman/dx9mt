@@ -12,6 +12,23 @@
 #endif
 
 #include "dx9mt/log.h"
+#include "dx9mt/metal_ipc.h"
+
+#if defined(__APPLE__) && !defined(DX9MT_NO_METAL)
+#include "metal_presenter.h"
+#endif
+
+/*
+ * Shared-memory IPC for PE DLL -> native Metal viewer.
+ * Under Wine (_WIN32), the PE DLL maps a file and writes frame data
+ * that the standalone native viewer process reads and renders.
+ */
+#ifdef _WIN32
+static HANDLE g_metal_ipc_file = INVALID_HANDLE_VALUE;
+static HANDLE g_metal_ipc_mapping = NULL;
+static dx9mt_metal_frame_data *g_metal_ipc_ptr = NULL;
+static uint32_t g_metal_ipc_sequence = 0;
+#endif
 
 static int g_backend_ready;
 static uint32_t g_last_frame_id;
@@ -22,12 +39,100 @@ static uint32_t g_last_clear_color;
 static uint32_t g_last_clear_flags;
 static float g_last_clear_z;
 static uint32_t g_last_clear_stencil;
+static uint32_t g_last_draw_state_hash;
+static uint32_t g_last_draw_primitive_type;
+static uint32_t g_last_draw_primitive_count;
 static uint32_t g_last_packet_sequence;
 static int g_have_present_target;
 static dx9mt_backend_present_target_desc g_present_target;
 static int g_frame_open;
 static int g_trace_packets = -1;
 static int g_soft_present = -1;
+static int g_metal_present = -1;
+static dx9mt_upload_arena_desc g_upload_desc;
+static uint32_t g_last_replay_hash;
+
+typedef struct dx9mt_backend_frame_snapshot {
+  uint32_t frame_id;
+  uint32_t packet_count;
+  uint32_t draw_count;
+  uint32_t clear_count;
+  uint32_t last_clear_color;
+  uint32_t last_clear_flags;
+  float last_clear_z;
+  uint32_t last_clear_stencil;
+  uint32_t last_draw_state_hash;
+  uint32_t last_draw_primitive_type;
+  uint32_t last_draw_primitive_count;
+  uint32_t replay_hash;
+  uint32_t replay_draw_count;
+} dx9mt_backend_frame_snapshot;
+
+typedef struct dx9mt_backend_draw_command {
+  uint32_t state_block_hash;
+  uint32_t primitive_type;
+  int32_t base_vertex;
+  uint32_t min_vertex_index;
+  uint32_t num_vertices;
+  uint32_t start_index;
+  uint32_t primitive_count;
+  uint32_t render_target_id;
+  uint32_t depth_stencil_id;
+  uint32_t vertex_buffer_id;
+  uint32_t index_buffer_id;
+  uint32_t vertex_decl_id;
+  uint32_t vertex_shader_id;
+  uint32_t pixel_shader_id;
+  uint32_t fvf;
+  uint32_t stream0_offset;
+  uint32_t stream0_stride;
+  uint32_t viewport_hash;
+  uint32_t scissor_hash;
+  uint32_t texture_stage_hash;
+  uint32_t sampler_state_hash;
+  uint32_t stream_binding_hash;
+  dx9mt_upload_ref constants_vs;
+  dx9mt_upload_ref constants_ps;
+
+  uint32_t viewport_x;
+  uint32_t viewport_y;
+  uint32_t viewport_width;
+  uint32_t viewport_height;
+  float viewport_min_z;
+  float viewport_max_z;
+  int32_t scissor_left;
+  int32_t scissor_top;
+  int32_t scissor_right;
+  int32_t scissor_bottom;
+
+  dx9mt_upload_ref vertex_data;
+  uint32_t vertex_data_size;
+  dx9mt_upload_ref index_data;
+  uint32_t index_data_size;
+  uint32_t index_format;
+  dx9mt_upload_ref vertex_decl_data;
+  uint16_t vertex_decl_count;
+  uint16_t _pad1;
+} dx9mt_backend_draw_command;
+
+#define DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME 8192u
+
+typedef struct dx9mt_backend_frame_replay_state {
+  uint32_t frame_id;
+  uint32_t draw_total;
+  uint32_t draw_stored;
+  uint32_t draw_dropped;
+  int have_clear;
+  dx9mt_packet_clear last_clear_packet;
+  int have_present_packet;
+  uint32_t present_packet_frame_id;
+  dx9mt_backend_draw_command
+      draws[DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME];
+} dx9mt_backend_frame_replay_state;
+
+static dx9mt_backend_frame_snapshot g_current_frame_snapshot;
+static dx9mt_backend_frame_snapshot g_last_presented_snapshot;
+static dx9mt_backend_frame_replay_state g_frame_replay_state;
 
 static const char *dx9mt_packet_type_name(uint16_t type) {
   switch (type) {
@@ -48,6 +153,79 @@ static const char *dx9mt_packet_type_name(uint16_t type) {
   }
 }
 
+static uint32_t dx9mt_backend_hash_u32(uint32_t hash, uint32_t value) {
+  hash ^= value;
+  hash *= 16777619u;
+  return hash;
+}
+
+static uint32_t dx9mt_backend_hash_upload_ref(uint32_t hash,
+                                              const dx9mt_upload_ref *ref) {
+  if (!ref) {
+    return dx9mt_backend_hash_u32(hash, 0);
+  }
+
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)ref->arena_index);
+  hash = dx9mt_backend_hash_u32(hash, ref->offset);
+  hash = dx9mt_backend_hash_u32(hash, ref->size);
+  return hash;
+}
+
+static uint32_t
+dx9mt_backend_draw_command_hash(const dx9mt_backend_draw_command *command) {
+  uint32_t hash = 2166136261u;
+
+  if (!command) {
+    return 0;
+  }
+
+  hash = dx9mt_backend_hash_u32(hash, command->state_block_hash);
+  hash = dx9mt_backend_hash_u32(hash, command->primitive_type);
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->base_vertex);
+  hash = dx9mt_backend_hash_u32(hash, command->min_vertex_index);
+  hash = dx9mt_backend_hash_u32(hash, command->num_vertices);
+  hash = dx9mt_backend_hash_u32(hash, command->start_index);
+  hash = dx9mt_backend_hash_u32(hash, command->primitive_count);
+  hash = dx9mt_backend_hash_u32(hash, command->render_target_id);
+  hash = dx9mt_backend_hash_u32(hash, command->depth_stencil_id);
+  hash = dx9mt_backend_hash_u32(hash, command->vertex_buffer_id);
+  hash = dx9mt_backend_hash_u32(hash, command->index_buffer_id);
+  hash = dx9mt_backend_hash_u32(hash, command->vertex_decl_id);
+  hash = dx9mt_backend_hash_u32(hash, command->vertex_shader_id);
+  hash = dx9mt_backend_hash_u32(hash, command->pixel_shader_id);
+  hash = dx9mt_backend_hash_u32(hash, command->fvf);
+  hash = dx9mt_backend_hash_u32(hash, command->stream0_offset);
+  hash = dx9mt_backend_hash_u32(hash, command->stream0_stride);
+  hash = dx9mt_backend_hash_u32(hash, command->viewport_hash);
+  hash = dx9mt_backend_hash_u32(hash, command->scissor_hash);
+  hash = dx9mt_backend_hash_u32(hash, command->texture_stage_hash);
+  hash = dx9mt_backend_hash_u32(hash, command->sampler_state_hash);
+  hash = dx9mt_backend_hash_u32(hash, command->stream_binding_hash);
+  hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_vs);
+  hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_ps);
+  return hash;
+}
+
+static uint32_t dx9mt_backend_compute_frame_replay_hash(
+    const dx9mt_backend_frame_replay_state *state) {
+  uint32_t hash = 2166136261u;
+  uint32_t i;
+
+  if (!state) {
+    return 0;
+  }
+
+  hash = dx9mt_backend_hash_u32(hash, state->frame_id);
+  hash = dx9mt_backend_hash_u32(hash, state->draw_total);
+  hash = dx9mt_backend_hash_u32(hash, state->draw_stored);
+  hash = dx9mt_backend_hash_u32(hash, state->draw_dropped);
+  for (i = 0; i < state->draw_stored; ++i) {
+    hash = dx9mt_backend_hash_u32(
+        hash, dx9mt_backend_draw_command_hash(&state->draws[i]));
+  }
+  return hash;
+}
+
 static int dx9mt_backend_trace_packets_enabled(void) {
   const char *value;
 
@@ -66,7 +244,7 @@ static int dx9mt_backend_trace_packets_enabled(void) {
   return g_trace_packets;
 }
 
- #ifdef _WIN32
+#ifdef _WIN32
 static int dx9mt_backend_soft_present_enabled(void) {
   const char *value;
 
@@ -88,27 +266,113 @@ static int dx9mt_backend_soft_present_enabled(void) {
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DX9MT_NO_METAL)
+static int dx9mt_backend_metal_present_enabled(void) {
+  const char *value;
+
+  if (g_metal_present >= 0) {
+    return g_metal_present;
+  }
+
+  /* Metal present defaults ON (unlike soft-present which defaults OFF). */
+  value = getenv("DX9MT_BACKEND_METAL_PRESENT");
+  if (value && (*value == '0' || strcmp(value, "false") == 0 ||
+                strcmp(value, "FALSE") == 0 || strcmp(value, "off") == 0 ||
+                strcmp(value, "OFF") == 0 || strcmp(value, "no") == 0 ||
+                strcmp(value, "NO") == 0)) {
+    g_metal_present = 0;
+  } else {
+    g_metal_present = 1;
+  }
+
+  return g_metal_present;
+}
+#endif
+
 #ifdef _WIN32
 static COLORREF dx9mt_colorref_from_d3dcolor(uint32_t color) {
   return RGB((color >> 16) & 0xffu, (color >> 8) & 0xffu, color & 0xffu);
 }
 
-static int dx9mt_backend_soft_present_to_window(uint32_t frame_id) {
+static void dx9mt_backend_soft_present_draw_replay_preview(
+    HDC hdc, const RECT *client, uint32_t frame_id) {
+  enum {
+    max_cells = 64,
+    cells_per_row = 8,
+  };
+  uint32_t draw_count;
+  uint32_t cells_to_draw;
+  uint32_t i;
+
+  if (!hdc || !client) {
+    return;
+  }
+
+  draw_count = g_frame_replay_state.draw_stored;
+  if (draw_count == 0) {
+    return;
+  }
+
+  cells_to_draw = draw_count;
+  if (cells_to_draw > max_cells) {
+    cells_to_draw = max_cells;
+  }
+
+  for (i = 0; i < cells_to_draw; ++i) {
+    RECT cell;
+    uint32_t row = i / cells_per_row;
+    uint32_t col = i % cells_per_row;
+    uint32_t draw_hash =
+        dx9mt_backend_draw_command_hash(&g_frame_replay_state.draws[i]);
+    COLORREF color = RGB((draw_hash >> 16) & 0xffu, (draw_hash >> 8) & 0xffu,
+                         (draw_hash ^ frame_id) & 0xffu);
+    HBRUSH brush;
+
+    cell.left = client->left + (LONG)col * 12;
+    cell.top = client->top + 24 + (LONG)row * 12;
+    cell.right = cell.left + 10;
+    cell.bottom = cell.top + 10;
+    if (cell.left >= client->right || cell.top >= client->bottom) {
+      continue;
+    }
+    if (cell.right > client->right) {
+      cell.right = client->right;
+    }
+    if (cell.bottom > client->bottom) {
+      cell.bottom = client->bottom;
+    }
+
+    brush = CreateSolidBrush(color);
+    if (brush) {
+      FillRect(hdc, &cell, brush);
+      DeleteObject((HGDIOBJ)brush);
+    }
+  }
+}
+
+static int dx9mt_backend_soft_present_to_window(
+    const dx9mt_backend_frame_snapshot *snapshot) {
   HWND hwnd;
   HDC hdc;
   RECT client;
   RECT marker;
+  RECT draw_bar;
   HBRUSH clear_brush;
   HBRUSH marker_brush;
+  HBRUSH draw_brush;
   COLORREF clear_color;
   COLORREF marker_color;
+  COLORREF draw_color;
+  uint32_t frame_id;
+  uint32_t draw_bar_width;
 
-  if (!dx9mt_backend_soft_present_enabled()) {
+  if (!snapshot || !dx9mt_backend_soft_present_enabled()) {
     return 0;
   }
   if (g_present_target.window_handle == 0) {
     return 0;
   }
+  frame_id = snapshot->frame_id;
 
   hwnd = (HWND)(uintptr_t)g_present_target.window_handle;
   if (!IsWindow(hwnd)) {
@@ -124,7 +388,7 @@ static int dx9mt_backend_soft_present_to_window(uint32_t frame_id) {
     return 0;
   }
 
-  clear_color = dx9mt_colorref_from_d3dcolor(g_last_clear_color);
+  clear_color = dx9mt_colorref_from_d3dcolor(snapshot->last_clear_color);
   clear_brush = CreateSolidBrush(clear_color);
   if (clear_brush) {
     FillRect(hdc, &client, clear_brush);
@@ -146,18 +410,80 @@ static int dx9mt_backend_soft_present_to_window(uint32_t frame_id) {
     DeleteObject((HGDIOBJ)marker_brush);
   }
 
+  draw_bar = client;
+  draw_bar.left = marker.left;
+  draw_bar.top = marker.bottom;
+  if (draw_bar.top < draw_bar.bottom) {
+    draw_bar.bottom = draw_bar.top + 4;
+    if (draw_bar.bottom > client.bottom) {
+      draw_bar.bottom = client.bottom;
+    }
+    draw_bar_width = snapshot->draw_count;
+    if (draw_bar_width > (uint32_t)(client.right - client.left)) {
+      draw_bar_width = (uint32_t)(client.right - client.left);
+    }
+    draw_bar.right = draw_bar.left + (LONG)draw_bar_width;
+    draw_color = RGB((snapshot->last_draw_state_hash >> 16) & 0xffu,
+                     (snapshot->last_draw_state_hash >> 8) & 0xffu,
+                     snapshot->last_draw_state_hash & 0xffu);
+    draw_brush = CreateSolidBrush(draw_color);
+    if (draw_brush) {
+      FillRect(hdc, &draw_bar, draw_brush);
+      DeleteObject((HGDIOBJ)draw_brush);
+    }
+  }
+
+  dx9mt_backend_soft_present_draw_replay_preview(hdc, &client, frame_id);
+
   ReleaseDC(hwnd, hdc);
   return 1;
 }
 #else
-static int dx9mt_backend_soft_present_to_window(uint32_t frame_id) {
-  (void)frame_id;
+static int dx9mt_backend_soft_present_to_window(
+    const dx9mt_backend_frame_snapshot *snapshot) {
+  (void)snapshot;
   return 0;
 }
 #endif
 
 static int dx9mt_backend_should_log_frame(uint32_t frame_id) {
   return frame_id < 10 || (frame_id % 120) == 0;
+}
+
+static int dx9mt_backend_validate_upload_ref(const dx9mt_upload_ref *ref,
+                                             const char *name,
+                                             uint32_t sequence) {
+  if (!ref || !name) {
+    return 0;
+  }
+  if (ref->size == 0) {
+    dx9mt_logf("backend", "draw packet missing %s payload: seq=%u", name,
+               sequence);
+    return 0;
+  }
+  if (g_upload_desc.slot_count == 0 || g_upload_desc.bytes_per_slot == 0) {
+    dx9mt_logf("backend",
+               "upload arena unavailable for %s: slots=%u bytes=%u seq=%u", name,
+               g_upload_desc.slot_count, g_upload_desc.bytes_per_slot, sequence);
+    return 0;
+  }
+  if ((uint32_t)ref->arena_index >= g_upload_desc.slot_count) {
+    dx9mt_logf("backend",
+               "upload ref arena out of range for %s: arena=%u slots=%u seq=%u",
+               name, (unsigned)ref->arena_index, g_upload_desc.slot_count,
+               sequence);
+    return 0;
+  }
+  if (ref->size > g_upload_desc.bytes_per_slot ||
+      ref->offset > g_upload_desc.bytes_per_slot - ref->size) {
+    dx9mt_logf(
+        "backend",
+        "upload ref bounds invalid for %s: arena=%u offset=%u size=%u bytes=%u seq=%u",
+        name, (unsigned)ref->arena_index, ref->offset, ref->size,
+        g_upload_desc.bytes_per_slot, sequence);
+    return 0;
+  }
+  return 1;
 }
 
 static void dx9mt_backend_reset_frame_stats(void) {
@@ -168,6 +494,102 @@ static void dx9mt_backend_reset_frame_stats(void) {
   g_last_clear_flags = 0;
   g_last_clear_z = 1.0f;
   g_last_clear_stencil = 0;
+  g_last_draw_state_hash = 0;
+  g_last_draw_primitive_type = 0;
+  g_last_draw_primitive_count = 0;
+}
+
+static dx9mt_backend_frame_snapshot
+dx9mt_backend_capture_frame_snapshot(uint32_t frame_id) {
+  dx9mt_backend_frame_snapshot snapshot;
+  memset(&snapshot, 0, sizeof(snapshot));
+  snapshot.frame_id = frame_id;
+  snapshot.packet_count = g_frame_packet_count;
+  snapshot.draw_count = g_frame_replay_state.draw_total;
+  snapshot.clear_count = g_frame_clear_count;
+  snapshot.last_clear_color = g_last_clear_color;
+  snapshot.last_clear_flags = g_last_clear_flags;
+  snapshot.last_clear_z = g_last_clear_z;
+  snapshot.last_clear_stencil = g_last_clear_stencil;
+  snapshot.last_draw_state_hash = g_last_draw_state_hash;
+  snapshot.last_draw_primitive_type = g_last_draw_primitive_type;
+  snapshot.last_draw_primitive_count = g_last_draw_primitive_count;
+  snapshot.replay_hash =
+      dx9mt_backend_compute_frame_replay_hash(&g_frame_replay_state);
+  snapshot.replay_draw_count = g_frame_replay_state.draw_stored;
+  return snapshot;
+}
+
+static void dx9mt_backend_reset_frame_replay_state(uint32_t frame_id) {
+  memset(&g_frame_replay_state, 0, sizeof(g_frame_replay_state));
+  g_frame_replay_state.frame_id = frame_id;
+}
+
+static void
+dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) {
+  dx9mt_backend_draw_command *command;
+
+  if (!draw_packet) {
+    return;
+  }
+
+  ++g_frame_replay_state.draw_total;
+  if (g_frame_replay_state.draw_stored >=
+      DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME) {
+    ++g_frame_replay_state.draw_dropped;
+    if (g_frame_replay_state.draw_dropped == 1 ||
+        (g_frame_replay_state.draw_dropped % 256u) == 0u) {
+      dx9mt_logf("backend",
+                 "draw command capture overflow frame=%u total=%u dropped=%u",
+                 g_frame_replay_state.frame_id, g_frame_replay_state.draw_total,
+                 g_frame_replay_state.draw_dropped);
+    }
+    return;
+  }
+
+  command = &g_frame_replay_state.draws[g_frame_replay_state.draw_stored++];
+  memset(command, 0, sizeof(*command));
+  command->state_block_hash = draw_packet->state_block_hash;
+  command->primitive_type = draw_packet->primitive_type;
+  command->base_vertex = draw_packet->base_vertex;
+  command->min_vertex_index = draw_packet->min_vertex_index;
+  command->num_vertices = draw_packet->num_vertices;
+  command->start_index = draw_packet->start_index;
+  command->primitive_count = draw_packet->primitive_count;
+  command->render_target_id = draw_packet->render_target_id;
+  command->depth_stencil_id = draw_packet->depth_stencil_id;
+  command->vertex_buffer_id = draw_packet->vertex_buffer_id;
+  command->index_buffer_id = draw_packet->index_buffer_id;
+  command->vertex_decl_id = draw_packet->vertex_decl_id;
+  command->vertex_shader_id = draw_packet->vertex_shader_id;
+  command->pixel_shader_id = draw_packet->pixel_shader_id;
+  command->fvf = draw_packet->fvf;
+  command->stream0_offset = draw_packet->stream0_offset;
+  command->stream0_stride = draw_packet->stream0_stride;
+  command->viewport_hash = draw_packet->viewport_hash;
+  command->scissor_hash = draw_packet->scissor_hash;
+  command->texture_stage_hash = draw_packet->texture_stage_hash;
+  command->sampler_state_hash = draw_packet->sampler_state_hash;
+  command->stream_binding_hash = draw_packet->stream_binding_hash;
+  command->constants_vs = draw_packet->constants_vs;
+  command->constants_ps = draw_packet->constants_ps;
+  command->viewport_x = draw_packet->viewport_x;
+  command->viewport_y = draw_packet->viewport_y;
+  command->viewport_width = draw_packet->viewport_width;
+  command->viewport_height = draw_packet->viewport_height;
+  command->viewport_min_z = draw_packet->viewport_min_z;
+  command->viewport_max_z = draw_packet->viewport_max_z;
+  command->scissor_left = draw_packet->scissor_left;
+  command->scissor_top = draw_packet->scissor_top;
+  command->scissor_right = draw_packet->scissor_right;
+  command->scissor_bottom = draw_packet->scissor_bottom;
+  command->vertex_data = draw_packet->vertex_data;
+  command->vertex_data_size = draw_packet->vertex_data_size;
+  command->index_data = draw_packet->index_data;
+  command->index_data_size = draw_packet->index_data_size;
+  command->index_format = draw_packet->index_format;
+  command->vertex_decl_data = draw_packet->vertex_decl_data;
+  command->vertex_decl_count = draw_packet->vertex_decl_count;
 }
 
 int dx9mt_backend_bridge_init(const dx9mt_backend_init_desc *desc) {
@@ -186,7 +608,66 @@ int dx9mt_backend_bridge_init(const dx9mt_backend_init_desc *desc) {
   memset(&g_present_target, 0, sizeof(g_present_target));
   g_frame_open = 0;
   g_soft_present = -1;
+  g_metal_present = -1;
+  g_upload_desc = desc->upload_desc;
+  g_last_replay_hash = 0;
+  memset(&g_current_frame_snapshot, 0, sizeof(g_current_frame_snapshot));
+  memset(&g_last_presented_snapshot, 0, sizeof(g_last_presented_snapshot));
+  dx9mt_backend_reset_frame_replay_state(0);
   dx9mt_backend_reset_frame_stats();
+
+#if defined(__APPLE__) && !defined(DX9MT_NO_METAL)
+  if (dx9mt_backend_metal_present_enabled()) {
+    if (dx9mt_metal_init() == 0) {
+      dx9mt_logf("backend", "metal presenter initialized");
+    } else {
+      dx9mt_logf("backend", "metal presenter init failed, falling back to no-op");
+    }
+  }
+#endif
+
+#ifdef _WIN32
+  /*
+   * Open the shared-memory IPC file for the native Metal viewer.
+   * The file is pre-created by `make run` before Wine starts.
+   * If the file doesn't exist, IPC is silently disabled -- the viewer
+   * wasn't launched, so there's nothing to render to.
+   */
+  g_metal_ipc_sequence = 0;
+  g_metal_ipc_file = CreateFileA(
+      DX9MT_METAL_IPC_WIN_PATH, GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+  if (g_metal_ipc_file != INVALID_HANDLE_VALUE) {
+    g_metal_ipc_mapping = CreateFileMappingA(g_metal_ipc_file, NULL,
+                                             PAGE_READWRITE, 0,
+                                             DX9MT_METAL_IPC_SIZE, NULL);
+    if (g_metal_ipc_mapping) {
+      g_metal_ipc_ptr = (dx9mt_metal_frame_data *)MapViewOfFile(
+          g_metal_ipc_mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+          DX9MT_METAL_IPC_SIZE);
+      if (g_metal_ipc_ptr) {
+        memset((void *)g_metal_ipc_ptr, 0, sizeof(dx9mt_metal_ipc_header));
+        g_metal_ipc_ptr->magic = DX9MT_METAL_IPC_MAGIC;
+        dx9mt_logf("backend", "metal IPC mapped at %s",
+                   DX9MT_METAL_IPC_WIN_PATH);
+      }
+    }
+    if (!g_metal_ipc_ptr) {
+      dx9mt_logf("backend", "metal IPC mapping failed");
+      if (g_metal_ipc_mapping) {
+        CloseHandle(g_metal_ipc_mapping);
+        g_metal_ipc_mapping = NULL;
+      }
+      CloseHandle(g_metal_ipc_file);
+      g_metal_ipc_file = INVALID_HANDLE_VALUE;
+    }
+  } else {
+    dx9mt_logf("backend",
+               "metal IPC file not found (viewer not running?): %s",
+               DX9MT_METAL_IPC_WIN_PATH);
+  }
+#endif
+
   return 0;
 }
 
@@ -215,6 +696,18 @@ int dx9mt_backend_bridge_update_present_target(
       (unsigned long long)g_present_target.target_id,
       (unsigned long long)g_present_target.window_handle, g_present_target.width,
       g_present_target.height, g_present_target.format, g_present_target.windowed);
+
+#if defined(__APPLE__) && !defined(DX9MT_NO_METAL)
+  if (dx9mt_metal_is_available()) {
+    if (dx9mt_metal_update_target(g_present_target.width,
+                                  g_present_target.height,
+                                  g_present_target.target_id) != 0) {
+      dx9mt_logf("backend", "metal target update failed for %ux%u",
+                 g_present_target.width, g_present_target.height);
+    }
+  }
+#endif
+
   return 0;
 }
 
@@ -283,6 +776,18 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
             draw_packet->fvf, header->sequence);
         return -1;
       }
+      if (!dx9mt_backend_validate_upload_ref(&draw_packet->constants_vs,
+                                             "constants_vs",
+                                             header->sequence) ||
+          !dx9mt_backend_validate_upload_ref(&draw_packet->constants_ps,
+                                             "constants_ps",
+                                             header->sequence)) {
+        return -1;
+      }
+      g_last_draw_state_hash = draw_packet->state_block_hash;
+      g_last_draw_primitive_type = draw_packet->primitive_type;
+      g_last_draw_primitive_count = draw_packet->primitive_count;
+      dx9mt_backend_record_draw_command(draw_packet);
       ++g_frame_draw_indexed_count;
     } else if (header->type == DX9MT_PACKET_CLEAR) {
       const dx9mt_packet_clear *clear_packet =
@@ -298,6 +803,35 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
       g_last_clear_flags = clear_packet->flags;
       g_last_clear_z = clear_packet->z;
       g_last_clear_stencil = clear_packet->stencil;
+      g_frame_replay_state.have_clear = 1;
+      g_frame_replay_state.last_clear_packet = *clear_packet;
+    } else if (header->type == DX9MT_PACKET_BEGIN_FRAME) {
+      /*
+       * BEGIN_FRAME now arrives through the packet stream (not as a
+       * side-channel direct call). Dispatch to the same begin_frame
+       * logic so frame state is reset consistently whether packets
+       * arrive via submit_packets or the direct API.
+       */
+      const dx9mt_packet_begin_frame *bf_packet =
+          (const dx9mt_packet_begin_frame *)header;
+      if (header->size < sizeof(*bf_packet)) {
+        dx9mt_logf("backend",
+                   "begin_frame packet too small: size=%u expected=%u",
+                   header->size, (unsigned)sizeof(*bf_packet));
+        return -1;
+      }
+      dx9mt_backend_bridge_begin_frame(bf_packet->frame_id);
+    } else if (header->type == DX9MT_PACKET_PRESENT) {
+      const dx9mt_packet_present *present_packet =
+          (const dx9mt_packet_present *)header;
+      if (header->size < sizeof(*present_packet)) {
+        dx9mt_logf("backend",
+                   "present packet too small: size=%u expected=%u",
+                   header->size, (unsigned)sizeof(*present_packet));
+        return -1;
+      }
+      g_frame_replay_state.have_present_packet = 1;
+      g_frame_replay_state.present_packet_frame_id = present_packet->frame_id;
     }
 
     if (dx9mt_backend_trace_packets_enabled()) {
@@ -331,6 +865,9 @@ int dx9mt_backend_bridge_begin_frame(uint32_t frame_id) {
   g_frame_open = 1;
   g_last_frame_id = frame_id;
   dx9mt_backend_reset_frame_stats();
+  memset(&g_current_frame_snapshot, 0, sizeof(g_current_frame_snapshot));
+  g_current_frame_snapshot.frame_id = frame_id;
+  dx9mt_backend_reset_frame_replay_state(frame_id);
 
   if (dx9mt_backend_should_log_frame(frame_id)) {
     dx9mt_logf("backend", "begin_frame=%u", frame_id);
@@ -341,6 +878,7 @@ int dx9mt_backend_bridge_begin_frame(uint32_t frame_id) {
 int dx9mt_backend_bridge_present(uint32_t frame_id) {
   int soft_presented;
   const char *present_mode = "no-op";
+  dx9mt_backend_frame_snapshot snapshot;
 
   if (!g_backend_ready) {
     return -1;
@@ -353,24 +891,198 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
   if (!g_frame_open) {
     dx9mt_logf("backend", "present frame=%u without begin_frame", frame_id);
   }
+  if (g_frame_replay_state.frame_id != 0 &&
+      g_frame_replay_state.frame_id != frame_id) {
+    dx9mt_logf("backend",
+               "present frame mismatch: incoming=%u replay_state=%u",
+               frame_id, g_frame_replay_state.frame_id);
+  }
+  if (g_frame_replay_state.have_present_packet &&
+      g_frame_replay_state.present_packet_frame_id != frame_id) {
+    dx9mt_logf("backend",
+               "present packet frame mismatch: packet=%u present=%u",
+               g_frame_replay_state.present_packet_frame_id, frame_id);
+    return -1;
+  }
+  if (g_frame_draw_indexed_count != g_frame_replay_state.draw_total) {
+    dx9mt_logf("backend",
+               "draw count mismatch: counter=%u replay_total=%u frame=%u",
+               g_frame_draw_indexed_count, g_frame_replay_state.draw_total,
+               frame_id);
+  }
 
   g_frame_open = 0;
   g_last_frame_id = frame_id;
-  soft_presented = dx9mt_backend_soft_present_to_window(frame_id);
-  if (soft_presented) {
-    present_mode = "soft-present";
+  snapshot = dx9mt_backend_capture_frame_snapshot(frame_id);
+  g_current_frame_snapshot = snapshot;
+  g_last_presented_snapshot = snapshot;
+  g_last_replay_hash = snapshot.replay_hash;
+
+#if defined(__APPLE__) && !defined(DX9MT_NO_METAL)
+  if (dx9mt_metal_is_available()) {
+    dx9mt_metal_present_desc metal_desc;
+    memset(&metal_desc, 0, sizeof(metal_desc));
+    metal_desc.have_clear = g_frame_replay_state.have_clear;
+    metal_desc.clear_color_argb = snapshot.last_clear_color;
+    metal_desc.clear_flags = snapshot.last_clear_flags;
+    metal_desc.clear_z = snapshot.last_clear_z;
+    metal_desc.clear_stencil = snapshot.last_clear_stencil;
+    metal_desc.draw_count = g_frame_replay_state.draw_stored;
+    metal_desc.replay_hash = snapshot.replay_hash;
+    metal_desc.frame_id = frame_id;
+    if (dx9mt_metal_present(&metal_desc) == 0) {
+      present_mode = "metal";
+    } else {
+      present_mode = "metal-fail";
+    }
+  } else
+#endif
+  {
+    soft_presented = dx9mt_backend_soft_present_to_window(&snapshot);
+    if (soft_presented) {
+      present_mode = "soft-present";
+    }
   }
+
+#ifdef _WIN32
+  if (g_metal_ipc_ptr) {
+    unsigned char *ipc_base = (unsigned char *)g_metal_ipc_ptr;
+    uint32_t draw_count = g_frame_replay_state.draw_stored;
+    uint32_t bulk_offset;
+    uint32_t bulk_used = 0;
+    dx9mt_metal_ipc_draw *ipc_draws;
+    uint32_t i;
+
+    if (draw_count > DX9MT_METAL_IPC_MAX_DRAWS) {
+      draw_count = DX9MT_METAL_IPC_MAX_DRAWS;
+    }
+
+    bulk_offset = (uint32_t)(sizeof(dx9mt_metal_ipc_header) +
+                             draw_count * sizeof(dx9mt_metal_ipc_draw));
+    /* Align bulk data to 16 bytes */
+    bulk_offset = (bulk_offset + 15u) & ~15u;
+
+    ipc_draws =
+        (dx9mt_metal_ipc_draw *)(ipc_base + sizeof(dx9mt_metal_ipc_header));
+
+    for (i = 0; i < draw_count; ++i) {
+      const dx9mt_backend_draw_command *cmd = &g_frame_replay_state.draws[i];
+      dx9mt_metal_ipc_draw *d = &ipc_draws[i];
+      const void *data;
+
+      memset(d, 0, sizeof(*d));
+      d->primitive_type = cmd->primitive_type;
+      d->base_vertex = cmd->base_vertex;
+      d->min_vertex_index = cmd->min_vertex_index;
+      d->num_vertices = cmd->num_vertices;
+      d->start_index = cmd->start_index;
+      d->primitive_count = cmd->primitive_count;
+      d->viewport_x = cmd->viewport_x;
+      d->viewport_y = cmd->viewport_y;
+      d->viewport_width = cmd->viewport_width;
+      d->viewport_height = cmd->viewport_height;
+      d->viewport_min_z = cmd->viewport_min_z;
+      d->viewport_max_z = cmd->viewport_max_z;
+      d->scissor_left = cmd->scissor_left;
+      d->scissor_top = cmd->scissor_top;
+      d->scissor_right = cmd->scissor_right;
+      d->scissor_bottom = cmd->scissor_bottom;
+      d->fvf = cmd->fvf;
+      d->stream0_offset = cmd->stream0_offset;
+      d->stream0_stride = cmd->stream0_stride;
+      d->index_format = cmd->index_format;
+
+      /* Copy VB data into bulk region */
+      data = dx9mt_frontend_upload_resolve(&cmd->vertex_data);
+      if (data && cmd->vertex_data_size > 0 &&
+          bulk_offset + bulk_used + cmd->vertex_data_size <=
+              DX9MT_METAL_IPC_SIZE) {
+        d->vb_bulk_offset = bulk_used;
+        d->vb_bulk_size = cmd->vertex_data_size;
+        memcpy(ipc_base + bulk_offset + bulk_used, data, cmd->vertex_data_size);
+        bulk_used += (cmd->vertex_data_size + 15u) & ~15u;
+      }
+
+      /* Copy IB data into bulk region */
+      data = dx9mt_frontend_upload_resolve(&cmd->index_data);
+      if (data && cmd->index_data_size > 0 &&
+          bulk_offset + bulk_used + cmd->index_data_size <=
+              DX9MT_METAL_IPC_SIZE) {
+        d->ib_bulk_offset = bulk_used;
+        d->ib_bulk_size = cmd->index_data_size;
+        memcpy(ipc_base + bulk_offset + bulk_used, data, cmd->index_data_size);
+        bulk_used += (cmd->index_data_size + 15u) & ~15u;
+      }
+
+      /* Copy vertex declaration into bulk region */
+      data = dx9mt_frontend_upload_resolve(&cmd->vertex_decl_data);
+      if (data && cmd->vertex_decl_count > 0) {
+        uint32_t decl_bytes = cmd->vertex_decl_count * 8u;
+        if (bulk_offset + bulk_used + decl_bytes <= DX9MT_METAL_IPC_SIZE) {
+          d->decl_bulk_offset = bulk_used;
+          d->decl_count = cmd->vertex_decl_count;
+          memcpy(ipc_base + bulk_offset + bulk_used, data, decl_bytes);
+          bulk_used += (decl_bytes + 15u) & ~15u;
+        }
+      }
+
+      /* Copy VS float constants into bulk region */
+      data = dx9mt_frontend_upload_resolve(&cmd->constants_vs);
+      if (data && cmd->constants_vs.size > 0 &&
+          bulk_offset + bulk_used + cmd->constants_vs.size <=
+              DX9MT_METAL_IPC_SIZE) {
+        d->vs_constants_bulk_offset = bulk_used;
+        d->vs_constants_size = cmd->constants_vs.size;
+        memcpy(ipc_base + bulk_offset + bulk_used, data,
+               cmd->constants_vs.size);
+        bulk_used += (cmd->constants_vs.size + 15u) & ~15u;
+      }
+
+      /* Copy PS float constants into bulk region */
+      data = dx9mt_frontend_upload_resolve(&cmd->constants_ps);
+      if (data && cmd->constants_ps.size > 0 &&
+          bulk_offset + bulk_used + cmd->constants_ps.size <=
+              DX9MT_METAL_IPC_SIZE) {
+        d->ps_constants_bulk_offset = bulk_used;
+        d->ps_constants_size = cmd->constants_ps.size;
+        memcpy(ipc_base + bulk_offset + bulk_used, data,
+               cmd->constants_ps.size);
+        bulk_used += (cmd->constants_ps.size + 15u) & ~15u;
+      }
+    }
+
+    g_metal_ipc_ptr->width = g_present_target.width;
+    g_metal_ipc_ptr->height = g_present_target.height;
+    g_metal_ipc_ptr->have_clear = g_frame_replay_state.have_clear;
+    g_metal_ipc_ptr->clear_color_argb = snapshot.last_clear_color;
+    g_metal_ipc_ptr->clear_flags = snapshot.last_clear_flags;
+    g_metal_ipc_ptr->clear_z = snapshot.last_clear_z;
+    g_metal_ipc_ptr->clear_stencil = snapshot.last_clear_stencil;
+    g_metal_ipc_ptr->draw_count = draw_count;
+    g_metal_ipc_ptr->replay_hash = snapshot.replay_hash;
+    g_metal_ipc_ptr->frame_id = frame_id;
+    g_metal_ipc_ptr->bulk_data_offset = bulk_offset;
+    g_metal_ipc_ptr->bulk_data_used = bulk_used;
+    /* Write sequence last -- the viewer polls this field. */
+    __atomic_store_n(&g_metal_ipc_ptr->sequence, ++g_metal_ipc_sequence,
+                     __ATOMIC_RELEASE);
+    present_mode = "metal-ipc";
+  }
+#endif
   if (dx9mt_backend_should_log_frame(frame_id)) {
     dx9mt_logf(
         "backend",
-        "present frame=%u target=%llu size=%ux%u fmt=%u (%s) packets=%u draws=%u clears=%u last_clear=0x%08x flags=0x%08x z=%.3f stencil=%u",
+        "present frame=%u target=%llu size=%ux%u fmt=%u (%s) packets=%u draws=%u clears=%u last_clear=0x%08x flags=0x%08x z=%.3f stencil=%u draw_hash=0x%08x replay_hash=0x%08x draw_stored=%u draw_dropped=%u",
         frame_id, (unsigned long long)g_present_target.target_id,
         g_present_target.width, g_present_target.height, g_present_target.format,
-        present_mode,
-        g_frame_packet_count, g_frame_draw_indexed_count,
-        g_frame_clear_count, g_last_clear_color, g_last_clear_flags,
-        (double)g_last_clear_z, g_last_clear_stencil);
+        present_mode, snapshot.packet_count, snapshot.draw_count,
+        snapshot.clear_count, snapshot.last_clear_color,
+        snapshot.last_clear_flags, (double)snapshot.last_clear_z,
+        snapshot.last_clear_stencil, snapshot.last_draw_state_hash,
+        snapshot.replay_hash,
+        g_frame_replay_state.draw_stored, g_frame_replay_state.draw_dropped);
   }
+  g_frame_replay_state.have_present_packet = 0;
   return 0;
 }
 
@@ -379,9 +1091,37 @@ void dx9mt_backend_bridge_shutdown(void) {
     return;
   }
 
+#if defined(__APPLE__) && !defined(DX9MT_NO_METAL)
+  if (dx9mt_metal_is_available()) {
+    dx9mt_metal_shutdown();
+  }
+#endif
+
+#ifdef _WIN32
+  if (g_metal_ipc_ptr) {
+    UnmapViewOfFile(g_metal_ipc_ptr);
+    g_metal_ipc_ptr = NULL;
+  }
+  if (g_metal_ipc_mapping) {
+    CloseHandle(g_metal_ipc_mapping);
+    g_metal_ipc_mapping = NULL;
+  }
+  if (g_metal_ipc_file != INVALID_HANDLE_VALUE) {
+    CloseHandle(g_metal_ipc_file);
+    g_metal_ipc_file = INVALID_HANDLE_VALUE;
+  }
+#endif
+
   dx9mt_logf("backend", "shutdown, last_frame=%u", g_last_frame_id);
   g_backend_ready = 0;
   g_have_present_target = 0;
   g_last_packet_sequence = 0;
   g_frame_open = 0;
+  memset(&g_upload_desc, 0, sizeof(g_upload_desc));
+  g_last_replay_hash = 0;
+  dx9mt_backend_reset_frame_replay_state(0);
+}
+
+uint32_t dx9mt_backend_bridge_debug_get_last_replay_hash(void) {
+  return g_last_replay_hash;
 }

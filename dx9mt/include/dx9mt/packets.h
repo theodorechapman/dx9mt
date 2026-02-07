@@ -54,8 +54,33 @@ typedef struct dx9mt_packet_draw_indexed {
   uint32_t stream0_stride;
   uint32_t viewport_hash;
   uint32_t scissor_hash;
+  uint32_t texture_stage_hash;
+  uint32_t sampler_state_hash;
+  uint32_t stream_binding_hash;
   dx9mt_upload_ref constants_vs;
   dx9mt_upload_ref constants_ps;
+
+  /* RB3: actual viewport/scissor values (previously only hashes) */
+  uint32_t viewport_x;
+  uint32_t viewport_y;
+  uint32_t viewport_width;
+  uint32_t viewport_height;
+  float viewport_min_z;
+  float viewport_max_z;
+  int32_t scissor_left;
+  int32_t scissor_top;
+  int32_t scissor_right;
+  int32_t scissor_bottom;
+
+  /* RB3: geometry data refs (VB/IB bytes, vertex declaration) */
+  dx9mt_upload_ref vertex_data;
+  uint32_t vertex_data_size;
+  dx9mt_upload_ref index_data;
+  uint32_t index_data_size;
+  uint32_t index_format;
+  dx9mt_upload_ref vertex_decl_data;
+  uint16_t vertex_decl_count;
+  uint16_t _pad1;
 } dx9mt_packet_draw_indexed;
 
 typedef struct dx9mt_packet_present {
@@ -73,5 +98,21 @@ typedef struct dx9mt_packet_clear {
   float z;
   uint32_t stencil;
 } dx9mt_packet_clear;
+
+/*
+ * header.size is uint16_t, so every packet struct must fit in 65535 bytes.
+ * The (uint16_t)sizeof(packet) casts in the frontend silently truncate if
+ * a packet grows past this limit. Catch it at compile time instead.
+ */
+_Static_assert(sizeof(dx9mt_packet_init) <= UINT16_MAX,
+               "packet_init exceeds uint16 size field");
+_Static_assert(sizeof(dx9mt_packet_begin_frame) <= UINT16_MAX,
+               "packet_begin_frame exceeds uint16 size field");
+_Static_assert(sizeof(dx9mt_packet_draw_indexed) <= UINT16_MAX,
+               "packet_draw_indexed exceeds uint16 size field");
+_Static_assert(sizeof(dx9mt_packet_present) <= UINT16_MAX,
+               "packet_present exceeds uint16 size field");
+_Static_assert(sizeof(dx9mt_packet_clear) <= UINT16_MAX,
+               "packet_clear exceeds uint16 size field");
 
 #endif

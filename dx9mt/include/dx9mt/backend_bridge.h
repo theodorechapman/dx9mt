@@ -29,5 +29,6 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
 int dx9mt_backend_bridge_begin_frame(uint32_t frame_id);
 int dx9mt_backend_bridge_present(uint32_t frame_id);
 void dx9mt_backend_bridge_shutdown(void);
+uint32_t dx9mt_backend_bridge_debug_get_last_replay_hash(void);
 
 #endif

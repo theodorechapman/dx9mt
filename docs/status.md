@@ -1,148 +1,113 @@
 # dx9mt Status
 
-Last updated: 2026-02-06  
-Owner: project-wide (update every working session)
+## What This Is
 
-## Objective
-Ship a high-performance direct `d3d9.dll` replacement for 32-bit DX9 games under Wine WoW64 on Apple Silicon, with Fallout New Vegas (FNV) as first target.
+D3D9-to-Metal translation layer for Wine WoW64 on Apple Silicon. Target: Fallout: New Vegas (FNV). Replaces the DXVK/Vulkan/MoltenVK chain with a direct D3D9-to-Metal path.
 
-## Scope
-- In scope:
-  - PE32 D3D9 front-end (`d3d9.dll`) with COM ABI compatibility.
-  - ARM64 native backend bridge (`unixlib`) and packet path.
-  - FNV-first compatibility and performance bring-up.
-- Out of scope for initial milestones:
-  - Generic non-Wine runtime support.
-  - Broad DX9Ex/64-bit game support.
-  - Replacing Wine CPU emulation strategy.
+## Architecture
 
-## Environment Baseline
-- `Wine Staging.app` + fresh `wineprefix`.
-- Steam + FNV installed under `C:\Games\Steam\...`.
-- `dxmt/` present as D3D10/11->Metal reference.
-- Frame capture inputs:
-  - `frame3172-api-calls.txt` (32,647 lines)
-  - `frame3172-unique-api-calls.txt` (34 unique calls)
+```
+PE32 Frontend (d3d9.dll, i686-mingw32)
+  Implements D3D9 COM interfaces
+  Captures all API state + draw calls as packets
+  Copies VB/IB/decl/constant data to upload arena
+  Writes per-frame data to shared memory IPC file
+      |
+      | memory-mapped file (/tmp/dx9mt_metal_frame.bin, 16MB)
+      | per-draw: viewport, scissor, VB bytes, IB bytes,
+      |           vertex decl, VS/PS constants
+      v
+Native Metal Viewer (dx9mt_metal_viewer, ARM64)
+  Polls IPC file for new frames
+  Parses vertex declarations -> Metal vertex descriptors
+  Creates Metal buffers from VB/IB data
+  Applies WVP matrix from VS constants c0-c3
+  Encodes indexed draw calls per frame
+  Renders to standalone NSWindow with CAMetalLayer
+```
 
-## Milestone Status
-- `M0` Docs + baseline data interpretation: completed.
-- `M1` Buildable scaffold (`d3d9.dll` + backend bridge + packet/log plumbing): completed.
-- `M2` Minimal runtime object correctness (device/swapchain/surface/VB/IB/shaders): completed.
-- `M3` FNV startup and launch compatibility: in progress.
-  - `M3a` DLL load and launcher compatibility: completed.
-  - `M3b` Game post-`CreateDevice` renderer init: in progress.
-- `M4` Performance architecture and batching: pending.
-- `M5` Hardening and long-session validation: pending.
+The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (mingw, `_WIN32`), the viewer runs natively (`__APPLE__`). They share a 16MB memory-mapped file for frame data. A native backend dylib (`libdx9mt_unixlib.dylib`) is also built but not yet loaded by Wine -- the IPC approach bypasses the need for Wine unix lib integration.
 
-## What Was Implemented (Current Session Window)
-- Wine-compatible `d3d9.dll` exports/ordinals (`d3d9.def`) and missing compatibility exports.
-- Runtime attach/detach logging with PID + exe + command line.
-- Startup capability-check implementation for:
-  - `CheckDeviceType`
-  - `CheckDeviceFormat`
-  - `CheckDepthStencilMatch`
-  - `CheckDeviceMultiSampleType`
-  - `GetDeviceCaps`
-  - `EnumAdapterModes`
-- Per-app override flow updated so both executables use dx9mt:
-  - `FalloutNVLauncher.exe`
-  - `FalloutNV.exe`
-- Make workflow simplified and stabilized:
-  - `make run`
-  - `make show-logs`
-  - `wine-restart` hook before override-sensitive targets.
-- `CreateQuery` implemented (minimal `IDirect3DQuery9` COM object) to unblock launcher device detection.
-- `GetDeviceCaps` expanded to a more realistic HAL profile for Gamebryo expectations.
-- Added `DX9MT_PACKET_CLEAR` emission from `IDirect3DDevice9::Clear`.
-- Backend stub logging changed from per-packet spam to per-frame summaries (`packets/draws/clears/last_clear`) with optional packet trace via `DX9MT_BACKEND_TRACE_PACKETS=1`.
-- Probe/perf log throttling to keep runtime logs readable by default:
-  - set `DX9MT_TRACE_PROBES=1` to restore full probe verbosity.
-  - `DebugSetMute` now logs sampled counts instead of every call.
-  - capability-probe failure loops now sampled (not logged every time).
-- Added targeted runtime instrumentation for unimplemented/high-risk paths:
-  - `CreateCubeTexture` call-path log (sampled).
-  - `CreateVolumeTexture` unsupported log (sampled).
-  - `DrawPrimitive` stub-use log (sampled).
-- Implemented minimal `IDirect3DCubeTexture9` object + `CreateCubeTexture` success path for common startup usage.
-- Added/kept analyzer tooling:
-  - `tools/analyze_dx9mt_log.py`
-  - `uv` project setup (`pyproject.toml`, `uv.lock`).
-- Backend contract hardening for rendering bring-up (`RB0`) landed:
-  - monotonic packet sequencing via `dx9mt_runtime_next_packet_sequence()`.
-  - present-target metadata publishing on device create/reset (`target/window/size/format/windowed`).
-  - swapchain present delegated to device present to keep one packet sequencing path.
-  - `DRAW_INDEXED` packets now include draw-critical IDs/hashes (RT/DS/VB/IB/decl/shaders/FVF/stream0/viewport/scissor).
-  - backend parser validates draw packet size and required state IDs.
-- Automated contract tests added:
-  - `dx9mt/tests/backend_bridge_contract_test.c`
-  - top-level `make test` / `make -C dx9mt test-native` pass.
-- RB1 bootstrap paths added (optional):
-  - `DX9MT_BACKEND_SOFT_PRESENT=1` enables backend-side window clear/marker present using present-target window metadata.
-  - `DX9MT_FRONTEND_SOFT_PRESENT=1` enables a software present path that blits backbuffer sysmem to the Wine window via GDI.
-  - `Clear(D3DCLEAR_TARGET)` now updates RT0 sysmem, and present overlays a deterministic frame marker for visual confirmation.
-  - these are temporary validation paths; real Metal/backend replay remains the long-term target.
+## Current Verified State (2026-02-07)
 
-## Current Verified Runtime State
-- Launcher path:
-  - `dx9mt` loads into `FalloutNVLauncher.exe`.
-  - Device detection now works (no immediate crash from previous `CreateQuery` stub).
-- Game path:
-  - `dx9mt` loads into `FalloutNV.exe`.
-  - `Direct3DCreate9` called.
-  - `CreateDevice` succeeds.
-  - `GetDeviceCaps` succeeds.
-  - `CreateCubeTexture` now succeeds in the game startup path (`hr=0x00000000`).
-  - Game progresses past previous `failed to initialize gamebryo renderer` error.
-  - Runtime reaches active frame loop with large `DRAW_INDEXED` + `PRESENT` traffic.
-  - Latest manual validation sustained through at least frame `2760` with stable present target metadata:
-    - `present target updated: target=33554433 size=1280x720 fmt=22 windowed=1`
-    - repeated `present frame=... target=33554433 size=1280x720 fmt=22 (no-op)`
-  - Latest manual validation had no contract errors:
-    - no `packet parse error`
-    - no `packet sequence out of order`
-    - no `draw packet missing state ids`
-    - no `draw packet too small`
-  - No `CreateVolumeTexture unsupported` or `DrawPrimitive stub` signal in latest runtime slices.
-  - Automated contract validation currently passes (`backend_bridge_contract_test: PASS` via `make test`).
-  - User-observed behavior in bootstrap mode: top-left marker/texture changes color frame-to-frame (expected).
-  - Without bootstrap mode: black screen with active audio/input cues.
+- FNV launches through Steam, passes launcher, reaches main menu
+- Active frame loop: ~19 draws/frame, 1 clear, consistent packet flow
+- Metal viewer shows FNV main menu with geometry in correct screen positions
+- WVP matrix extracted from VS constants c0-c3, applied in Metal vertex shader
+- Vertex colors visible (D3DCOLOR from vertex declaration)
+- Mouse interaction audible (game audio works, cursor movement detected)
+- No contract violations in packet stream
+- 10/10 backend contract tests passing
 
-## Current Blocker
-- Backend present/render path is still intentionally `no-op`; black screen is currently expected.
-- Current issue is no longer early launcher/device init failure; it is missing real backend rendering.
-- `RB0` bridge/packet guardrails are in place and validated.
-- Next blocker to clear is `RB1`: first visible backend present path (real backend path, not frontend bootstrap).
-- Remaining compatibility gaps still exist (`CreateVolumeTexture` and other unimplemented methods), with instrumentation to confirm call impact.
+## Milestones
 
-## Backend Plan
-- Detailed backend bring-up plan is tracked in:
-  - `docs/rendering-backend-plan.md`
+| Milestone | Status | Description |
+|-----------|--------|-------------|
+| M0-M3 | Done | Docs, scaffold, object model, FNV compatibility |
+| RB0 | Done | Packet contract: monotonic sequence, present-target metadata, draw-state IDs, upload refs |
+| RB1 | Done | First visible Metal output: clear color + draw-count overlay bar |
+| RB2 | Done | Structured per-draw IPC: viewport, scissor, VB/IB data, vertex decl, constants |
+| RB3 Phase 1 | Done | Metal geometry pipeline: indexed draws with WVP transform, vertex colors |
+| RB3 Phase 2 | Next | Textures, depth/stencil, blend state, D3D9 shader translation |
+| RB4 | Pending | State fidelity: render state, pass structure, clear-pass fusion |
+| RB5 | Pending | Performance: state dedup, buffer recycling, pipeline cache, async compile |
+| RB6 | Pending | Compatibility hardening: missing stubs, edge cases |
 
-## Operational Workflow
-- `make run`
-  - Restarts wineserver first.
-  - Reapplies per-app overrides.
-  - Installs `dx9mt/build/d3d9.dll` into FNV directory.
-  - Starts Steam, then launcher.
-  - Writes logs to:
-    - `/tmp/dx9mt_runtime.log`
-    - `/tmp/fnv_dx9mt_probe.log`
-    - `/tmp/steam_probe.log`
-- `make show-logs`
-  - Dumps runtime log and filtered launcher/steam signals.
-- `uv run tools/analyze_dx9mt_log.py /tmp/dx9mt_runtime.log --top 20`
-  - Summarizes call frequencies and probe sweep duplication.
+## Build & Run
 
-## Step 1 Definition (Updated)
-Step 1 is complete only when FNV progresses past Gamebryo renderer initialization into stable in-game rendering path under `dx9mt`.
+```bash
+make -C dx9mt                # Build frontend DLL + backend dylib + Metal viewer
+make -C dx9mt test-native    # Run 10 contract tests (Metal excluded via DX9MT_NO_METAL)
+make run                     # Kill old viewer, create IPC file, launch viewer + Wine + FNV
+make clear                   # Kill viewer + wineserver, remove IPC file
+make show-logs               # Display runtime logs
+```
 
-## Next 1-3 Actions
-1. Implement `RB1` first-visible present path (replace backend present no-op with a deterministic clear/output path).
-2. Start `RB2` frame-state replay scaffolding using the new draw packet identity fields and monotonic sequence contract.
-3. Keep the validation loop strict on every change:
-   - `make test`
-   - `make run`
-   - `rg -n "present target updated|present frame=.*target=|draw packet missing state ids|draw packet too small|packet parse error|packet sequence out of order" /tmp/dx9mt_runtime.log`
-   - optional visible bootstrap checks:
-     - `DX9MT_BACKEND_SOFT_PRESENT=1 make run`
-     - `DX9MT_FRONTEND_SOFT_PRESENT=1 make run`
+## Runtime Logs
+
+The PE DLL logs to `DX9MT_LOG_PATH` (default `/tmp/dx9mt_runtime.log`). Key patterns:
+
+```bash
+# Frame progression
+grep "present frame=" /tmp/dx9mt_runtime.log | head
+
+# Metal IPC status
+grep "metal IPC" /tmp/dx9mt_runtime.log
+
+# Contract errors (should be empty)
+grep -E "packet parse error|sequence out of order|draw packet missing" /tmp/dx9mt_runtime.log
+```
+
+Present frames show `(metal-ipc)` when the IPC path is active.
+
+## File Map
+
+```
+dx9mt/
+  include/dx9mt/
+    packets.h              Wire protocol (INIT, BEGIN_FRAME, DRAW_INDEXED, PRESENT, CLEAR)
+    backend_bridge.h       Backend bridge API (init, submit_packets, present, shutdown)
+    upload_arena.h         Triple-buffered upload arena for shader constants + geometry
+    metal_ipc.h            Shared memory IPC format (header + per-draw entries + bulk data)
+    object_ids.h           Kind-tagged object IDs ((kind << 24) | serial)
+    d3d9_device.h          Device creation entry point
+    runtime.h              Frontend runtime init + packet sequencing
+    log.h                  Centralized logging
+  src/frontend/
+    d3d9.c                 IDirect3D9 factory (caps, format checks, device creation)
+    d3d9_device.c          IDirect3DDevice9 + all COM objects (~5000 lines)
+    d3d9_perf.c            D3DPERF_* stubs + legacy exports
+    dllmain.c              DLL entry point
+    runtime.c              Singleton init, backend bridge setup, packet sequencing
+    d3d9.def               DLL export definitions
+  src/backend/
+    backend_bridge_stub.c  Packet parser, frame replay state, IPC writer, Metal wiring
+    metal_presenter.h      C-callable Metal presenter API (unused in IPC mode)
+    metal_presenter.m      Objective-C Metal implementation (unused in IPC mode)
+  src/common/
+    log.c                  Timestamped file/stderr logging
+  src/tools/
+    metal_viewer.m         Standalone native Metal viewer (reads IPC, renders geometry)
+  tests/
+    backend_bridge_contract_test.c   10 contract tests
+```
