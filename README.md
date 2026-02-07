@@ -30,9 +30,16 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 
 ## Current Verified State (2026-02-07)
 
-| Actual FNV Main Menu | Our Current Output |
-|---|---|
-| ![Actual FNV Main Menu](assets/fnv_main_menu_actual.jpg) | ![Current State](assets/current_state.png) |
+<table>
+<tr>
+<td align="center" width="50%"><b>Actual FNV Main Menu</b></td>
+<td align="center" width="50%"><b>Our Current Output</b></td>
+</tr>
+<tr>
+<td><img src="assets/fnv_main_menu_actual.jpg" width="100%"></td>
+<td><img src="assets/current_state.png" width="100%"></td>
+</tr>
+</table>
 
 - FNV launches through Steam, passes launcher, reaches main menu
 - Active frame loop: ~19 draws/frame, 1 clear, consistent packet flow
