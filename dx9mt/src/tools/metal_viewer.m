@@ -193,7 +193,6 @@ static uint32_t s_height = 720;
 static NSMutableDictionary *s_vs_func_cache;  /* bytecode_hash -> id<MTLFunction> or NSNull */
 static NSMutableDictionary *s_ps_func_cache;
 static NSMutableDictionary *s_translated_pso_cache;  /* combined_key -> id<MTLRenderPipelineState> */
-static int s_shader_translate_enabled = -1;  /* -1 = uninitialized */
 
 static NSString *const s_shader_source =
     @"#include <metal_stdlib>\n"
@@ -1407,16 +1406,6 @@ static const char *d3d_blend_name(uint32_t b) {
 /* RB3 Phase 3: Shader translation + compilation                       */
 /* ------------------------------------------------------------------ */
 
-static int shader_translate_enabled(void) {
-  if (s_shader_translate_enabled < 0) {
-    const char *env = getenv("DX9MT_SHADER_TRANSLATE");
-    s_shader_translate_enabled = (!env || strcmp(env, "0") != 0) ? 1 : 0;
-    if (!s_shader_translate_enabled)
-      fprintf(stderr, "dx9mt_metal_viewer: shader translation disabled by env\n");
-  }
-  return s_shader_translate_enabled;
-}
-
 static id<MTLFunction> translate_and_compile_vs(
     const uint32_t *bytecode, uint32_t dword_count, uint32_t bc_hash) {
   NSNumber *key = @(bc_hash);
@@ -1976,43 +1965,55 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         continue;
       }
 
-      /* RB3 Phase 3: attempt shader translation */
+      /* RB3 Phase 3: shader translation (mandatory when bytecode present) */
       int use_translated = 0;
-      id<MTLRenderPipelineState> translated_pso = nil;
-      if (shader_translate_enabled() &&
-          d->vs_bytecode_bulk_size >= 8 && d->ps_bytecode_bulk_size >= 8 &&
-          !decl_has_positiont) {
+      int has_shader_bytecode =
+          (d->vs_bytecode_bulk_size >= 8 && d->ps_bytecode_bulk_size >= 8 &&
+           !decl_has_positiont);
+
+      if (has_shader_bytecode) {
         const uint32_t *vs_bc = (const uint32_t *)(ipc_base + bulk_off +
                                                      d->vs_bytecode_bulk_offset);
         const uint32_t *ps_bc = (const uint32_t *)(ipc_base + bulk_off +
                                                      d->ps_bytecode_bulk_offset);
         uint32_t vs_dwords = d->vs_bytecode_bulk_size / 4;
         uint32_t ps_dwords = d->ps_bytecode_bulk_size / 4;
+
+        /* Validate version tokens: VS=0xFFFExxxx, PS=0xFFFFxxxx */
+        uint32_t vs_ver = vs_bc[0] & 0xFFFF0000u;
+        uint32_t ps_ver = ps_bc[0] & 0xFFFF0000u;
+        if (vs_ver != 0xFFFE0000u || ps_ver != 0xFFFF0000u) {
+          continue; /* invalid bytecode — skip draw */
+        }
+
         uint32_t vs_hash = dx9mt_sm_bytecode_hash(vs_bc, vs_dwords);
         uint32_t ps_hash = dx9mt_sm_bytecode_hash(ps_bc, ps_dwords);
 
         id<MTLFunction> vs_func = translate_and_compile_vs(vs_bc, vs_dwords, vs_hash);
         id<MTLFunction> ps_func = translate_and_compile_ps(ps_bc, ps_dwords, ps_hash);
 
-        if (vs_func && ps_func && elems) {
-          uint16_t eff_count = (fvf_elem_count > 0) ? fvf_elem_count
-                                                     : d->decl_count;
-          /* Build PSO key from shader hashes + vertex layout + blend state */
-          uint64_t pso_key = ((uint64_t)vs_hash << 32) | ps_hash;
-          pso_key ^= (uint64_t)stride * 0x9E3779B97F4A7C15ULL;
-          pso_key ^= ((uint64_t)d->rs_alpha_blend_enable << 48) |
-                     ((uint64_t)d->rs_src_blend << 40) |
-                     ((uint64_t)d->rs_dest_blend << 32);
-
-          translated_pso = create_translated_pso(
-              vs_func, ps_func, elems, eff_count, stride, textured,
-              d->rs_alpha_blend_enable, d->rs_src_blend, d->rs_dest_blend,
-              pso_key);
-          if (translated_pso) {
-            geometry_pso = translated_pso;
-            use_translated = 1;
-          }
+        if (!vs_func || !ps_func || !elems) {
+          continue; /* translation failed — skip draw, no fallback */
         }
+
+        uint16_t eff_count = (fvf_elem_count > 0) ? fvf_elem_count
+                                                   : d->decl_count;
+        uint64_t pso_key = ((uint64_t)vs_hash << 32) | ps_hash;
+        pso_key ^= (uint64_t)stride * 0x9E3779B97F4A7C15ULL;
+        pso_key ^= ((uint64_t)d->rs_alpha_blend_enable << 48) |
+                   ((uint64_t)d->rs_src_blend << 40) |
+                   ((uint64_t)d->rs_dest_blend << 32);
+
+        id<MTLRenderPipelineState> translated_pso = create_translated_pso(
+            vs_func, ps_func, elems, eff_count, stride, textured,
+            d->rs_alpha_blend_enable, d->rs_src_blend, d->rs_dest_blend,
+            pso_key);
+        if (!translated_pso) {
+          continue; /* PSO creation failed — skip draw */
+        }
+
+        geometry_pso = translated_pso;
+        use_translated = 1;
       }
 
       /* Create Metal buffers from IPC bulk data */

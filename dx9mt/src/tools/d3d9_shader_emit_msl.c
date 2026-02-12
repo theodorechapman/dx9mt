@@ -37,7 +37,7 @@ static void emit(emit_ctx *ctx, const char *fmt, ...) {
 /* ------------------------------------------------------------------ */
 
 static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
-                     int is_vs) {
+                     int is_vs, int major_ver) {
   switch (r->type) {
   case DX9MT_SM_REG_TEMP:
     snprintf(out, out_sz, "r%u", r->number);
@@ -49,7 +49,11 @@ static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
     snprintf(out, out_sz, "c[%u]", r->number);
     break;
   case DX9MT_SM_REG_ADDR:
-    snprintf(out, out_sz, "a%u", r->number);
+    /* VS: a0 (address register).  PS: t# (texture coordinate input). */
+    if (is_vs)
+      snprintf(out, out_sz, "a%u", r->number);
+    else
+      snprintf(out, out_sz, "in.t%u", r->number);
     break;
   case DX9MT_SM_REG_RASTOUT:
     if (r->number == 0) snprintf(out, out_sz, "out.position");
@@ -60,7 +64,11 @@ static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
     snprintf(out, out_sz, "out.oD%u", r->number);
     break;
   case DX9MT_SM_REG_OUTPUT:
-    snprintf(out, out_sz, "out.o%u", r->number);
+    /* VS SM<3.0: oT# (texcoord output).  VS SM>=3.0: o# (generic output). */
+    if (is_vs && major_ver < 3)
+      snprintf(out, out_sz, "out.oT%u", r->number);
+    else
+      snprintf(out, out_sz, "out.o%u", r->number);
     break;
   case DX9MT_SM_REG_COLOROUT:
     snprintf(out, out_sz, "oC%u", r->number);
@@ -135,10 +143,10 @@ static int mask_count(uint8_t mask) {
 /* ------------------------------------------------------------------ */
 
 static void src_expr(char *out, size_t out_sz, const dx9mt_sm_register *r,
-                     int is_vs) {
+                     int is_vs, int major_ver) {
   char base[80];
   char swiz[8];
-  reg_name(base, sizeof(base), r, is_vs);
+  reg_name(base, sizeof(base), r, is_vs, major_ver);
   swizzle_str(swiz, r->swizzle);
 
   switch (r->src_modifier) {
@@ -181,10 +189,11 @@ static void src_expr(char *out, size_t out_sz, const dx9mt_sm_register *r,
 /* ------------------------------------------------------------------ */
 
 static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
-                             int is_vs) {
+                             int is_vs, int major_ver) {
   char dst[80], wm[8];
   char s0[128], s1[128], s2[128];
   char rhs[512];
+  int rhs_is_scalar = 0;
 
   int has_dst = 1;
   switch (inst->opcode) {
@@ -206,13 +215,13 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
   }
 
   if (has_dst) {
-    reg_name(dst, sizeof(dst), &inst->dst, is_vs);
+    reg_name(dst, sizeof(dst), &inst->dst, is_vs, major_ver);
     wmask_str(wm, inst->dst.write_mask);
   }
 
   for (int i = 0; i < inst->num_sources && i < 3; ++i) {
     char *tgt = (i == 0) ? s0 : (i == 1) ? s1 : s2;
-    src_expr(tgt, 128, &inst->src[i], is_vs);
+    src_expr(tgt, 128, &inst->src[i], is_vs, major_ver);
   }
 
   int do_sat = (has_dst && (inst->dst.result_modifier & DX9MT_SM_RMOD_SATURATE));
@@ -242,19 +251,23 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     break;
 
   case DX9MT_SM_OP_DP3:
-    snprintf(rhs, sizeof(rhs), "float4(dot(%s.xyz, %s.xyz))", s0, s1);
+    snprintf(rhs, sizeof(rhs), "dot(%s.xyz, %s.xyz)", s0, s1);
+    rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_DP4:
-    snprintf(rhs, sizeof(rhs), "float4(dot(%s, %s))", s0, s1);
+    snprintf(rhs, sizeof(rhs), "dot(%s, %s)", s0, s1);
+    rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_RCP:
-    snprintf(rhs, sizeof(rhs), "float4(1.0 / %s.x)", s0);
+    snprintf(rhs, sizeof(rhs), "(1.0 / %s.x)", s0);
+    rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_RSQ:
-    snprintf(rhs, sizeof(rhs), "float4(rsqrt(abs(%s.x)))", s0);
+    snprintf(rhs, sizeof(rhs), "rsqrt(abs(%s.x))", s0);
+    rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_MIN:
@@ -266,19 +279,21 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     break;
 
   case DX9MT_SM_OP_SLT:
-    snprintf(rhs, sizeof(rhs), "float4(%s < %s)", s0, s1);
+    snprintf(rhs, sizeof(rhs), "select(float4(0.0), float4(1.0), (%s < %s))", s0, s1);
     break;
 
   case DX9MT_SM_OP_SGE:
-    snprintf(rhs, sizeof(rhs), "float4(%s >= %s)", s0, s1);
+    snprintf(rhs, sizeof(rhs), "select(float4(0.0), float4(1.0), (%s >= %s))", s0, s1);
     break;
 
   case DX9MT_SM_OP_EXP:
-    snprintf(rhs, sizeof(rhs), "float4(exp2(%s.x))", s0);
+    snprintf(rhs, sizeof(rhs), "exp2(%s.x)", s0);
+    rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_LOG:
-    snprintf(rhs, sizeof(rhs), "float4(log2(abs(%s.x)))", s0);
+    snprintf(rhs, sizeof(rhs), "log2(abs(%s.x))", s0);
+    rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_FRC:
@@ -308,7 +323,8 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     break;
 
   case DX9MT_SM_OP_POW:
-    snprintf(rhs, sizeof(rhs), "float4(pow(abs(%s.x), %s.x))", s0, s1);
+    snprintf(rhs, sizeof(rhs), "pow(abs(%s.x), %s.x)", s0, s1);
+    rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_CRS:
@@ -346,7 +362,8 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
 
   case DX9MT_SM_OP_DP2ADD:
     snprintf(rhs, sizeof(rhs),
-             "float4(dot(%s.xy, %s.xy) + %s.x)", s0, s1, s2);
+             "(dot(%s.xy, %s.xy) + %s.x)", s0, s1, s2);
+    rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_MOVA:
@@ -357,7 +374,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
   case DX9MT_SM_OP_M4x4: {
     /* m4x4 dst, src0, src1: dst.x = dp4(src0, c[src1+0]) ... */
     char base_c[80];
-    reg_name(base_c, sizeof(base_c), &inst->src[1], is_vs);
+    reg_name(base_c, sizeof(base_c), &inst->src[1], is_vs, major_ver);
     /* src1 is a const register, we need c[n], c[n+1], c[n+2], c[n+3] */
     uint16_t cn = inst->src[1].number;
     emit(ctx, "  { // m4x4\n");
@@ -437,7 +454,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     /* texld dst, coord, sampler */
     uint16_t samp_num = inst->src[1].number;
     char coord_expr[128];
-    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], is_vs);
+    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], is_vs, major_ver);
     snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s.xy)",
              samp_num, samp_num, coord_expr);
     break;
@@ -447,7 +464,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     /* texldl dst, coord, sampler: coord.w = LOD */
     uint16_t samp_num = inst->src[1].number;
     char coord_expr[128];
-    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], is_vs);
+    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], is_vs, major_ver);
     snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s.xy, level(%s.w))",
              samp_num, samp_num, coord_expr, coord_expr);
     break;
@@ -488,11 +505,75 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     return;
   }
 
+  /* Broadcast scalar RHS to match destination width when needed.
+   * Single-component write mask: scalar is fine.
+   * Multi-component: need floatN() wrapper so types match. */
+  char final_rhs[560];
+  if (rhs_is_scalar && has_dst) {
+    int mc = mask_count(inst->dst.write_mask);
+    if (mc == 1)
+      snprintf(final_rhs, sizeof(final_rhs), "%s", rhs);
+    else if (mc == 2)
+      snprintf(final_rhs, sizeof(final_rhs), "float2(%s)", rhs);
+    else if (mc == 3)
+      snprintf(final_rhs, sizeof(final_rhs), "float3(%s)", rhs);
+    else
+      snprintf(final_rhs, sizeof(final_rhs), "float4(%s)", rhs);
+  } else {
+    snprintf(final_rhs, sizeof(final_rhs), "%s", rhs);
+  }
+
+  /* Truncate vector RHS to match write-mask width when needed.
+   * E.g. dst.xy = float4_val → dst.xy = (float4_val).xy
+   * Scalar RHS (from replicate swizzle) broadcasts naturally in MSL. */
+  if (!rhs_is_scalar && has_dst && inst->dst.write_mask != 0xF) {
+    int mc = mask_count(inst->dst.write_mask);
+    int rhs_width = 4;
+    if (inst->num_sources == 1) {
+      const uint8_t *sw = inst->src[0].swizzle;
+      if (sw[0] == sw[1] && sw[1] == sw[2] && sw[2] == sw[3])
+        rhs_width = 1;
+    } else if (inst->num_sources >= 2) {
+      int all_scalar = 1;
+      for (int i = 0; i < inst->num_sources && i < 3; ++i) {
+        const uint8_t *sw = inst->src[i].swizzle;
+        if (!(sw[0] == sw[1] && sw[1] == sw[2] && sw[2] == sw[3])) {
+          all_scalar = 0;
+          break;
+        }
+      }
+      if (all_scalar) rhs_width = 1;
+    }
+    if (mc < rhs_width) {
+      static const char *trunc_swiz[] = {"", ".x", ".xy", ".xyz", ""};
+      char tmp[600];
+      snprintf(tmp, sizeof(tmp), "(%s)%s", final_rhs, trunc_swiz[mc]);
+      snprintf(final_rhs, sizeof(final_rhs), "%s", tmp);
+    }
+  }
+
   /* Standard assignment with optional saturation */
   if (do_sat)
-    emit(ctx, "  %s%s = saturate(%s);\n", dst, wm, rhs);
+    emit(ctx, "  %s%s = saturate(%s);\n", dst, wm, final_rhs);
   else
-    emit(ctx, "  %s%s = %s;\n", dst, wm, rhs);
+    emit(ctx, "  %s%s = %s;\n", dst, wm, final_rhs);
+}
+
+/* ------------------------------------------------------------------ */
+/* Semantic-to-attribute-index mapping (must match create_translated_pso) */
+/* ------------------------------------------------------------------ */
+
+static int usage_to_attr_idx(uint8_t usage, uint8_t usage_index) {
+  if ((usage == DX9MT_SM_USAGE_POSITION || usage == DX9MT_SM_USAGE_POSITIONT)
+      && usage_index == 0) return 0;
+  if (usage == DX9MT_SM_USAGE_COLOR && usage_index == 0) return 1;
+  if (usage == DX9MT_SM_USAGE_TEXCOORD && usage_index == 0) return 2;
+  if (usage == DX9MT_SM_USAGE_NORMAL && usage_index == 0) return 3;
+  if (usage == DX9MT_SM_USAGE_TEXCOORD && usage_index == 1) return 4;
+  if (usage == DX9MT_SM_USAGE_COLOR && usage_index == 1) return 5;
+  if (usage == DX9MT_SM_USAGE_BLENDWEIGHT && usage_index == 0) return 6;
+  if (usage == DX9MT_SM_USAGE_BLENDINDICES && usage_index == 0) return 7;
+  return -1; /* unmapped */
 }
 
 /* ------------------------------------------------------------------ */
@@ -528,20 +609,24 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   emit(&ctx, "#include <metal_stdlib>\n");
   emit(&ctx, "using namespace metal;\n\n");
 
-  /* Input struct from vertex attributes */
+  /* Input struct from vertex attributes.
+   * Variable name = v{reg_number} (matches shader instructions).
+   * Attribute index = usage_to_attr_idx (matches PSO vertex descriptor). */
   emit(&ctx, "struct VS_In_%08x {\n", bytecode_hash);
   for (uint32_t i = 0; i < prog->dcl_count; ++i) {
     const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
     if (d->reg_type != DX9MT_SM_REG_INPUT) continue;
 
+    int attr_idx = usage_to_attr_idx(d->usage, d->usage_index);
+    if (attr_idx < 0) continue; /* skip unmapped semantics */
+
     const char *type = "float4";
-    /* Determine type from write mask */
     int mc = mask_count(d->write_mask);
     if (mc == 1) type = "float";
     else if (mc == 2) type = "float2";
     else if (mc == 3) type = "float3";
 
-    emit(&ctx, "  %s v%u [[attribute(%u)]];\n", type, d->reg_number, d->reg_number);
+    emit(&ctx, "  %s v%u [[attribute(%u)]];\n", type, d->reg_number, attr_idx);
   }
   emit(&ctx, "};\n\n");
 
@@ -549,7 +634,7 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   emit(&ctx, "struct VS_Out_%08x {\n", bytecode_hash);
   emit(&ctx, "  float4 position [[position]];\n");
 
-  /* VS 3.0: output registers from dcl */
+  /* VS 3.0: output registers from dcl with [[user(...)]] for rasterizer matching */
   if (prog->major_version >= 3) {
     for (uint32_t i = 0; i < prog->dcl_count; ++i) {
       const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
@@ -563,27 +648,25 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
       else if (mc == 2) type = "float2";
       else if (mc == 3) type = "float3";
 
-      emit(&ctx, "  %s o%u;\n", type, d->reg_number);
+      const char *uname = "attr";
+      if (d->usage == DX9MT_SM_USAGE_TEXCOORD) uname = "texcoord";
+      else if (d->usage == DX9MT_SM_USAGE_COLOR) uname = "color";
+      else if (d->usage == DX9MT_SM_USAGE_NORMAL) uname = "normal";
+      else if (d->usage == DX9MT_SM_USAGE_FOG) uname = "fog";
+
+      emit(&ctx, "  %s o%u [[user(%s%u)]];\n", type, d->reg_number,
+           uname, d->usage_index);
     }
   } else {
-    /* VS 2.0: oD# and oT# outputs */
+    /* VS 1.x/2.x: oD# (color) and oT# (texcoord) outputs */
     for (int i = 0; i < 2; ++i) {
       if (prog->color_output_mask & (1u << i))
-        emit(&ctx, "  float4 oD%d;\n", i);
+        emit(&ctx, "  float4 oD%d [[user(color%d)]];\n", i, i);
     }
-    /* Check which oT# are written by scanning instructions */
-    for (uint32_t i = 0; i < prog->instruction_count; ++i) {
-      const dx9mt_sm_instruction *inst = &prog->instructions[i];
-      if (inst->dst.type == DX9MT_SM_REG_OUTPUT ||
-          inst->dst.type == DX9MT_SM_REG_ADDR) {
-        /* In VS 2.0, texture coord outputs use reg type 3 (ADDR/TEXCRD) with
-         * output bit set. Actually they use oT# which is... */
-      }
-    }
-    /* Emit oT# for texcoord registers written to -- use output_mask */
+    /* oT# from output_mask (type 6 = TEXCRDOUT in SM < 3.0) */
     for (int i = 0; i < 8; ++i) {
-      if (prog->texcoord_output_mask & (1u << i))
-        emit(&ctx, "  float4 oT%d;\n", i);
+      if (prog->output_mask & (1u << i))
+        emit(&ctx, "  float4 oT%d [[user(texcoord%d)]];\n", i, i);
     }
   }
 
@@ -624,7 +707,7 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
 
   /* Emit instructions */
   for (uint32_t i = 0; i < prog->instruction_count; ++i) {
-    emit_instruction(&ctx, &prog->instructions[i], 1);
+    emit_instruction(&ctx, &prog->instructions[i], 1, prog->major_version);
   }
 
   emit(&ctx, "\n  return out;\n");
@@ -675,6 +758,8 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   /* Input struct (interpolants from VS) */
   emit(&ctx, "struct PS_In_%08x {\n", bytecode_hash);
   emit(&ctx, "  float4 position [[position]];\n");
+
+  /* PS 3.0: v# inputs with dcl semantics */
   for (uint32_t i = 0; i < prog->dcl_count; ++i) {
     const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
     if (d->reg_type != DX9MT_SM_REG_INPUT) continue;
@@ -685,8 +770,24 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
     else if (mc == 2) type = "float2";
     else if (mc == 3) type = "float3";
 
-    emit(&ctx, "  %s v%u;\n", type, d->reg_number);
+    const char *uname = "attr";
+    if (d->usage == DX9MT_SM_USAGE_TEXCOORD) uname = "texcoord";
+    else if (d->usage == DX9MT_SM_USAGE_COLOR) uname = "color";
+    else if (d->usage == DX9MT_SM_USAGE_NORMAL) uname = "normal";
+    else if (d->usage == DX9MT_SM_USAGE_FOG) uname = "fog";
+
+    emit(&ctx, "  %s v%u [[user(%s%u)]];\n", type, d->reg_number,
+         uname, d->usage_index);
   }
+
+  /* PS 1.x/2.x: t# texture coordinate inputs (register type ADDR/TEXTURE = 3) */
+  for (uint32_t i = 0; i < prog->dcl_count; ++i) {
+    const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
+    if (d->reg_type != DX9MT_SM_REG_ADDR) continue;
+    emit(&ctx, "  float4 t%u [[user(texcoord%u)]];\n",
+         d->reg_number, d->reg_number);
+  }
+
   /* vPos if used */
   for (uint32_t i = 0; i < prog->dcl_count; ++i) {
     if (prog->dcls[i].reg_type == DX9MT_SM_REG_MISCTYPE &&
@@ -745,7 +846,7 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
 
   /* Emit instructions */
   for (uint32_t i = 0; i < prog->instruction_count; ++i) {
-    emit_instruction(&ctx, &prog->instructions[i], 0);
+    emit_instruction(&ctx, &prog->instructions[i], 0, prog->major_version);
   }
 
   emit(&ctx, "\n  return oC0;\n");

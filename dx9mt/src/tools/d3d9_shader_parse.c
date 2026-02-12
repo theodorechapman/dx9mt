@@ -215,8 +215,8 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
       break;
     }
 
-    /* Comment block: skip */
-    if ((instr_token & 0xFFFF0000u) == 0xFFFE0000u) {
+    /* Comment block: lower 16 bits = 0xFFFE, upper 15 bits = length in DWORDs */
+    if ((instr_token & 0xFFFFu) == 0xFFFEu) {
       uint32_t comment_len = (instr_token >> 16) & 0x7FFFu;
       pos += 1 + comment_len;
       continue;
