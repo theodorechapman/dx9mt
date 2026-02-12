@@ -143,6 +143,12 @@ typedef struct dx9mt_backend_draw_command {
   dx9mt_upload_ref vertex_decl_data;
   uint16_t vertex_decl_count;
   uint16_t _pad1;
+
+  /* RB3 Phase 3: shader bytecode */
+  dx9mt_upload_ref vs_bytecode;
+  uint32_t vs_bytecode_dwords;
+  dx9mt_upload_ref ps_bytecode;
+  uint32_t ps_bytecode_dwords;
 } dx9mt_backend_draw_command;
 
 #define DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME 8192u
@@ -681,6 +687,10 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
   command->index_format = draw_packet->index_format;
   command->vertex_decl_data = draw_packet->vertex_decl_data;
   command->vertex_decl_count = draw_packet->vertex_decl_count;
+  command->vs_bytecode = draw_packet->vs_bytecode;
+  command->vs_bytecode_dwords = draw_packet->vs_bytecode_dwords;
+  command->ps_bytecode = draw_packet->ps_bytecode;
+  command->ps_bytecode_dwords = draw_packet->ps_bytecode_dwords;
 }
 
 int dx9mt_backend_bridge_init(const dx9mt_backend_init_desc *desc) {
@@ -1190,6 +1200,29 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
         memcpy(ipc_base + bulk_offset + bulk_used, data,
                cmd->texture0_data.size);
         bulk_used += (cmd->texture0_data.size + 15u) & ~15u;
+      }
+
+      /* Copy VS/PS shader bytecode for translation. */
+      d->vertex_shader_id = cmd->vertex_shader_id;
+      data = dx9mt_frontend_upload_resolve(&cmd->vs_bytecode);
+      if (data && cmd->vs_bytecode.size > 0 &&
+          bulk_offset + bulk_used + cmd->vs_bytecode.size <=
+              DX9MT_METAL_IPC_SIZE) {
+        d->vs_bytecode_bulk_offset = bulk_used;
+        d->vs_bytecode_bulk_size = cmd->vs_bytecode.size;
+        memcpy(ipc_base + bulk_offset + bulk_used, data,
+               cmd->vs_bytecode.size);
+        bulk_used += (cmd->vs_bytecode.size + 15u) & ~15u;
+      }
+      data = dx9mt_frontend_upload_resolve(&cmd->ps_bytecode);
+      if (data && cmd->ps_bytecode.size > 0 &&
+          bulk_offset + bulk_used + cmd->ps_bytecode.size <=
+              DX9MT_METAL_IPC_SIZE) {
+        d->ps_bytecode_bulk_offset = bulk_used;
+        d->ps_bytecode_bulk_size = cmd->ps_bytecode.size;
+        memcpy(ipc_base + bulk_offset + bulk_used, data,
+               cmd->ps_bytecode.size);
+        bulk_used += (cmd->ps_bytecode.size + 15u) & ~15u;
       }
     }
 

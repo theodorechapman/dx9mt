@@ -32,8 +32,8 @@ The PE DLL accesses Unix paths via the Z: drive. `CreateFileA("Z:\\tmp\\foo")` m
 ### BEGIN_FRAME is now in the packet stream
 Originally `BeginScene` called `begin_frame()` as a direct side-channel. Now it emits a `BEGIN_FRAME` packet through `submit_packets`, making the stream self-describing. The backend parser dispatches `BEGIN_FRAME` packets to the same `begin_frame()` logic.
 
-### Draw packet carries full geometry data
-`dx9mt_packet_draw_indexed` includes upload refs for VB data, IB data, vertex declaration, VS constants, PS constants, and texture data. The frontend copies all this into the upload arena on every `DrawIndexedPrimitive`. The IPC writer then copies from the arena into the shared memory bulk region.
+### Draw packet carries full geometry data + shader bytecode
+`dx9mt_packet_draw_indexed` includes upload refs for VB data, IB data, vertex declaration, VS constants, PS constants, texture data, and VS/PS shader bytecode. The frontend copies all this into the upload arena on every `DrawIndexedPrimitive`. The IPC writer then copies from the arena into the shared memory bulk region. Shader bytecode is small (1-10KB per shader) and many draws reuse the same shader, so the same bytecode is uploaded redundantly per-draw but the viewer deduplicates by hash.
 
 ### Upload arena overflow returns zero-ref, not corrupt data
 When a slot runs out of space, `dx9mt_frontend_upload_copy` returns a zero-ref instead of wrapping to offset 0. The backend rejects draws with zero-size constant refs. This prevents silent shader constant corruption.
@@ -63,16 +63,43 @@ D3D9 DXT1/DXT3/DXT5 formats map directly to Metal's BC1_RGBA/BC2_RGBA/BC3_RGBA. 
 ### Render-target texture routing
 Draws can target offscreen render targets (not just the swapchain). The viewer tracks per-draw `render_target_id` and creates separate `MTLTexture` objects for each RT. When a later draw samples a texture whose `texture_id` matches a previous RT's `render_target_texture_id`, the viewer substitutes the RT's Metal texture. This enables render-to-texture effects (e.g., UI compositing).
 
+## Shader Translation (RB3 Phase 3)
+
+### D3D9 SM2.0/SM3.0 bytecode format
+The bytecode is a stream of 32-bit DWORD tokens. Token 0 is the version (`0xFFFE03xx` for VS 3.x, `0xFFFF03xx` for PS 3.x). Each instruction is an opcode token followed by destination and source register tokens. The stream ends with `0x0000FFFF`. Register tokens encode type (5 bits split across bits [30:28] and [12:11]), number (bits [10:0]), and for sources: swizzle (bits [23:16], 2 bits per component) and modifier (bits [27:24]). For destinations: write mask (bits [19:16]) and result modifier (bits [23:20]).
+
+### Transpiler architecture: parse → IR → MSL source → compile → cache
+The bytecode is parsed into a flat IR (`dx9mt_sm_program` with instruction/dcl/def arrays), then emitted as MSL source text, compiled with `[MTLDevice newLibraryWithSource:]`, and the resulting `MTLFunction` cached by bytecode hash. Compilation happens once per unique shader; subsequent draws just look up the cache. Failures are sticky (cached as NSNull) to avoid retrying every frame.
+
+### VS/PS interface uses a "fat" interpolant struct
+The emitted VS output struct and PS input struct must have matching field names and types. Rather than dynamically matching VS output semantics to PS input semantics (complex), the emitter generates per-shader structs based on dcl declarations. The VS writes its declared outputs; the PS reads its declared inputs. As long as the same VS/PS pair is used together, the structs match.
+
+### Register mapping is straightforward for SM3.0
+- `r#` → `float4 r#` (local variable, initialized to 0)
+- `v#` → `in.v#` (from `[[stage_in]]` struct)
+- `c#` → `c[#]` (constant buffer at buffer index 1 for VS, 0 for PS)
+- `s#` + `texld` → `tex#.sample(samp#, coord.xy)` (texture + sampler pair)
+- `oPos` (rastout 0) → `out.position` with `[[position]]`
+- `oC0` → return value of fragment function
+
+### D3D9 swizzle maps directly to MSL component access
+D3D9 swizzle encodes 4 component indices (0=x, 1=y, 2=z, 3=w). Identity swizzle `.xyzw` is omitted. Replicate swizzle `.xxxx` emits `.x`. The emitter handles all modifiers: negate `(-expr)`, abs `abs(expr)`, complement `(1.0 - expr)`, x2 `(expr * 2.0)`, bias `(expr - 0.5)`.
+
+### POSITIONT draws skip translation entirely
+Pre-transformed vertices (D3DFVF_XYZRHW / `dcl_positiont`) are already in screen space. The existing hardcoded `geo_vertex` shader with a synthetic screen-to-NDC matrix handles these correctly. When the vertex declaration has POSITIONT, the viewer uses the fallback path and only the PS could potentially be translated (currently skipped -- both VS and PS are needed for the translated path).
+
 ## Fragment Shader Strategy
 
-### Three-tier fragment shader fallback
-The Metal viewer uses a tiered approach for fragment shading:
+### Four-tier fragment shader approach (with translation)
+The Metal viewer now has four tiers for fragment shading, tried in order:
 
-1. **TSS fixed-function combiner** (`use_stage0_combiner=1`, when `pixel_shader_id==0`): Full D3D9 texture stage state evaluation. Supports all D3DTOP operations (MODULATE, SELECTARG, ADD, BLEND*, etc.) with configurable arg sources (TEXTURE, CURRENT, DIFFUSE, TFACTOR).
+1. **Translated shader** (when bytecode is available and compiles): Full D3D9 shader translated to MSL. Reads from constant buffer, samples textures, executes all arithmetic. Uses the full VS/PS constant arrays at buffer indices 1 and 0 respectively.
 
-2. **PS constant c0 tint** (`has_pixel_shader=1`): When a D3D9 pixel shader is active but can't be translated, the viewer reads PS constant register c0 and multiplies it by the texture sample. This approximation works for FNV's menu shaders (which are essentially `output = texture * c0`).
+2. **TSS fixed-function combiner** (`use_stage0_combiner=1`, when `pixel_shader_id==0`): Full D3D9 texture stage state evaluation. Supports all D3DTOP operations (MODULATE, SELECTARG, ADD, BLEND*, etc.) with configurable arg sources (TEXTURE, CURRENT, DIFFUSE, TFACTOR).
 
-3. **Raw passthrough** (no PS, no TSS): `output = diffuse * texture` (textured) or `output = diffuse` (non-textured).
+3. **PS constant c0 tint** (`has_pixel_shader=1`, translation failed): When a D3D9 pixel shader is active but translation failed, the viewer reads PS constant register c0 and multiplies it by the texture sample. This approximation works for FNV's menu shaders.
+
+4. **Raw passthrough** (no PS, no TSS): `output = diffuse * texture` (textured) or `output = diffuse` (non-textured).
 
 ### D3D9 TSS state is irrelevant when a pixel shader is active
 When a pixel shader is bound, D3D9 completely ignores texture stage state. Games may set TSS to anything (including DISABLE) while a pixel shader handles all texturing. The viewer mirrors this: `use_stage0_combiner` is only set when `pixel_shader_id == 0`.

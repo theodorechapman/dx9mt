@@ -5087,6 +5087,24 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
   packet.constants_ps = dx9mt_frontend_upload_copy(
       self->frame_id, &self->ps_const_f[0][0], DX9MT_DRAW_SHADER_CONSTANT_BYTES);
 
+  /* RB3 Phase 3: shader bytecode for translation */
+  {
+    dx9mt_vertex_shader *vs = self->vertex_shader
+        ? dx9mt_vshader_from_iface(self->vertex_shader) : NULL;
+    dx9mt_pixel_shader *ps = self->pixel_shader
+        ? dx9mt_pshader_from_iface(self->pixel_shader) : NULL;
+    if (vs && vs->byte_code && vs->dword_count > 0) {
+      packet.vs_bytecode = dx9mt_frontend_upload_copy(
+          self->frame_id, vs->byte_code, vs->dword_count * sizeof(DWORD));
+      packet.vs_bytecode_dwords = vs->dword_count;
+    }
+    if (ps && ps->byte_code && ps->dword_count > 0) {
+      packet.ps_bytecode = dx9mt_frontend_upload_copy(
+          self->frame_id, ps->byte_code, ps->dword_count * sizeof(DWORD));
+      packet.ps_bytecode_dwords = ps->dword_count;
+    }
+  }
+
   /* RB3: actual viewport/scissor values */
   packet.viewport_x = self->viewport.X;
   packet.viewport_y = self->viewport.Y;

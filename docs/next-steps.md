@@ -2,58 +2,33 @@
 
 ## Where We Are
 
-RB3 Phase 2 complete. The Metal viewer renders FNV's main menu with correct colors: textured backgrounds (DXT1/DXT5), yellow menu text (PS c0 tint), alpha-blended UI elements, and render-target routing. The remaining gap for visual correctness is proper D3D9 shader translation.
+RB3 Phase 3 complete. The Metal viewer now has a full D3D9 SM2.0/SM3.0 bytecode-to-MSL transpiler. Shader bytecode is transmitted from the frontend through IPC, parsed into an intermediate representation, emitted as MSL source, compiled with Metal, and cached. Draws with translated shaders use the full constant arrays instead of the hardcoded WVP/c0 approximations. The existing TSS combiner and c0 tint fallback paths remain as automatic fallback when translation fails.
 
-## Immediate Next: RB3 Phase 3 -- D3D9 Shader Translation
+## Immediate Next: Shader Translation Hardening
 
-### The problem
+### The situation
 
-The viewer currently uses two approximations:
-1. **Vertex shader**: Hardcoded "multiply position by WVP from c0-c3". Works for FNV's menu but breaks for shaders with different constant layouts, skinning, lighting, or texcoord generation.
-2. **Pixel shader**: Falls back to `texture * c0` when a pixel shader is active. Works for FNV's menu tint but can't handle multi-texture blending, per-pixel lighting, or complex combiners.
+The transpiler is structurally complete but untested against real FNV bytecode. The first run will likely surface MSL compilation errors from:
+- VS/PS interface mismatches (output struct fields must match input struct fields)
+- Missing attribute mappings (vertex elements the shader expects but the PSO doesn't declare)
+- Edge cases in register usage or instruction patterns FNV shaders actually use
 
-### Approach: D3D9 SM2.0/SM3.0 bytecode → MSL transpiler
+### Steps
 
-Parse the D3D9 shader bytecode (DXBC format) and emit equivalent Metal Shading Language source. Key observations:
+1. **Run FNV** and examine stderr for shader compilation errors
+2. **Fix MSL compilation issues** one by one -- the error messages include the full MSL source and parsed IR for diagnosis
+3. **A/B comparison** with `DX9MT_SHADER_TRANSLATE=0` to verify translated output matches the existing fallback
+4. **Flow control** -- if FNV's gameplay shaders use `if`/`else`/`endif` or `rep`/`endrep`, implement proper MSL emission (currently emitted as comments)
+5. **Relative addressing** -- `a0` register for dynamic constant array indexing (`c[a0.x + N]`)
 
-- FNV uses a small set of shaders (~20-50 unique VS/PS combinations)
-- SM3.0 has ~70 instruction types but FNV likely uses <20
-- Shader constants are already transmitted (VS/PS float constants in IPC bulk data)
-- The transpiler runs once per unique shader, then the compiled MSL is cached
-
-### Implementation sketch
-
-1. **Bytecode parser**: Read version token, instruction stream, dcl registers, def constants
-2. **Register allocator**: Map D3D9 registers (r0-r31, v0-v15, t0-t7, c0-c255, s0-s15) to MSL variables
-3. **Instruction emitter**: Translate each D3D9 opcode to MSL:
-   - Arithmetic: `add`, `mul`, `mad`, `dp3`, `dp4`, `rsq`, `rcp`, `min`, `max`, `mov`
-   - Texture: `texld` (tex2D), `texldl`, `texldd`
-   - Flow: `if_*`, `else`, `endif`, `rep`, `endrep`
-   - Comparison: `slt`, `sge`, `cmp`
-4. **VS output**: Emit MSL vertex function reading from vertex attributes and constant buffer
-5. **PS output**: Emit MSL fragment function reading from interpolants, textures, and constant buffer
-6. **PSO integration**: Compile MSL source with `newLibraryWithSource:`, create PSO, cache by shader bytecode hash
-
-### What to transmit
-
-The frontend already has the shader bytecode (stored at `CreateVertexShader`/`CreatePixelShader` time). Need to:
-- Add shader bytecode upload ref to the draw packet (or a separate shader registry packet)
-- Include bytecode size so the viewer knows the full program
-- Hash the bytecode for PSO cache lookup
-
-### Priority instructions for FNV menu + early gameplay
-
-VS: `dcl_position`, `dcl_texcoord`, `dcl_color`, `dp4` (WVP transform), `mov`, `add`, `mul`, `mad`
-PS: `dcl_2d`, `texld`, `mov`, `mul`, `add`, `mad`, `cmp`, `lrp`
-
-## After Shader Translation: RB4 -- Depth/Stencil
+## After Hardening: RB4 -- Depth/Stencil + Pass Structure
 
 ### Depth state
 
 Need actual render state values for:
 - `D3DRS_ZENABLE`, `D3DRS_ZWRITEENABLE`, `D3DRS_ZFUNC`
 
-Maps to `MTLDepthStencilDescriptor` → `MTLDepthStencilState`. Also needs a depth texture attachment on the render pass. Without this, z-fighting and draw-order artifacts will appear in gameplay.
+Maps to `MTLDepthStencilDescriptor` -> `MTLDepthStencilState`. Also needs a depth texture attachment on the render pass. Without this, z-fighting and draw-order artifacts will appear in gameplay.
 
 ### Stencil state
 
@@ -71,14 +46,14 @@ Replace IPC with in-process `__wine_unix_call` for zero-copy data sharing and sy
 
 ### In-game rendering
 FNV gameplay uses much more diverse rendering: skinned meshes, landscape, multiple render targets, shadow passes. Requires all of the above plus:
-- Multi-texture stages (stages 1-7)
+- Multi-texture stages (stages 1-7) in translated shaders
 - Fog state
 - Cull mode / fill mode render states
 - More vertex declaration formats
 
 ## Priority Order
 
-1. **D3D9 shader translation** -- correctness for all geometry, eliminates c0 tint hack
+1. **Shader translation hardening** -- fix MSL compilation issues with real FNV bytecode
 2. **Depth/stencil state** -- prevents z-fighting and draw ordering issues in gameplay
 3. **Wine unix lib integration** -- performance, zero-copy, proper architecture
 4. **In-game render state coverage** -- fog, cull, multi-texture, etc.

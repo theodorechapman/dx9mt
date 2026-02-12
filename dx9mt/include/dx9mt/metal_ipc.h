@@ -103,6 +103,13 @@ typedef struct dx9mt_metal_ipc_draw {
   uint32_t vs_constants_size;
   uint32_t ps_constants_bulk_offset;
   uint32_t ps_constants_size;
+
+  /* RB3 Phase 3: shader bytecode for translation */
+  uint32_t vertex_shader_id;
+  uint32_t vs_bytecode_bulk_offset;
+  uint32_t vs_bytecode_bulk_size;
+  uint32_t ps_bytecode_bulk_offset;
+  uint32_t ps_bytecode_bulk_size;
 } dx9mt_metal_ipc_draw;
 
 typedef struct dx9mt_metal_ipc_header {

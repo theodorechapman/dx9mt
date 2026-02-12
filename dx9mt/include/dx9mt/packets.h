@@ -119,6 +119,12 @@ typedef struct dx9mt_packet_draw_indexed {
   dx9mt_upload_ref vertex_decl_data;
   uint16_t vertex_decl_count;
   uint16_t _pad1;
+
+  /* RB3 Phase 3: shader bytecode for translation */
+  dx9mt_upload_ref vs_bytecode;
+  uint32_t vs_bytecode_dwords;
+  dx9mt_upload_ref ps_bytecode;
+  uint32_t ps_bytecode_dwords;
 } dx9mt_packet_draw_indexed;
 
 typedef struct dx9mt_packet_present {

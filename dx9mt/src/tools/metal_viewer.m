@@ -15,6 +15,8 @@
 #include <unistd.h>
 
 #include "dx9mt/metal_ipc.h"
+#include "d3d9_shader_parse.h"
+#include "d3d9_shader_emit_msl.h"
 
 /* D3D9 constants we need to interpret vertex declarations and draw params */
 enum {
@@ -186,6 +188,12 @@ static CAMetalLayer *s_metal_layer;
 static NSWindow *s_window;
 static uint32_t s_width = 1280;
 static uint32_t s_height = 720;
+
+/* RB3 Phase 3: shader translation caches */
+static NSMutableDictionary *s_vs_func_cache;  /* bytecode_hash -> id<MTLFunction> or NSNull */
+static NSMutableDictionary *s_ps_func_cache;
+static NSMutableDictionary *s_translated_pso_cache;  /* combined_key -> id<MTLRenderPipelineState> */
+static int s_shader_translate_enabled = -1;  /* -1 = uninitialized */
 
 static NSString *const s_shader_source =
     @"#include <metal_stdlib>\n"
@@ -1209,6 +1217,9 @@ static int init_metal(void) {
   s_render_target_cache = [[NSMutableDictionary alloc] init];
   s_render_target_desc = [[NSMutableDictionary alloc] init];
   s_texture_rt_overrides = [[NSMutableDictionary alloc] init];
+  s_vs_func_cache = [[NSMutableDictionary alloc] init];
+  s_ps_func_cache = [[NSMutableDictionary alloc] init];
+  s_translated_pso_cache = [[NSMutableDictionary alloc] init];
 
   /* Overlay PSO (same as RB1) */
   {
@@ -1392,6 +1403,200 @@ static const char *d3d_blend_name(uint32_t b) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* RB3 Phase 3: Shader translation + compilation                       */
+/* ------------------------------------------------------------------ */
+
+static int shader_translate_enabled(void) {
+  if (s_shader_translate_enabled < 0) {
+    const char *env = getenv("DX9MT_SHADER_TRANSLATE");
+    s_shader_translate_enabled = (!env || strcmp(env, "0") != 0) ? 1 : 0;
+    if (!s_shader_translate_enabled)
+      fprintf(stderr, "dx9mt_metal_viewer: shader translation disabled by env\n");
+  }
+  return s_shader_translate_enabled;
+}
+
+static id<MTLFunction> translate_and_compile_vs(
+    const uint32_t *bytecode, uint32_t dword_count, uint32_t bc_hash) {
+  NSNumber *key = @(bc_hash);
+
+  /* Check cache */
+  id cached = [s_vs_func_cache objectForKey:key];
+  if (cached) return (cached == (id)[NSNull null]) ? nil : cached;
+
+  /* Parse */
+  dx9mt_sm_program prog;
+  if (dx9mt_sm_parse(bytecode, dword_count, &prog) != 0) {
+    fprintf(stderr, "dx9mt: VS 0x%08x parse failed: %s\n",
+            bc_hash, prog.error_msg);
+    [s_vs_func_cache setObject:[NSNull null] forKey:key];
+    return nil;
+  }
+
+  /* Emit MSL */
+  dx9mt_msl_emit_result msl;
+  if (dx9mt_msl_emit_vs(&prog, bc_hash, &msl) != 0) {
+    fprintf(stderr, "dx9mt: VS 0x%08x emit failed: %s\n",
+            bc_hash, msl.error_msg);
+    [s_vs_func_cache setObject:[NSNull null] forKey:key];
+    return nil;
+  }
+
+  /* Compile */
+  NSString *src = [NSString stringWithUTF8String:msl.source];
+  NSError *err = nil;
+  id<MTLLibrary> lib = [s_device newLibraryWithSource:src options:nil error:&err];
+  if (!lib) {
+    fprintf(stderr, "dx9mt: VS 0x%08x compile failed: %s\n",
+            bc_hash, [[err localizedDescription] UTF8String]);
+    fprintf(stderr, "--- VS MSL source ---\n%s\n--- end ---\n", msl.source);
+    dx9mt_sm_dump(&prog, stderr);
+    [s_vs_func_cache setObject:[NSNull null] forKey:key];
+    return nil;
+  }
+
+  NSString *entry = [NSString stringWithUTF8String:msl.entry_name];
+  id<MTLFunction> func = [lib newFunctionWithName:entry];
+  if (!func) {
+    fprintf(stderr, "dx9mt: VS 0x%08x entry '%s' not found\n",
+            bc_hash, msl.entry_name);
+    [s_vs_func_cache setObject:[NSNull null] forKey:key];
+    return nil;
+  }
+
+  fprintf(stderr, "dx9mt: VS 0x%08x compiled OK (%u instructions)\n",
+          bc_hash, prog.instruction_count);
+  [s_vs_func_cache setObject:func forKey:key];
+  return func;
+}
+
+static id<MTLFunction> translate_and_compile_ps(
+    const uint32_t *bytecode, uint32_t dword_count, uint32_t bc_hash) {
+  NSNumber *key = @(bc_hash);
+
+  id cached = [s_ps_func_cache objectForKey:key];
+  if (cached) return (cached == (id)[NSNull null]) ? nil : cached;
+
+  dx9mt_sm_program prog;
+  if (dx9mt_sm_parse(bytecode, dword_count, &prog) != 0) {
+    fprintf(stderr, "dx9mt: PS 0x%08x parse failed: %s\n",
+            bc_hash, prog.error_msg);
+    [s_ps_func_cache setObject:[NSNull null] forKey:key];
+    return nil;
+  }
+
+  dx9mt_msl_emit_result msl;
+  if (dx9mt_msl_emit_ps(&prog, bc_hash, &msl) != 0) {
+    fprintf(stderr, "dx9mt: PS 0x%08x emit failed: %s\n",
+            bc_hash, msl.error_msg);
+    [s_ps_func_cache setObject:[NSNull null] forKey:key];
+    return nil;
+  }
+
+  NSString *src = [NSString stringWithUTF8String:msl.source];
+  NSError *err = nil;
+  id<MTLLibrary> lib = [s_device newLibraryWithSource:src options:nil error:&err];
+  if (!lib) {
+    fprintf(stderr, "dx9mt: PS 0x%08x compile failed: %s\n",
+            bc_hash, [[err localizedDescription] UTF8String]);
+    fprintf(stderr, "--- PS MSL source ---\n%s\n--- end ---\n", msl.source);
+    dx9mt_sm_dump(&prog, stderr);
+    [s_ps_func_cache setObject:[NSNull null] forKey:key];
+    return nil;
+  }
+
+  NSString *entry = [NSString stringWithUTF8String:msl.entry_name];
+  id<MTLFunction> func = [lib newFunctionWithName:entry];
+  if (!func) {
+    fprintf(stderr, "dx9mt: PS 0x%08x entry '%s' not found\n",
+            bc_hash, msl.entry_name);
+    [s_ps_func_cache setObject:[NSNull null] forKey:key];
+    return nil;
+  }
+
+  fprintf(stderr, "dx9mt: PS 0x%08x compiled OK (%u instructions)\n",
+          bc_hash, prog.instruction_count);
+  [s_ps_func_cache setObject:func forKey:key];
+  return func;
+}
+
+static id<MTLRenderPipelineState> create_translated_pso(
+    id<MTLFunction> vs_func, id<MTLFunction> ps_func,
+    const dx9mt_d3d_vertex_element *elems, uint16_t elem_count,
+    uint32_t stride, int textured,
+    uint32_t blend_enable, uint32_t src_blend, uint32_t dst_blend,
+    uint64_t pso_key) {
+  NSNumber *key = @(pso_key);
+  id cached = [s_translated_pso_cache objectForKey:key];
+  if (cached) return (cached == (id)[NSNull null]) ? nil : cached;
+
+  MTLVertexDescriptor *vd = [[MTLVertexDescriptor alloc] init];
+  /* Map vertex elements using attribute index = register number based on usage */
+  for (uint16_t e = 0; e < elem_count; ++e) {
+    MTLVertexFormat fmt = decl_type_to_mtl(elems[e].type);
+    if (fmt == MTLVertexFormatInvalid) continue;
+    /* For translated shaders: attribute index matches v# register.
+     * POSITION -> v0, COLOR -> v1, TEXCOORD0 -> v2, etc.
+     * This must match the VS_In struct attribute indices. */
+    uint32_t attr_idx;
+    if (elems[e].usage == D3DDECLUSAGE_POSITION || elems[e].usage == D3DDECLUSAGE_POSITIONT) {
+      attr_idx = 0;
+    } else if (elems[e].usage == D3DDECLUSAGE_COLOR && elems[e].usage_index == 0) {
+      attr_idx = 1;
+    } else if (elems[e].usage == D3DDECLUSAGE_TEXCOORD && elems[e].usage_index == 0) {
+      attr_idx = 2;
+    } else if (elems[e].usage == D3DDECLUSAGE_NORMAL && elems[e].usage_index == 0) {
+      attr_idx = 3;
+    } else if (elems[e].usage == D3DDECLUSAGE_TEXCOORD && elems[e].usage_index == 1) {
+      attr_idx = 4;
+    } else if (elems[e].usage == D3DDECLUSAGE_COLOR && elems[e].usage_index == 1) {
+      attr_idx = 5;
+    } else if (elems[e].usage == 1 /* BLENDWEIGHT */ && elems[e].usage_index == 0) {
+      attr_idx = 6;
+    } else if (elems[e].usage == 2 /* BLENDINDICES */ && elems[e].usage_index == 0) {
+      attr_idx = 7;
+    } else {
+      continue; /* Skip unmapped semantics */
+    }
+    vd.attributes[attr_idx].format = fmt;
+    vd.attributes[attr_idx].offset = elems[e].offset;
+    vd.attributes[attr_idx].bufferIndex = 0;
+  }
+  vd.layouts[0].stride = stride;
+  vd.layouts[0].stepRate = 1;
+  vd.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+
+  MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+  desc.vertexFunction = vs_func;
+  desc.fragmentFunction = ps_func;
+  desc.vertexDescriptor = vd;
+  desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+
+  if (blend_enable) {
+    desc.colorAttachments[0].blendingEnabled = YES;
+    desc.colorAttachments[0].sourceRGBBlendFactor = d3d_blend_to_mtl(src_blend, 1);
+    desc.colorAttachments[0].destinationRGBBlendFactor = d3d_blend_to_mtl(dst_blend, 0);
+    desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    desc.colorAttachments[0].sourceAlphaBlendFactor = d3d_blend_to_mtl(src_blend, 1);
+    desc.colorAttachments[0].destinationAlphaBlendFactor = d3d_blend_to_mtl(dst_blend, 0);
+    desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+  }
+
+  NSError *err = nil;
+  id<MTLRenderPipelineState> pso =
+      [s_device newRenderPipelineStateWithDescriptor:desc error:&err];
+  if (!pso) {
+    fprintf(stderr, "dx9mt: translated PSO creation failed: %s\n",
+            [[err localizedDescription] UTF8String]);
+    [s_translated_pso_cache setObject:[NSNull null] forKey:key];
+    return nil;
+  }
+
+  [s_translated_pso_cache setObject:pso forKey:key];
+  return pso;
+}
+
 static void dump_frame(const volatile unsigned char *ipc_base) {
   const volatile dx9mt_metal_ipc_header *hdr =
       (const volatile dx9mt_metal_ipc_header *)ipc_base;
@@ -1422,8 +1627,8 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
     fprintf(f, "  prim_type=%u  prim_count=%u  base_vertex=%d  start_index=%u\n",
             d->primitive_type, d->primitive_count, d->base_vertex,
             d->start_index);
-    fprintf(f, "  stride=%u  fvf=0x%08x  ps_id=%u\n",
-            d->stream0_stride, d->fvf, d->pixel_shader_id);
+    fprintf(f, "  stride=%u  fvf=0x%08x  vs_id=%u  ps_id=%u\n",
+            d->stream0_stride, d->fvf, d->vertex_shader_id, d->pixel_shader_id);
     fprintf(f, "  rt_id=%u  rt_tex_id=%u  rt_size=%ux%u  rt_fmt=%s\n",
             d->render_target_id, d->render_target_texture_id,
             d->render_target_width, d->render_target_height,
@@ -1488,6 +1693,30 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
     fprintf(f, "  vs_const: offset=%u size=%u  ps_const: offset=%u size=%u\n",
             d->vs_constants_bulk_offset, d->vs_constants_size,
             d->ps_constants_bulk_offset, d->ps_constants_size);
+
+    /* Shader bytecode */
+    fprintf(f, "  vs_id=%u  vs_bc: offset=%u size=%u  ps_bc: offset=%u size=%u\n",
+            d->vertex_shader_id,
+            d->vs_bytecode_bulk_offset, d->vs_bytecode_bulk_size,
+            d->ps_bytecode_bulk_offset, d->ps_bytecode_bulk_size);
+    if (d->vs_bytecode_bulk_size >= 4) {
+      const uint32_t *bc = (const uint32_t *)(ipc_base + bulk_off +
+                                               d->vs_bytecode_bulk_offset);
+      uint32_t dw_count = d->vs_bytecode_bulk_size / 4;
+      fprintf(f, "    vs_bc[0..3]: %08x %08x %08x %08x (%u dwords, ver=%u.%u)\n",
+              bc[0], dw_count > 1 ? bc[1] : 0,
+              dw_count > 2 ? bc[2] : 0, dw_count > 3 ? bc[3] : 0,
+              dw_count, (bc[0] >> 8) & 0xFF, bc[0] & 0xFF);
+    }
+    if (d->ps_bytecode_bulk_size >= 4) {
+      const uint32_t *bc = (const uint32_t *)(ipc_base + bulk_off +
+                                               d->ps_bytecode_bulk_offset);
+      uint32_t dw_count = d->ps_bytecode_bulk_size / 4;
+      fprintf(f, "    ps_bc[0..3]: %08x %08x %08x %08x (%u dwords, ver=%u.%u)\n",
+              bc[0], dw_count > 1 ? bc[1] : 0,
+              dw_count > 2 ? bc[2] : 0, dw_count > 3 ? bc[3] : 0,
+              dw_count, (bc[0] >> 8) & 0xFF, bc[0] & 0xFF);
+    }
 
     /* Dump first few vertices (raw hex + interpreted color if COLOR present) */
     if (d->vb_bulk_size > 0 && d->stream0_stride > 0) {
@@ -1747,6 +1976,45 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         continue;
       }
 
+      /* RB3 Phase 3: attempt shader translation */
+      int use_translated = 0;
+      id<MTLRenderPipelineState> translated_pso = nil;
+      if (shader_translate_enabled() &&
+          d->vs_bytecode_bulk_size >= 8 && d->ps_bytecode_bulk_size >= 8 &&
+          !decl_has_positiont) {
+        const uint32_t *vs_bc = (const uint32_t *)(ipc_base + bulk_off +
+                                                     d->vs_bytecode_bulk_offset);
+        const uint32_t *ps_bc = (const uint32_t *)(ipc_base + bulk_off +
+                                                     d->ps_bytecode_bulk_offset);
+        uint32_t vs_dwords = d->vs_bytecode_bulk_size / 4;
+        uint32_t ps_dwords = d->ps_bytecode_bulk_size / 4;
+        uint32_t vs_hash = dx9mt_sm_bytecode_hash(vs_bc, vs_dwords);
+        uint32_t ps_hash = dx9mt_sm_bytecode_hash(ps_bc, ps_dwords);
+
+        id<MTLFunction> vs_func = translate_and_compile_vs(vs_bc, vs_dwords, vs_hash);
+        id<MTLFunction> ps_func = translate_and_compile_ps(ps_bc, ps_dwords, ps_hash);
+
+        if (vs_func && ps_func && elems) {
+          uint16_t eff_count = (fvf_elem_count > 0) ? fvf_elem_count
+                                                     : d->decl_count;
+          /* Build PSO key from shader hashes + vertex layout + blend state */
+          uint64_t pso_key = ((uint64_t)vs_hash << 32) | ps_hash;
+          pso_key ^= (uint64_t)stride * 0x9E3779B97F4A7C15ULL;
+          pso_key ^= ((uint64_t)d->rs_alpha_blend_enable << 48) |
+                     ((uint64_t)d->rs_src_blend << 40) |
+                     ((uint64_t)d->rs_dest_blend << 32);
+
+          translated_pso = create_translated_pso(
+              vs_func, ps_func, elems, eff_count, stride, textured,
+              d->rs_alpha_blend_enable, d->rs_src_blend, d->rs_dest_blend,
+              pso_key);
+          if (translated_pso) {
+            geometry_pso = translated_pso;
+            use_translated = 1;
+          }
+        }
+      }
+
       /* Create Metal buffers from IPC bulk data */
       const void *vb_data = (const void *)(ipc_base + bulk_off + d->vb_bulk_offset);
       const void *ib_data = (const void *)(ipc_base + bulk_off + d->ib_bulk_offset);
@@ -1790,117 +2058,131 @@ static void render_frame(const volatile unsigned char *ipc_base) {
 
       [encoder setRenderPipelineState:geometry_pso];
       [encoder setVertexBuffer:vb_buf offset:d->stream0_offset atIndex:0];
-      uint32_t alpha_func = d->rs_alpha_func;
-      uint32_t color_op = d->tss0_color_op;
-      uint32_t alpha_op = d->tss0_alpha_op;
-      if (alpha_func < D3DCMP_NEVER || alpha_func > D3DCMP_ALWAYS) {
-        alpha_func = D3DCMP_ALWAYS;
-      }
-      if (color_op < D3DTOP_DISABLE || color_op > D3DTOP_PREMODULATE) {
-        color_op = D3DTOP_MODULATE;
-      }
-      if (alpha_op < D3DTOP_DISABLE || alpha_op > D3DTOP_PREMODULATE) {
-        alpha_op = D3DTOP_SELECTARG1;
-      }
-      struct {
-        uint32_t use_vertex_color;
-        uint32_t use_stage0_combiner;
-        uint32_t alpha_only;
-        uint32_t force_alpha_one;
-        uint32_t alpha_test_enable;
-        float alpha_ref;
-        uint32_t alpha_func;
-        uint32_t color_op;
-        uint32_t color_arg1;
-        uint32_t color_arg2;
-        uint32_t alpha_op;
-        uint32_t alpha_arg1;
-        uint32_t alpha_arg2;
-        uint32_t texture_factor_argb;
-        uint32_t has_pixel_shader;
-        uint32_t _pad0;
-        float ps_c0[4];
-      } frag_params;
-      memset(&frag_params, 0, sizeof(frag_params));
-      frag_params.use_vertex_color = (uint32_t)(decl_has_color ? 1 : 0);
-      frag_params.use_stage0_combiner =
-          (uint32_t)(d->pixel_shader_id == 0 ? 1 : 0);
-      frag_params.alpha_only =
-          (uint32_t)(d->texture0_format == D3DFMT_A8 ? 1 : 0);
-      frag_params.force_alpha_one =
-          (uint32_t)(d->texture0_format == D3DFMT_X8R8G8B8 ? 1 : 0);
-      frag_params.alpha_test_enable =
-          (uint32_t)(d->rs_alpha_test_enable ? 1 : 0);
-      frag_params.alpha_ref = (float)(d->rs_alpha_ref & 0xFFu) / 255.0f;
-      frag_params.alpha_func = alpha_func;
-      frag_params.color_op = color_op;
-      frag_params.color_arg1 = d->tss0_color_arg1;
-      frag_params.color_arg2 = d->tss0_color_arg2;
-      frag_params.alpha_op = alpha_op;
-      frag_params.alpha_arg1 = d->tss0_alpha_arg1;
-      frag_params.alpha_arg2 = d->tss0_alpha_arg2;
-      frag_params.texture_factor_argb = d->rs_texture_factor;
-      frag_params.has_pixel_shader =
-          (uint32_t)(d->pixel_shader_id != 0 ? 1 : 0);
-      frag_params.ps_c0[0] = 1.0f;
-      frag_params.ps_c0[1] = 1.0f;
-      frag_params.ps_c0[2] = 1.0f;
-      frag_params.ps_c0[3] = 1.0f;
-      if (d->pixel_shader_id != 0 && d->ps_constants_size >= 16) {
-        const float *ps_data = (const float *)(ipc_base + bulk_off +
-                                                d->ps_constants_bulk_offset);
-        frag_params.ps_c0[0] = ps_data[0];
-        frag_params.ps_c0[1] = ps_data[1];
-        frag_params.ps_c0[2] = ps_data[2];
-        frag_params.ps_c0[3] = ps_data[3];
-      }
-      if (draw_texture) {
-        [encoder setFragmentBytes:&frag_params
-                           length:sizeof(frag_params)
-                          atIndex:0];
-        [encoder setFragmentTexture:draw_texture atIndex:0];
-        [encoder setFragmentSamplerState:draw_sampler atIndex:0];
-      } else {
-        [encoder setFragmentBytes:&frag_params
-                           length:sizeof(frag_params)
-                          atIndex:0];
-        [encoder setFragmentTexture:nil atIndex:0];
-        [encoder setFragmentSamplerState:nil atIndex:0];
-      }
 
-      /* Bind VS constants at buffer index 1 for the WVP matrix */
-      if (decl_has_positiont && d->viewport_width > 0 && d->viewport_height > 0) {
-        /*
-         * Pre-transformed vertices (D3DFVF_XYZRHW / POSITIONT): bypass the
-         * game's WVP and synthesize a screen-to-NDC matrix so the existing
-         * geo_vertex shader produces correct clip-space output.
-         *
-         * D3D9 row-major rows stored in VS constant registers c0-c3:
-         *   c0 = [2/w,  0,   0, 0]
-         *   c1 = [0,   -2/h, 0, 0]
-         *   c2 = [0,    0,   1, 0]
-         *   c3 = [-2*vpX/w-1, 2*vpY/h+1, 0, 1]
-         */
-        float vpX = (float)d->viewport_x;
-        float vpY = (float)d->viewport_y;
-        float vpW = (float)d->viewport_width;
-        float vpH = (float)d->viewport_height;
-        float pt_matrix[16] = {
-          2.0f / vpW,              0.0f,                   0.0f, 0.0f,
-          0.0f,                   -2.0f / vpH,             0.0f, 0.0f,
-          0.0f,                    0.0f,                   1.0f, 0.0f,
-         -2.0f * vpX / vpW - 1.0f, 2.0f * vpY / vpH + 1.0f, 0.0f, 1.0f,
-        };
-        [encoder setVertexBytes:pt_matrix length:sizeof(pt_matrix) atIndex:1];
-      } else if (d->vs_constants_size >= 64) {
-        const void *vs_data =
-            (const void *)(ipc_base + bulk_off + d->vs_constants_bulk_offset);
-        [encoder setVertexBytes:vs_data length:d->vs_constants_size atIndex:1];
+      if (use_translated) {
+        /* Translated shader path: bind full constant arrays */
+        if (d->vs_constants_size > 0) {
+          const void *vs_data =
+              (const void *)(ipc_base + bulk_off + d->vs_constants_bulk_offset);
+          [encoder setVertexBytes:vs_data length:d->vs_constants_size atIndex:1];
+        } else {
+          static const float zero[4] = {0, 0, 0, 0};
+          [encoder setVertexBytes:zero length:sizeof(zero) atIndex:1];
+        }
+        if (d->ps_constants_size > 0) {
+          const void *ps_data =
+              (const void *)(ipc_base + bulk_off + d->ps_constants_bulk_offset);
+          [encoder setFragmentBytes:ps_data length:d->ps_constants_size atIndex:0];
+        } else {
+          static const float zero[4] = {0, 0, 0, 0};
+          [encoder setFragmentBytes:zero length:sizeof(zero) atIndex:0];
+        }
+        if (draw_texture) {
+          [encoder setFragmentTexture:draw_texture atIndex:0];
+          [encoder setFragmentSamplerState:draw_sampler atIndex:0];
+        }
       } else {
-        /* No constants -- bind identity matrix as fallback */
-        static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
-                                            0, 0, 1, 0, 0, 0, 0, 1};
-        [encoder setVertexBytes:identity length:sizeof(identity) atIndex:1];
+        /* Hardcoded shader path (TSS combiner / ps_c0 tint / passthrough) */
+        uint32_t alpha_func = d->rs_alpha_func;
+        uint32_t color_op = d->tss0_color_op;
+        uint32_t alpha_op = d->tss0_alpha_op;
+        if (alpha_func < D3DCMP_NEVER || alpha_func > D3DCMP_ALWAYS) {
+          alpha_func = D3DCMP_ALWAYS;
+        }
+        if (color_op < D3DTOP_DISABLE || color_op > D3DTOP_PREMODULATE) {
+          color_op = D3DTOP_MODULATE;
+        }
+        if (alpha_op < D3DTOP_DISABLE || alpha_op > D3DTOP_PREMODULATE) {
+          alpha_op = D3DTOP_SELECTARG1;
+        }
+        struct {
+          uint32_t use_vertex_color;
+          uint32_t use_stage0_combiner;
+          uint32_t alpha_only;
+          uint32_t force_alpha_one;
+          uint32_t alpha_test_enable;
+          float alpha_ref;
+          uint32_t alpha_func;
+          uint32_t color_op;
+          uint32_t color_arg1;
+          uint32_t color_arg2;
+          uint32_t alpha_op;
+          uint32_t alpha_arg1;
+          uint32_t alpha_arg2;
+          uint32_t texture_factor_argb;
+          uint32_t has_pixel_shader;
+          uint32_t _pad0;
+          float ps_c0[4];
+        } frag_params;
+        memset(&frag_params, 0, sizeof(frag_params));
+        frag_params.use_vertex_color = (uint32_t)(decl_has_color ? 1 : 0);
+        frag_params.use_stage0_combiner =
+            (uint32_t)(d->pixel_shader_id == 0 ? 1 : 0);
+        frag_params.alpha_only =
+            (uint32_t)(d->texture0_format == D3DFMT_A8 ? 1 : 0);
+        frag_params.force_alpha_one =
+            (uint32_t)(d->texture0_format == D3DFMT_X8R8G8B8 ? 1 : 0);
+        frag_params.alpha_test_enable =
+            (uint32_t)(d->rs_alpha_test_enable ? 1 : 0);
+        frag_params.alpha_ref = (float)(d->rs_alpha_ref & 0xFFu) / 255.0f;
+        frag_params.alpha_func = alpha_func;
+        frag_params.color_op = color_op;
+        frag_params.color_arg1 = d->tss0_color_arg1;
+        frag_params.color_arg2 = d->tss0_color_arg2;
+        frag_params.alpha_op = alpha_op;
+        frag_params.alpha_arg1 = d->tss0_alpha_arg1;
+        frag_params.alpha_arg2 = d->tss0_alpha_arg2;
+        frag_params.texture_factor_argb = d->rs_texture_factor;
+        frag_params.has_pixel_shader =
+            (uint32_t)(d->pixel_shader_id != 0 ? 1 : 0);
+        frag_params.ps_c0[0] = 1.0f;
+        frag_params.ps_c0[1] = 1.0f;
+        frag_params.ps_c0[2] = 1.0f;
+        frag_params.ps_c0[3] = 1.0f;
+        if (d->pixel_shader_id != 0 && d->ps_constants_size >= 16) {
+          const float *ps_data = (const float *)(ipc_base + bulk_off +
+                                                  d->ps_constants_bulk_offset);
+          frag_params.ps_c0[0] = ps_data[0];
+          frag_params.ps_c0[1] = ps_data[1];
+          frag_params.ps_c0[2] = ps_data[2];
+          frag_params.ps_c0[3] = ps_data[3];
+        }
+        if (draw_texture) {
+          [encoder setFragmentBytes:&frag_params
+                             length:sizeof(frag_params)
+                            atIndex:0];
+          [encoder setFragmentTexture:draw_texture atIndex:0];
+          [encoder setFragmentSamplerState:draw_sampler atIndex:0];
+        } else {
+          [encoder setFragmentBytes:&frag_params
+                             length:sizeof(frag_params)
+                            atIndex:0];
+          [encoder setFragmentTexture:nil atIndex:0];
+          [encoder setFragmentSamplerState:nil atIndex:0];
+        }
+
+        /* Bind VS constants at buffer index 1 for the WVP matrix */
+        if (decl_has_positiont && d->viewport_width > 0 && d->viewport_height > 0) {
+          float vpX = (float)d->viewport_x;
+          float vpY = (float)d->viewport_y;
+          float vpW = (float)d->viewport_width;
+          float vpH = (float)d->viewport_height;
+          float pt_matrix[16] = {
+            2.0f / vpW,              0.0f,                   0.0f, 0.0f,
+            0.0f,                   -2.0f / vpH,             0.0f, 0.0f,
+            0.0f,                    0.0f,                   1.0f, 0.0f,
+           -2.0f * vpX / vpW - 1.0f, 2.0f * vpY / vpH + 1.0f, 0.0f, 1.0f,
+          };
+          [encoder setVertexBytes:pt_matrix length:sizeof(pt_matrix) atIndex:1];
+        } else if (d->vs_constants_size >= 64) {
+          const void *vs_data =
+              (const void *)(ipc_base + bulk_off + d->vs_constants_bulk_offset);
+          [encoder setVertexBytes:vs_data length:d->vs_constants_size atIndex:1];
+        } else {
+          static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
+                                              0, 0, 1, 0, 0, 0, 0, 1};
+          [encoder setVertexBytes:identity length:sizeof(identity) atIndex:1];
+        }
       }
 
       [encoder drawIndexedPrimitives:d3d_prim_to_mtl(d->primitive_type)

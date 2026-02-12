@@ -56,9 +56,13 @@ $(TEST_BIN): $(TEST_SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(BACKEND_CC) $(TEST_CFLAGS) -o $@ $(TEST_SRCS)
 
-$(VIEWER_BIN): src/tools/metal_viewer.m
+VIEWER_SRCS := src/tools/metal_viewer.m \
+	src/tools/d3d9_shader_parse.c \
+	src/tools/d3d9_shader_emit_msl.c
+
+$(VIEWER_BIN): $(VIEWER_SRCS)
 	@mkdir -p $(BUILD_DIR)
-	$(BACKEND_CC) $(BACKEND_OBJCFLAGS) -framework Metal -framework QuartzCore -framework Cocoa -o $@ $<
+	$(BACKEND_CC) $(BACKEND_OBJCFLAGS) -framework Metal -framework QuartzCore -framework Cocoa -o $@ $(VIEWER_SRCS)
 
 test-native: $(TEST_BIN)
 	@"$(TEST_BIN)"

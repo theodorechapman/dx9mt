@@ -21,18 +21,24 @@
 - [x] FVF-to-vertex-declaration conversion for legacy draws
 - [x] Pre-transformed vertex (XYZRHW/POSITIONT) handling with synthetic screen-to-NDC matrix
 
-## Current Priority: RB3 Phase 3 -- D3D9 Shader Translation
+## Completed: RB3 Phase 3 -- D3D9 Shader Translation
 
-- [ ] Transmit VS/PS bytecode via IPC (upload ref or shader registry packet)
-- [ ] D3D9 SM2.0/SM3.0 bytecode parser (version token, instructions, dcl, def)
-- [ ] Register mapping: D3D9 registers → MSL variables
-- [ ] VS instruction emitter: dp4, mov, add, mul, mad (enough for WVP + basic transforms)
-- [ ] PS instruction emitter: texld, mov, mul, add, mad, cmp, lrp
-- [ ] MSL source compilation + PSO caching by shader bytecode hash
-- [ ] Replace hardcoded "WVP from c0-c3" vertex shader with translated VS
-- [ ] Replace "texture * c0" pixel shader fallback with translated PS
+- [x] Transmit VS/PS bytecode via IPC (upload ref in draw packet + bulk copy)
+- [x] Add vertex_shader_id to IPC draw entry (was missing)
+- [x] D3D9 SM2.0/SM3.0 bytecode parser (version token, instructions, dcl, def)
+- [x] Register token decoding (type, number, swizzle, write mask, source/result modifiers)
+- [x] Register mapping: D3D9 registers → MSL variables (r#, v#, c#, s#, oPos, oD#, oT#, oC#)
+- [x] VS instruction emitter: dp3, dp4, mov, add, sub, mul, mad, rcp, rsq, min, max, slt, sge, exp, log, lit, dst, lrp, frc, pow, crs, abs, nrm, sincos, mova, m4x4, m4x3, m3x4, m3x3, m3x2
+- [x] PS instruction emitter: texld, texldl, texkill, mov, mul, add, mad, cmp, lrp, dp2add + all VS arithmetic ops
+- [x] Swizzle emission, write mask application, source modifiers (negate, abs, complement, x2, bias)
+- [x] Result modifier _sat → saturate()
+- [x] MSL source compilation via newLibraryWithSource + function cache by bytecode hash
+- [x] Translated PSO creation and caching by (vs_hash, ps_hash, vertex layout, blend state)
+- [x] Fallback to hardcoded TSS/c0 path on parse/compile failure (sticky cache)
+- [x] POSITIONT draws skip translation (use existing synthetic matrix path)
+- [x] DX9MT_SHADER_TRANSLATE=0 env var for A/B comparison
 
-## Next After Shaders: RB4 -- Depth/Stencil + Pass Structure
+## Current Priority: RB4 -- Depth/Stencil + Pass Structure
 
 - [ ] Transmit depth/stencil render state values in draw packet
 - [ ] Create MTLDepthStencilState from D3D9 state
@@ -41,6 +47,14 @@
 - [ ] Explicit clear behavior per non-primary render target
 - [ ] Blend-op fidelity (D3DRS_BLENDOP: ADD, SUBTRACT, etc.)
 - [ ] Separate alpha blend support
+
+## Next: Shader Translation Hardening
+
+- [ ] Test with FNV, fix MSL compilation issues from real game bytecode
+- [ ] Flow control translation (if/else/endif, rep/endrep, break/breakc)
+- [ ] Relative addressing (a0 register for dynamic constant indexing)
+- [ ] Multi-texture support in translated PS (tex1..tex7 bindings)
+- [ ] VS/PS interface linkage validation (match output semantics to input semantics)
 
 ## Later
 

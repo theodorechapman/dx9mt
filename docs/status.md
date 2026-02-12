@@ -10,21 +10,23 @@ D3D9-to-Metal translation layer for Wine WoW64 on Apple Silicon. Target: Fallout
 PE32 Frontend (d3d9.dll, i686-mingw32)
   Implements D3D9 COM interfaces
   Captures all API state + draw calls as packets
-  Copies VB/IB/decl/constant/texture data to upload arena
+  Copies VB/IB/decl/constant/texture/shader bytecode to upload arena
   Writes per-frame data to shared memory IPC file
       |
       | memory-mapped file (/tmp/dx9mt_metal_frame.bin, 16MB)
       | per-draw: viewport, scissor, VB bytes, IB bytes,
       |           vertex decl, VS/PS constants, texture data,
-      |           sampler state, TSS state, blend/alpha state
+      |           sampler state, TSS state, blend/alpha state,
+      |           VS/PS shader bytecode
       v
 Native Metal Viewer (dx9mt_metal_viewer, ARM64)
   Polls IPC file for new frames
   Parses vertex declarations -> Metal vertex descriptors
   Creates Metal buffers from VB/IB data
-  Applies WVP matrix from VS constants c0-c3
+  Translates D3D9 SM2/SM3 shader bytecode -> MSL source
+  Compiles MSL and caches by bytecode hash
+  Falls back to hardcoded WVP/TSS/c0 path on translation failure
   Samples textures (DXT1/DXT3/DXT5/A8R8G8B8/X8R8G8B8/A8)
-  Evaluates D3D9 TSS fixed-function combiners OR PS c0 tint
   Routes draws to per-render-target Metal textures
   Alpha blending with configurable src/dst blend factors
   Encodes indexed draw calls per frame
@@ -40,7 +42,14 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 - ~19 draws/frame across DXT1, DXT3, DXT5, A8R8G8B8 textures
 - Texture caching by (object_id, generation) with periodic 60-frame refresh
 - Full D3D9 fixed-function TSS combiner evaluation in Metal fragment shader
-- PS constant c0 fallback for pixel shader draws (replaces white output)
+- **D3D9 SM2.0/SM3.0 shader bytecode → MSL transpiler** (RB3 Phase 3):
+  - Bytecode parser: dcl, def, arithmetic, texture, matrix multiply instructions
+  - MSL emitter: register mapping, swizzle, write mask, source modifiers, _sat
+  - Shader function cache (bytecode hash → MTLFunction) with sticky failure
+  - Translated PSO cache (combined key → MTLRenderPipelineState)
+  - Automatic fallback to TSS/c0 hardcoded path on parse/compile failure
+  - POSITIONT draws skip translation (use synthetic screen-to-NDC matrix)
+  - `DX9MT_SHADER_TRANSLATE=0` env var disables for A/B comparison
 - Render-target texture routing: draws to offscreen RTs available as shader inputs
 - FVF-to-vertex-declaration conversion for legacy FVF draws
 - Alpha blending (SRCALPHA/INVSRCALPHA) and alpha test with configurable function
@@ -62,8 +71,8 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 | RB3 Phase 2A | Done | Texture data transmission, caching, DXT/ARGB format support |
 | RB3 Phase 2B | Done | Sampler state, TSS fixed-function combiners, blend state, alpha test |
 | RB3 Phase 2C | Done | PS constant c0 tint for pixel shader draws, render-target routing |
-| RB3 Phase 3 | Next | D3D9 shader bytecode translation (VS + PS) |
-| RB4 | Pending | Depth/stencil state, pass structure, clear-pass fusion |
+| RB3 Phase 3 | Done | D3D9 SM2/SM3 bytecode → MSL transpiler, shader cache, PSO cache |
+| RB4 | Next | Depth/stencil state, pass structure, clear-pass fusion |
 | RB5 | Pending | Performance: state dedup, buffer recycling, pipeline cache, async compile |
 | RB6 | Pending | Compatibility hardening: missing stubs, edge cases, in-game rendering |
 
@@ -94,12 +103,33 @@ grep -E "packet parse error|sequence out of order|draw packet missing" /tmp/dx9m
 
 Present frames show `(metal-ipc)` when the IPC path is active.
 
+## Shader Translation Diagnostics
+
+The viewer logs shader compilation results to stderr:
+```bash
+# Successful compilations
+# dx9mt: VS 0xABCD1234 compiled OK (12 instructions)
+# dx9mt: PS 0xEF567890 compiled OK (8 instructions)
+
+# Failures (include full MSL source + parsed IR)
+# dx9mt: VS 0x... compile failed: <Metal error>
+# --- VS MSL source ---
+# ...
+# --- end ---
+```
+
+Disable translation for A/B comparison:
+```bash
+DX9MT_SHADER_TRANSLATE=0 make run
+```
+
 ## Frame Dump
 
-Set `DX9MT_FRAME_DUMP=1` to write per-draw state to `/tmp/dx9mt_frame_dump.txt`. Shows:
+Press 'D' in the viewer window to write per-draw state to `/tmp/dx9mt_frame_dump.txt`. Shows:
 - Resolution, draw count, clear color, present render target
 - Per-draw: primitive type/count, vertex format, texture info, TSS state, blend state
 - Sampler state, viewport, vertex data samples
+- Shader bytecode: VS/PS IDs, bytecode size, version token, first 4 DWORDs
 - `upload=0` means texture is cached (not missing), `upload=N` means N bytes uploaded this frame
 
 ## File Map
@@ -123,13 +153,17 @@ dx9mt/
     runtime.c              Singleton init, backend bridge setup, packet sequencing
     d3d9.def               DLL export definitions
   src/backend/
-    backend_bridge_stub.c  Packet parser, frame replay state, IPC writer, Metal wiring (~1270 lines)
+    backend_bridge_stub.c  Packet parser, frame replay state, IPC writer (~1300 lines)
     metal_presenter.h      C-callable Metal presenter API (unused in IPC mode)
     metal_presenter.m      Objective-C Metal implementation (unused in IPC mode)
   src/common/
     log.c                  Timestamped file/stderr logging
   src/tools/
-    metal_viewer.m         Standalone native Metal viewer (~2100 lines, reads IPC, renders)
+    metal_viewer.m         Standalone native Metal viewer (~2400 lines, reads IPC, renders)
+    d3d9_shader_parse.h    SM2/SM3 bytecode parser: IR structs + API
+    d3d9_shader_parse.c    Bytecode parser implementation (~470 lines)
+    d3d9_shader_emit_msl.h MSL emitter API
+    d3d9_shader_emit_msl.c D3D9 IR → MSL source emitter (~530 lines)
   tests/
     backend_bridge_contract_test.c   10 contract tests
 ```
