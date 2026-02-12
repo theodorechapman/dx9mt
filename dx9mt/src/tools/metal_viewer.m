@@ -2133,28 +2133,24 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         id<MTLFunction> vs_func = translate_and_compile_vs(vs_bc, vs_dwords, vs_hash);
         id<MTLFunction> ps_func = translate_and_compile_ps(ps_bc, ps_dwords, ps_hash);
 
-        if (!vs_func || !ps_func || !elems) {
-          continue; /* translation failed — skip draw, no fallback */
+        if (vs_func && ps_func && elems) {
+          uint16_t eff_count = (fvf_elem_count > 0) ? fvf_elem_count
+                                                     : d->decl_count;
+          uint64_t pso_key = ((uint64_t)vs_hash << 32) | ps_hash;
+          pso_key ^= (uint64_t)stride * 0x9E3779B97F4A7C15ULL;
+          pso_key ^= ((uint64_t)d->rs_alpha_blend_enable << 48) |
+                     ((uint64_t)d->rs_src_blend << 40) |
+                     ((uint64_t)d->rs_dest_blend << 32);
+
+          id<MTLRenderPipelineState> translated_pso = create_translated_pso(
+              vs_func, ps_func, elems, eff_count, stride, textured,
+              d->rs_alpha_blend_enable, d->rs_src_blend,
+              d->rs_dest_blend, pso_key);
+          if (translated_pso) {
+            geometry_pso = translated_pso;
+            use_translated = 1;
+          }
         }
-
-        uint16_t eff_count = (fvf_elem_count > 0) ? fvf_elem_count
-                                                   : d->decl_count;
-        uint64_t pso_key = ((uint64_t)vs_hash << 32) | ps_hash;
-        pso_key ^= (uint64_t)stride * 0x9E3779B97F4A7C15ULL;
-        pso_key ^= ((uint64_t)d->rs_alpha_blend_enable << 48) |
-                   ((uint64_t)d->rs_src_blend << 40) |
-                   ((uint64_t)d->rs_dest_blend << 32);
-
-        id<MTLRenderPipelineState> translated_pso = create_translated_pso(
-            vs_func, ps_func, elems, eff_count, stride, textured,
-            d->rs_alpha_blend_enable, d->rs_src_blend, d->rs_dest_blend,
-            pso_key);
-        if (!translated_pso) {
-          continue; /* PSO creation failed — skip draw */
-        }
-
-        geometry_pso = translated_pso;
-        use_translated = 1;
       }
 
       /* Create Metal buffers from IPC bulk data */

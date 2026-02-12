@@ -131,35 +131,87 @@ static int opcode_has_dst(uint16_t op) {
 static void track_register_usage(dx9mt_sm_program *prog,
                                  const dx9mt_sm_register *reg,
                                  int is_dst) {
+  if (!prog || !reg) {
+    return;
+  }
+
   switch (reg->type) {
   case DX9MT_SM_REG_TEMP:
+    if (reg->number > 255u) {
+      snprintf(prog->error_msg, sizeof(prog->error_msg),
+               "temp register %u out of supported range", reg->number);
+      prog->has_error = 1;
+      return;
+    }
     if (reg->number > prog->max_temp_reg)
       prog->max_temp_reg = reg->number;
     break;
   case DX9MT_SM_REG_CONST:
+    if (reg->number > 255u) {
+      snprintf(prog->error_msg, sizeof(prog->error_msg),
+               "const register %u out of supported range", reg->number);
+      prog->has_error = 1;
+      return;
+    }
     if (reg->number > prog->max_const_reg)
       prog->max_const_reg = reg->number;
     break;
   case DX9MT_SM_REG_INPUT:
+    if (reg->number >= 32u) {
+      snprintf(prog->error_msg, sizeof(prog->error_msg),
+               "input register %u out of supported range", reg->number);
+      prog->has_error = 1;
+      return;
+    }
     prog->input_mask |= (1u << reg->number);
     break;
   case DX9MT_SM_REG_OUTPUT:
+    if (reg->number >= 32u) {
+      snprintf(prog->error_msg, sizeof(prog->error_msg),
+               "output register %u out of supported range", reg->number);
+      prog->has_error = 1;
+      return;
+    }
     prog->output_mask |= (1u << reg->number);
     break;
   case DX9MT_SM_REG_SAMPLER:
+    if (reg->number >= 32u) {
+      snprintf(prog->error_msg, sizeof(prog->error_msg),
+               "sampler register %u out of supported range", reg->number);
+      prog->has_error = 1;
+      return;
+    }
     prog->sampler_mask |= (1u << reg->number);
     break;
   case DX9MT_SM_REG_RASTOUT:
+    if (reg->number > 2u) {
+      snprintf(prog->error_msg, sizeof(prog->error_msg),
+               "rastout register %u out of supported range", reg->number);
+      prog->has_error = 1;
+      return;
+    }
     if (is_dst && reg->number == 0)
       prog->writes_position = 1;
     if (is_dst && reg->number == 1)
       prog->writes_fog = 1;
     break;
   case DX9MT_SM_REG_ATTROUT:
+    if (reg->number >= 32u) {
+      snprintf(prog->error_msg, sizeof(prog->error_msg),
+               "attribute output register %u out of supported range", reg->number);
+      prog->has_error = 1;
+      return;
+    }
     if (is_dst)
       prog->color_output_mask |= (1u << reg->number);
     break;
   case DX9MT_SM_REG_COLOROUT:
+    if (reg->number >= 32u) {
+      snprintf(prog->error_msg, sizeof(prog->error_msg),
+               "color output register %u out of supported range", reg->number);
+      prog->has_error = 1;
+      return;
+    }
     if (is_dst) {
       prog->num_color_outputs = (int)reg->number + 1;
     }
@@ -180,6 +232,7 @@ static void track_register_usage(dx9mt_sm_program *prog,
 int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
                    dx9mt_sm_program *out) {
   uint32_t pos = 0;
+  int saw_end = 0;
 
   memset(out, 0, sizeof(*out));
 
@@ -212,12 +265,19 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
 
     /* End marker */
     if (opcode == DX9MT_SM_OP_END) {
+      saw_end = 1;
       break;
     }
 
     /* Comment block: lower 16 bits = 0xFFFE, upper 15 bits = length in DWORDs */
     if ((instr_token & 0xFFFFu) == 0xFFFEu) {
       uint32_t comment_len = (instr_token >> 16) & 0x7FFFu;
+      if (pos + 1 + comment_len > dword_count) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "truncated comment block at dword %u", pos);
+        out->has_error = 1;
+        return -1;
+      }
       pos += 1 + comment_len;
       continue;
     }
@@ -230,7 +290,12 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
 
     /* DCL: semantic_token + register_token */
     if (opcode == DX9MT_SM_OP_DCL) {
-      if (pos + 2 > dword_count) break;
+      if (pos + 2 > dword_count) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "truncated dcl at dword %u", pos);
+        out->has_error = 1;
+        return -1;
+      }
       uint32_t sem_token = bytecode[pos++];
       uint32_t reg_token = bytecode[pos++];
 
@@ -241,29 +306,66 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         dcl->reg_type = (uint8_t)decode_reg_type(reg_token);
         dcl->reg_number = decode_reg_number(reg_token);
         dcl->write_mask = (uint8_t)((reg_token >> 16) & 0xFu);
+        if (dcl->reg_type == DX9MT_SM_REG_SAMPLER &&
+            dcl->reg_number > 0u) {
+          snprintf(out->error_msg, sizeof(out->error_msg),
+                   "unsupported sampler index %u (multi-texture path not implemented)",
+                   dcl->reg_number);
+          out->has_error = 1;
+          return -1;
+        }
         /* For sampler declarations, the semantic token encodes sampler type */
         if (dcl->reg_type == DX9MT_SM_REG_SAMPLER) {
           dcl->sampler_type = (uint16_t)((sem_token >> 27) & 0xFu);
           out->sampler_mask |= (1u << dcl->reg_number);
         }
         /* Track input/output declarations */
-        if (dcl->reg_type == DX9MT_SM_REG_INPUT)
+        if (dcl->reg_type == DX9MT_SM_REG_INPUT) {
+          if (dcl->reg_number >= 32u) {
+            snprintf(out->error_msg, sizeof(out->error_msg),
+                     "invalid input register %u", dcl->reg_number);
+            out->has_error = 1;
+            return -1;
+          }
           out->input_mask |= (1u << dcl->reg_number);
-        if (dcl->reg_type == DX9MT_SM_REG_OUTPUT)
+        }
+        if (dcl->reg_type == DX9MT_SM_REG_OUTPUT) {
+          if (dcl->reg_number >= 32u) {
+            snprintf(out->error_msg, sizeof(out->error_msg),
+                     "invalid output register %u", dcl->reg_number);
+            out->has_error = 1;
+            return -1;
+          }
           out->output_mask |= (1u << dcl->reg_number);
+        }
+      } else {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "too many declarations (>%u)", DX9MT_SM_MAX_DCL);
+        out->has_error = 1;
+        return -1;
       }
       continue;
     }
 
     /* DEF: dst_token + 4 float immediates */
     if (opcode == DX9MT_SM_OP_DEF) {
-      if (pos + 5 > dword_count) break;
+      if (pos + 5 > dword_count) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "truncated def at dword %u", pos);
+        out->has_error = 1;
+        return -1;
+      }
       uint32_t dst_token = bytecode[pos++];
       if (out->def_count < DX9MT_SM_MAX_DEF) {
         dx9mt_sm_def_entry *def = &out->defs[out->def_count++];
         def->reg_type = DX9MT_SM_REG_CONST;
         def->reg_number = decode_reg_number(dst_token);
         memcpy(def->values.f, &bytecode[pos], 16);
+      } else {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "too many immediate defs (>%u)", DX9MT_SM_MAX_DEF);
+        out->has_error = 1;
+        return -1;
       }
       pos += 4;
       continue;
@@ -271,13 +373,23 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
 
     /* DEFI: dst_token + 4 int immediates */
     if (opcode == DX9MT_SM_OP_DEFI) {
-      if (pos + 5 > dword_count) break;
+      if (pos + 5 > dword_count) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "truncated defi at dword %u", pos);
+        out->has_error = 1;
+        return -1;
+      }
       uint32_t dst_token = bytecode[pos++];
       if (out->def_count < DX9MT_SM_MAX_DEF) {
         dx9mt_sm_def_entry *def = &out->defs[out->def_count++];
         def->reg_type = DX9MT_SM_REG_CONSTINT;
         def->reg_number = decode_reg_number(dst_token);
         memcpy(def->values.i, &bytecode[pos], 16);
+      } else {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "too many immediate defs (>%u)", DX9MT_SM_MAX_DEF);
+        out->has_error = 1;
+        return -1;
       }
       pos += 4;
       continue;
@@ -285,13 +397,23 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
 
     /* DEFB: dst_token + 1 bool */
     if (opcode == DX9MT_SM_OP_DEFB) {
-      if (pos + 2 > dword_count) break;
+      if (pos + 2 > dword_count) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "truncated defb at dword %u", pos);
+        out->has_error = 1;
+        return -1;
+      }
       uint32_t dst_token = bytecode[pos++];
       if (out->def_count < DX9MT_SM_MAX_DEF) {
         dx9mt_sm_def_entry *def = &out->defs[out->def_count++];
         def->reg_type = DX9MT_SM_REG_CONSTBOOL;
         def->reg_number = decode_reg_number(dst_token);
         def->values.b = bytecode[pos];
+      } else {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "too many immediate defs (>%u)", DX9MT_SM_MAX_DEF);
+        out->has_error = 1;
+        return -1;
       }
       pos += 1;
       continue;
@@ -299,34 +421,32 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
 
     /* Flow control */
     if (opcode == DX9MT_SM_OP_REP || opcode == DX9MT_SM_OP_IF) {
-      /* rep i# / if b# : 1 source token */
-      if (pos + 1 > dword_count) break;
-      if (out->instruction_count < DX9MT_SM_MAX_INSTRUCTIONS) {
-        dx9mt_sm_instruction *inst = &out->instructions[out->instruction_count++];
-        memset(inst, 0, sizeof(*inst));
-        inst->opcode = opcode;
-        inst->num_sources = 1;
-        inst->src[0] = decode_src(bytecode[pos++]);
-      } else {
-        pos += 1;
+      /* rep i# / if b# : flow control not yet supported */
+      if (pos + 1 > dword_count) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "truncated flow control at dword %u", pos);
+        out->has_error = 1;
+        return -1;
       }
-      continue;
+      pos += 1;
+      snprintf(out->error_msg, sizeof(out->error_msg),
+               "unsupported flow control opcode %u", opcode);
+      out->has_error = 1;
+      return -1;
     }
     if (opcode == DX9MT_SM_OP_IFC || opcode == DX9MT_SM_OP_BREAKC) {
       /* ifc src0, src1 / breakc src0, src1 */
-      if (pos + 2 > dword_count) break;
-      if (out->instruction_count < DX9MT_SM_MAX_INSTRUCTIONS) {
-        dx9mt_sm_instruction *inst = &out->instructions[out->instruction_count++];
-        memset(inst, 0, sizeof(*inst));
-        inst->opcode = opcode;
-        inst->comparison = (uint8_t)((instr_token >> 16) & 0x7u);
-        inst->num_sources = 2;
-        inst->src[0] = decode_src(bytecode[pos++]);
-        inst->src[1] = decode_src(bytecode[pos++]);
-      } else {
-        pos += 2;
+      if (pos + 2 > dword_count) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "truncated flow control at dword %u", pos);
+        out->has_error = 1;
+        return -1;
       }
-      continue;
+      pos += 2;
+      snprintf(out->error_msg, sizeof(out->error_msg),
+               "unsupported flow control opcode %u", opcode);
+      out->has_error = 1;
+      return -1;
     }
     if (opcode == DX9MT_SM_OP_ENDREP || opcode == DX9MT_SM_OP_ELSE ||
         opcode == DX9MT_SM_OP_ENDIF || opcode == DX9MT_SM_OP_BREAK) {
@@ -360,7 +480,12 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
       tokens_needed = 1;
     }
 
-    if (pos + tokens_needed > dword_count) break;
+    if (pos + tokens_needed > dword_count) {
+      snprintf(out->error_msg, sizeof(out->error_msg),
+               "truncated instruction operands at dword %u", pos);
+      out->has_error = 1;
+      return -1;
+    }
 
     if (out->instruction_count >= DX9MT_SM_MAX_INSTRUCTIONS) {
       snprintf(out->error_msg, sizeof(out->error_msg),
@@ -379,11 +504,23 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
 
       /* Skip relative addressing token if present */
       if ((dst_token >> 13) & 0x1u) {
-        if (pos < dword_count) pos++;
+        if (pos >= dword_count) {
+          snprintf(out->error_msg, sizeof(out->error_msg),
+                   "truncated dst relative token at dword %u", pos);
+          out->has_error = 1;
+          return -1;
+        }
+        pos++;
         inst->dst.has_relative = 1;
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "relative addressing not supported (dst %u)",
+                 inst->dst.number);
+        out->has_error = 1;
+        return -1;
       }
 
       track_register_usage(out, &inst->dst, 1);
+      if (out->has_error) return -1;
 
       /* Track texcoord outputs for VS < 3.0 */
       if (out->shader_type == 1) {
@@ -401,19 +538,45 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
     for (int s = 0; s < src_count; ++s) {
       uint32_t src_token = bytecode[pos++];
       inst->src[s] = decode_src(src_token);
+      if (inst->src[s].type == DX9MT_SM_REG_SAMPLER &&
+          inst->src[s].number > 0u) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "unsupported sampler index %u in instruction source",
+                 inst->src[s].number);
+        out->has_error = 1;
+        return -1;
+      }
 
       /* Skip relative addressing token if present */
       if (inst->src[s].has_relative) {
-        if (pos < dword_count) pos++;
+        if (pos >= dword_count) {
+          snprintf(out->error_msg, sizeof(out->error_msg),
+                   "truncated src relative token at dword %u", pos);
+          out->has_error = 1;
+          return -1;
+        }
+        pos++;
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "relative addressing not supported (src %u)",
+                 inst->src[s].number);
+        out->has_error = 1;
+        return -1;
       }
 
       track_register_usage(out, &inst->src[s], 0);
+      if (out->has_error) return -1;
     }
   }
 
   /* If no explicit color outputs counted for PS, default to 1 */
   if (out->shader_type == 0 && out->num_color_outputs == 0) {
     out->num_color_outputs = 1;
+  }
+
+  if (!saw_end) {
+    snprintf(out->error_msg, sizeof(out->error_msg), "missing END opcode");
+    out->has_error = 1;
+    return -1;
   }
 
   return 0;
