@@ -626,6 +626,14 @@ dx9mt_hash_draw_state(const dx9mt_packet_draw_indexed *packet) {
   hash = dx9mt_hash_u32(hash, packet->rs_alpha_test_enable);
   hash = dx9mt_hash_u32(hash, packet->rs_alpha_ref);
   hash = dx9mt_hash_u32(hash, packet->rs_alpha_func);
+  hash = dx9mt_hash_u32(hash, packet->rs_zenable);
+  hash = dx9mt_hash_u32(hash, packet->rs_zwriteenable);
+  hash = dx9mt_hash_u32(hash, packet->rs_zfunc);
+  hash = dx9mt_hash_u32(hash, packet->rs_stencilenable);
+  hash = dx9mt_hash_u32(hash, packet->rs_stencilfunc);
+  hash = dx9mt_hash_u32(hash, packet->rs_stencilref);
+  hash = dx9mt_hash_u32(hash, packet->rs_stencilmask);
+  hash = dx9mt_hash_u32(hash, packet->rs_stencilwritemask);
   return hash;
 }
 
@@ -3837,6 +3845,7 @@ static void dx9mt_device_init_default_states(dx9mt_device *self) {
 
   self->render_states[D3DRS_ZENABLE] = D3DZB_TRUE;
   self->render_states[D3DRS_ZWRITEENABLE] = TRUE;
+  self->render_states[D3DRS_ZFUNC] = D3DCMP_LESSEQUAL;
   self->render_states[D3DRS_ALPHABLENDENABLE] = FALSE;
   self->render_states[D3DRS_SRCBLEND] = D3DBLEND_ONE;
   self->render_states[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
@@ -3845,6 +3854,11 @@ static void dx9mt_device_init_default_states(dx9mt_device *self) {
   self->render_states[D3DRS_ALPHATESTENABLE] = FALSE;
   self->render_states[D3DRS_ALPHAREF] = 0;
   self->render_states[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
+  self->render_states[D3DRS_STENCILENABLE] = FALSE;
+  self->render_states[D3DRS_STENCILFUNC] = D3DCMP_ALWAYS;
+  self->render_states[D3DRS_STENCILREF] = 0;
+  self->render_states[D3DRS_STENCILMASK] = 0xFFFFFFFFu;
+  self->render_states[D3DRS_STENCILWRITEMASK] = 0xFFFFFFFFu;
 }
 
 static void dx9mt_device_release_bindings(dx9mt_device *self) {
@@ -4968,6 +4982,14 @@ dx9mt_device_fill_draw_texture_stage0(dx9mt_device *self,
   packet->rs_alpha_test_enable = self->render_states[D3DRS_ALPHATESTENABLE];
   packet->rs_alpha_ref = self->render_states[D3DRS_ALPHAREF];
   packet->rs_alpha_func = self->render_states[D3DRS_ALPHAFUNC];
+  packet->rs_zenable = self->render_states[D3DRS_ZENABLE];
+  packet->rs_zwriteenable = self->render_states[D3DRS_ZWRITEENABLE];
+  packet->rs_zfunc = self->render_states[D3DRS_ZFUNC];
+  packet->rs_stencilenable = self->render_states[D3DRS_STENCILENABLE];
+  packet->rs_stencilfunc = self->render_states[D3DRS_STENCILFUNC];
+  packet->rs_stencilref = self->render_states[D3DRS_STENCILREF];
+  packet->rs_stencilmask = self->render_states[D3DRS_STENCILMASK];
+  packet->rs_stencilwritemask = self->render_states[D3DRS_STENCILWRITEMASK];
 
   base_texture = self->textures[0];
   if (!base_texture) {

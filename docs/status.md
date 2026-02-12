@@ -17,7 +17,7 @@ PE32 Frontend (d3d9.dll, i686-mingw32)
       | per-draw: viewport, scissor, VB bytes, IB bytes,
       |           vertex decl, VS/PS constants, texture data,
       |           sampler state, TSS state, blend/alpha state,
-      |           VS/PS shader bytecode
+      |           depth/stencil state, VS/PS shader bytecode
       v
 Native Metal Viewer (dx9mt_metal_viewer, ARM64)
   Polls IPC file for new frames
@@ -28,6 +28,7 @@ Native Metal Viewer (dx9mt_metal_viewer, ARM64)
   Falls back to hardcoded WVP/TSS/c0 path on translation failure
   Samples textures (DXT1/DXT3/DXT5/A8R8G8B8/X8R8G8B8/A8)
   Routes draws to per-render-target Metal textures
+  Depth testing with per-RT Depth32Float textures
   Alpha blending with configurable src/dst blend factors
   Encodes indexed draw calls per frame
   Renders to standalone NSWindow with CAMetalLayer
@@ -37,23 +38,31 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 
 ## Current Verified State (2026-02-12)
 
-- FNV main menu renders correctly with proper colors and alpha blending
+- FNV main menu renders correctly with proper colors, alpha blending, and depth testing
 - Yellow menu text (PS constant c0 tint applied), textured backgrounds, UI atlas elements
 - ~19 draws/frame across DXT1, DXT3, DXT5, A8R8G8B8 textures
 - Texture caching by (object_id, generation) with periodic 60-frame refresh
 - Full D3D9 fixed-function TSS combiner evaluation in Metal fragment shader
-- **D3D9 SM2.0/SM3.0 shader bytecode → MSL transpiler** (RB3 Phase 3):
+- **D3D9 SM2.0/SM3.0 shader bytecode -> MSL transpiler** (RB3 Phase 3):
   - Bytecode parser: dcl, def, arithmetic, texture, matrix multiply instructions
   - MSL emitter: register mapping, swizzle, write mask, source modifiers, _sat
-  - Shader function cache (bytecode hash → MTLFunction) with sticky failure
-  - Translated PSO cache (combined key → MTLRenderPipelineState)
+  - Shader function cache (bytecode hash -> MTLFunction) with sticky failure
+  - Translated PSO cache (combined key -> MTLRenderPipelineState)
   - Automatic fallback to TSS/c0 hardcoded path on parse/compile failure
   - POSITIONT draws skip translation (use synthetic screen-to-NDC matrix)
   - `DX9MT_SHADER_TRANSLATE=0` env var disables for A/B comparison
+- **Depth/stencil support** (RB4):
+  - Depth/stencil render state transmission through full pipeline (packet -> backend -> IPC)
+  - Per-render-target Depth32Float texture cache (drawable + offscreen RTs)
+  - MTLDepthStencilState cache keyed by (zenable, zwriteenable, zfunc)
+  - Depth attachment on every render pass (Clear with game's clear_z on first use, Load on subsequent)
+  - Per-draw depth stencil state binding
+  - All PSO pipelines (geometry, translated shader, overlay) include depth format
+  - Stencil state fields transmitted (enable, func, ref, mask, writemask) for future use
 - Render-target texture routing: draws to offscreen RTs available as shader inputs
 - FVF-to-vertex-declaration conversion for legacy FVF draws
 - Alpha blending (SRCALPHA/INVSRCALPHA) and alpha test with configurable function
-- D3D9 default state initialization (TSS, sampler, render states)
+- D3D9 default state initialization (TSS, sampler, render states, depth/stencil)
 - Texture generation tracking: dirty on Lock/Unlock, AddDirtyRect, surface copy
 - Mouse interaction audible (game audio works, cursor movement detected)
 - No contract violations in packet stream
@@ -71,10 +80,11 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 | RB3 Phase 2A | Done | Texture data transmission, caching, DXT/ARGB format support |
 | RB3 Phase 2B | Done | Sampler state, TSS fixed-function combiners, blend state, alpha test |
 | RB3 Phase 2C | Done | PS constant c0 tint for pixel shader draws, render-target routing |
-| RB3 Phase 3 | Done | D3D9 SM2/SM3 bytecode → MSL transpiler, shader cache, PSO cache |
-| RB4 | Next | Depth/stencil state, pass structure, clear-pass fusion |
-| RB5 | Pending | Performance: state dedup, buffer recycling, pipeline cache, async compile |
-| RB6 | Pending | Compatibility hardening: missing stubs, edge cases, in-game rendering |
+| RB3 Phase 3 | Done | D3D9 SM2/SM3 bytecode -> MSL transpiler, shader cache, PSO cache |
+| RB4 | Done | Depth/stencil state, depth textures, per-draw depth testing |
+| RB5 | Next | In-game rendering: cull mode, fog, multi-texture, shader hardening |
+| RB6 | Pending | Performance: state dedup, buffer recycling, pipeline cache, async compile |
+| RB7 | Pending | Compatibility hardening: missing stubs, edge cases, Wine unix lib |
 
 ## Build & Run
 
@@ -128,6 +138,8 @@ DX9MT_SHADER_TRANSLATE=0 make run
 Press 'D' in the viewer window to write per-draw state to `/tmp/dx9mt_frame_dump.txt`. Shows:
 - Resolution, draw count, clear color, present render target
 - Per-draw: primitive type/count, vertex format, texture info, TSS state, blend state
+- Depth state: enable, write enable, compare function
+- Stencil state: enable, function, ref, mask, write mask
 - Sampler state, viewport, vertex data samples
 - Shader bytecode: VS/PS IDs, bytecode size, version token, first 4 DWORDs
 - `upload=0` means texture is cached (not missing), `upload=N` means N bytes uploaded this frame
@@ -159,11 +171,11 @@ dx9mt/
   src/common/
     log.c                  Timestamped file/stderr logging
   src/tools/
-    metal_viewer.m         Standalone native Metal viewer (~2400 lines, reads IPC, renders)
+    metal_viewer.m         Standalone native Metal viewer (~2600 lines, reads IPC, renders)
     d3d9_shader_parse.h    SM2/SM3 bytecode parser: IR structs + API
     d3d9_shader_parse.c    Bytecode parser implementation (~470 lines)
     d3d9_shader_emit_msl.h MSL emitter API
-    d3d9_shader_emit_msl.c D3D9 IR → MSL source emitter (~530 lines)
+    d3d9_shader_emit_msl.c D3D9 IR -> MSL source emitter (~530 lines)
   tests/
     backend_bridge_contract_test.c   10 contract tests
 ```

@@ -15,7 +15,7 @@
 - [x] Alpha test state (enable, ref, func)
 - [x] D3D9 default state initialization (TSS, sampler, render states)
 - [x] Render-target metadata per draw (RT id, texture id, size, format)
-- [x] Render-target texture routing (offscreen RT → shader-readable for later draws)
+- [x] Render-target texture routing (offscreen RT -> shader-readable for later draws)
 - [x] Present packet carries render_target_id for primary RT hint
 - [x] RT-to-texture override cache persists across frames
 - [x] FVF-to-vertex-declaration conversion for legacy draws
@@ -27,42 +27,63 @@
 - [x] Add vertex_shader_id to IPC draw entry (was missing)
 - [x] D3D9 SM2.0/SM3.0 bytecode parser (version token, instructions, dcl, def)
 - [x] Register token decoding (type, number, swizzle, write mask, source/result modifiers)
-- [x] Register mapping: D3D9 registers → MSL variables (r#, v#, c#, s#, oPos, oD#, oT#, oC#)
+- [x] Register mapping: D3D9 registers -> MSL variables (r#, v#, c#, s#, oPos, oD#, oT#, oC#)
 - [x] VS instruction emitter: dp3, dp4, mov, add, sub, mul, mad, rcp, rsq, min, max, slt, sge, exp, log, lit, dst, lrp, frc, pow, crs, abs, nrm, sincos, mova, m4x4, m4x3, m3x4, m3x3, m3x2
 - [x] PS instruction emitter: texld, texldl, texkill, mov, mul, add, mad, cmp, lrp, dp2add + all VS arithmetic ops
 - [x] Swizzle emission, write mask application, source modifiers (negate, abs, complement, x2, bias)
-- [x] Result modifier _sat → saturate()
+- [x] Result modifier _sat -> saturate()
 - [x] MSL source compilation via newLibraryWithSource + function cache by bytecode hash
 - [x] Translated PSO creation and caching by (vs_hash, ps_hash, vertex layout, blend state)
 - [x] Fallback to hardcoded TSS/c0 path on parse/compile failure (sticky cache)
 - [x] POSITIONT draws skip translation (use existing synthetic matrix path)
 - [x] DX9MT_SHADER_TRANSLATE=0 env var for A/B comparison
 
-## Current Priority: RB4 -- Depth/Stencil + Pass Structure
+## Completed: RB4 -- Depth/Stencil Support
 
-- [ ] Transmit depth/stencil render state values in draw packet
-- [ ] Create MTLDepthStencilState from D3D9 state
-- [ ] Depth texture attachment per render pass
-- [ ] Stencil state (enable, func, pass/fail ops)
-- [ ] Explicit clear behavior per non-primary render target
-- [ ] Blend-op fidelity (D3DRS_BLENDOP: ADD, SUBTRACT, etc.)
-- [ ] Separate alpha blend support
+- [x] Transmit depth render states (ZENABLE, ZWRITEENABLE, ZFUNC) in draw packet
+- [x] Transmit stencil render states (STENCILENABLE, STENCILFUNC, STENCILREF, STENCILMASK, STENCILWRITEMASK)
+- [x] Mirror depth/stencil fields through backend bridge (draw command struct, hash, IPC copy)
+- [x] D3D9 default state initialization for depth (ZFUNC=LESSEQUAL) and stencil
+- [x] D3DCMP_* -> MTLCompareFunction conversion
+- [x] Per-render-target Depth32Float texture cache
+- [x] Drawable depth texture creation/caching
+- [x] MTLDepthStencilState cache keyed by (zenable, zwriteenable, zfunc)
+- [x] depthAttachmentPixelFormat on all PSO creation paths (geometry, translated, overlay)
+- [x] Depth attachment on every render pass (Clear with clear_z on first use, Load on subsequent)
+- [x] Per-draw [encoder setDepthStencilState:] binding
+- [x] Static no-depth state for overlay draws (always pass, no write)
+- [x] Depth/stencil state in frame dump
+- [x] Contract test defaults updated with depth/stencil values
+- [x] Clean build, all 10 contract tests passing
+- [x] FNV main menu still renders correctly (depth state transparent for 2D menu)
 
-## Next: Shader Translation Hardening
+## Current Priority: RB5 -- In-Game Rendering
 
-- [ ] Test with FNV, fix MSL compilation issues from real game bytecode
+### Shader Translation Hardening
 - [ ] Flow control translation (if/else/endif, rep/endrep, break/breakc)
 - [ ] Relative addressing (a0 register for dynamic constant indexing)
 - [ ] Multi-texture support in translated PS (tex1..tex7 bindings)
 - [ ] VS/PS interface linkage validation (match output semantics to input semantics)
 
+### Render State Coverage
+- [ ] Cull mode (D3DRS_CULLMODE -> MTLCullMode)
+- [ ] Fog state (D3DRS_FOGENABLE, fog color, fog mode)
+- [ ] Fill mode (D3DRS_FILLMODE -> MTLTriangleFillMode)
+- [ ] Stencil operations (D3DRS_STENCILPASS, STENCILFAIL, STENCILZFAIL)
+- [ ] Blend-op fidelity (D3DRS_BLENDOP: ADD, SUBTRACT, REVSUBTRACT, MIN, MAX)
+- [ ] Separate alpha blend support (D3DRS_SEPARATEALPHABLENDENABLE)
+
+### Multi-texture
+- [ ] Texture stages 1-7 data transmission
+- [ ] Multiple texture/sampler bindings in translated shaders
+
 ## Later
 
 - [ ] Wine unix lib integration (__wine_unix_call, zero-copy)
-- [ ] Multi-texture stages (stages 1-7)
-- [ ] Fog state
-- [ ] Cull mode / fill mode render states
 - [ ] Buffer ring allocator (replace per-draw newBufferWithBytes)
-- [ ] PSO cache by full (vertex layout + blend + depth) hash
+- [ ] PSO cache persistence (serialize to disk)
 - [ ] Async shader compilation
 - [ ] In-game rendering validation (gameplay, save/load)
+- [ ] Skinned mesh support (blend weights/indices)
+- [ ] Multiple render target (MRT) support
+- [ ] Shadow pass rendering

@@ -59,6 +59,15 @@ static dx9mt_packet_draw_indexed make_valid_draw_packet(uint32_t sequence) {
   packet.constants_ps.offset = 4096;
   packet.constants_ps.size = 4096;
   packet.state_block_hash = 0x0BADF00Du;
+  /* RB4: depth/stencil defaults (D3D9 defaults) */
+  packet.rs_zenable = 1;          /* D3DZB_TRUE */
+  packet.rs_zwriteenable = 1;     /* TRUE */
+  packet.rs_zfunc = 4;            /* D3DCMP_LESSEQUAL */
+  packet.rs_stencilenable = 0;    /* FALSE */
+  packet.rs_stencilfunc = 8;      /* D3DCMP_ALWAYS */
+  packet.rs_stencilref = 0;
+  packet.rs_stencilmask = 0xFFFFFFFFu;
+  packet.rs_stencilwritemask = 0xFFFFFFFFu;
   return packet;
 }
 

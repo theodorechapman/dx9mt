@@ -110,6 +110,16 @@ typedef struct dx9mt_metal_ipc_draw {
   uint32_t vs_bytecode_bulk_size;
   uint32_t ps_bytecode_bulk_offset;
   uint32_t ps_bytecode_bulk_size;
+
+  /* RB4: depth/stencil render states */
+  uint32_t rs_zenable;
+  uint32_t rs_zwriteenable;
+  uint32_t rs_zfunc;
+  uint32_t rs_stencilenable;
+  uint32_t rs_stencilfunc;
+  uint32_t rs_stencilref;
+  uint32_t rs_stencilmask;
+  uint32_t rs_stencilwritemask;
 } dx9mt_metal_ipc_draw;
 
 typedef struct dx9mt_metal_ipc_header {

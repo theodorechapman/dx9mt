@@ -194,6 +194,14 @@ static NSMutableDictionary *s_vs_func_cache;  /* bytecode_hash -> id<MTLFunction
 static NSMutableDictionary *s_ps_func_cache;
 static NSMutableDictionary *s_translated_pso_cache;  /* combined_key -> id<MTLRenderPipelineState> */
 
+/* RB4: depth/stencil */
+static NSMutableDictionary *s_depth_texture_cache;  /* rt_id -> id<MTLTexture> (Depth32Float) */
+static id<MTLTexture> s_drawable_depth_texture;
+static uint32_t s_drawable_depth_w;
+static uint32_t s_drawable_depth_h;
+static NSMutableDictionary *s_depth_stencil_cache;  /* key -> id<MTLDepthStencilState> */
+static id<MTLDepthStencilState> s_no_depth_state;   /* always-pass, no write (overlay) */
+
 static NSString *const s_shader_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
@@ -843,6 +851,87 @@ static MTLBlendFactor d3d_blend_to_mtl(uint32_t blend, int is_source) {
   }
 }
 
+static MTLCompareFunction d3d_cmp_to_mtl(uint32_t func) {
+  switch (func) {
+  case D3DCMP_NEVER:        return MTLCompareFunctionNever;
+  case D3DCMP_LESS:         return MTLCompareFunctionLess;
+  case D3DCMP_EQUAL:        return MTLCompareFunctionEqual;
+  case D3DCMP_LESSEQUAL:    return MTLCompareFunctionLessEqual;
+  case D3DCMP_GREATER:      return MTLCompareFunctionGreater;
+  case D3DCMP_NOTEQUAL:     return MTLCompareFunctionNotEqual;
+  case D3DCMP_GREATEREQUAL: return MTLCompareFunctionGreaterEqual;
+  case D3DCMP_ALWAYS:       return MTLCompareFunctionAlways;
+  default:                  return MTLCompareFunctionAlways;
+  }
+}
+
+static id<MTLTexture> depth_texture_for_rt(uint32_t rt_id, uint32_t w,
+                                           uint32_t h) {
+  NSNumber *key = @(rt_id);
+  id<MTLTexture> cached = [s_depth_texture_cache objectForKey:key];
+  if (cached && cached.width == w && cached.height == h) {
+    return cached;
+  }
+  MTLTextureDescriptor *desc = [MTLTextureDescriptor
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                   width:w
+                                  height:h
+                               mipmapped:NO];
+  desc.usage = MTLTextureUsageRenderTarget;
+  desc.storageMode = MTLStorageModePrivate;
+  id<MTLTexture> tex = [s_device newTextureWithDescriptor:desc];
+  if (tex) {
+    [s_depth_texture_cache setObject:tex forKey:key];
+  }
+  return tex;
+}
+
+static id<MTLTexture> ensure_drawable_depth_texture(uint32_t w, uint32_t h) {
+  if (s_drawable_depth_texture && s_drawable_depth_w == w &&
+      s_drawable_depth_h == h) {
+    return s_drawable_depth_texture;
+  }
+  MTLTextureDescriptor *desc = [MTLTextureDescriptor
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                   width:w
+                                  height:h
+                               mipmapped:NO];
+  desc.usage = MTLTextureUsageRenderTarget;
+  desc.storageMode = MTLStorageModePrivate;
+  s_drawable_depth_texture = [s_device newTextureWithDescriptor:desc];
+  s_drawable_depth_w = w;
+  s_drawable_depth_h = h;
+  return s_drawable_depth_texture;
+}
+
+static id<MTLDepthStencilState>
+depth_stencil_state_for_draw(const volatile dx9mt_metal_ipc_draw *d) {
+  uint32_t zenable = d->rs_zenable;
+  uint32_t zwrite = d->rs_zwriteenable;
+  uint32_t zfunc = d->rs_zfunc;
+  uint64_t key_val = (uint64_t)zenable | ((uint64_t)zwrite << 8) |
+                     ((uint64_t)zfunc << 16);
+  NSNumber *key = @(key_val);
+  id<MTLDepthStencilState> cached = [s_depth_stencil_cache objectForKey:key];
+  if (cached) {
+    return cached;
+  }
+  MTLDepthStencilDescriptor *desc = [[MTLDepthStencilDescriptor alloc] init];
+  if (zenable) {
+    desc.depthCompareFunction = d3d_cmp_to_mtl(zfunc);
+    desc.depthWriteEnabled = (zwrite != 0) ? YES : NO;
+  } else {
+    desc.depthCompareFunction = MTLCompareFunctionAlways;
+    desc.depthWriteEnabled = NO;
+  }
+  id<MTLDepthStencilState> state =
+      [s_device newDepthStencilStateWithDescriptor:desc];
+  if (state) {
+    [s_depth_stencil_cache setObject:state forKey:key];
+  }
+  return state;
+}
+
 static MTLSamplerMipFilter d3d_filter_to_mtl_mip(uint32_t filter) {
   if (filter == D3DTEXF_POINT) {
     return MTLSamplerMipFilterNearest;
@@ -1146,6 +1235,7 @@ static void ensure_geometry_pso(uint32_t stride,
                                         : @"geo_fragment")];
   desc.vertexDescriptor = vd;
   desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
   if (blend_enable) {
     MTLBlendFactor src = d3d_blend_to_mtl(eff_src_blend, 1);
     MTLBlendFactor dst = d3d_blend_to_mtl(eff_dst_blend, 0);
@@ -1219,6 +1309,18 @@ static int init_metal(void) {
   s_vs_func_cache = [[NSMutableDictionary alloc] init];
   s_ps_func_cache = [[NSMutableDictionary alloc] init];
   s_translated_pso_cache = [[NSMutableDictionary alloc] init];
+  s_depth_texture_cache = [[NSMutableDictionary alloc] init];
+  s_depth_stencil_cache = [[NSMutableDictionary alloc] init];
+
+  /* Create "no depth" state for overlay draws */
+  {
+    MTLDepthStencilDescriptor *no_depth_desc =
+        [[MTLDepthStencilDescriptor alloc] init];
+    no_depth_desc.depthCompareFunction = MTLCompareFunctionAlways;
+    no_depth_desc.depthWriteEnabled = NO;
+    s_no_depth_state =
+        [s_device newDepthStencilStateWithDescriptor:no_depth_desc];
+  }
 
   /* Overlay PSO (same as RB1) */
   {
@@ -1227,6 +1329,7 @@ static int init_metal(void) {
     desc.vertexFunction = [s_library newFunctionWithName:@"overlay_vertex"];
     desc.fragmentFunction = [s_library newFunctionWithName:@"overlay_fragment"];
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     desc.colorAttachments[0].blendingEnabled = YES;
     desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
     desc.colorAttachments[0].destinationRGBBlendFactor =
@@ -1561,6 +1664,7 @@ static id<MTLRenderPipelineState> create_translated_pso(
   desc.fragmentFunction = ps_func;
   desc.vertexDescriptor = vd;
   desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
   if (blend_enable) {
     desc.colorAttachments[0].blendingEnabled = YES;
@@ -1674,6 +1778,11 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
             d3d_blend_name(d->rs_dest_blend));
     fprintf(f, "  alpha_test: enable=%u  ref=%u  func=%u\n",
             d->rs_alpha_test_enable, d->rs_alpha_ref, d->rs_alpha_func);
+    fprintf(f, "  depth: enable=%u  write=%u  func=%u\n",
+            d->rs_zenable, d->rs_zwriteenable, d->rs_zfunc);
+    fprintf(f, "  stencil: enable=%u  func=%u  ref=%u  mask=0x%08x  writemask=0x%08x\n",
+            d->rs_stencilenable, d->rs_stencilfunc, d->rs_stencilref,
+            d->rs_stencilmask, d->rs_stencilwritemask);
 
     /* Buffer sizes */
     fprintf(f, "  vb: offset=%u size=%u  ib: offset=%u size=%u\n",
@@ -1841,6 +1950,14 @@ static void render_frame(const volatile unsigned char *ipc_base) {
     NSMutableSet *cleared_targets = [[NSMutableSet alloc] init];
     NSNumber *drawable_key = @(0u);
 
+    /* RB4: depth clear value from Clear() call */
+    float clear_depth = 1.0f;
+    int clear_depth_flag = 0;
+    if (hdr->have_clear) {
+      clear_depth = hdr->clear_z;
+      clear_depth_flag = (hdr->clear_flags & 0x2) ? 1 : 0;
+    }
+
     /* RB3: Render actual geometry from per-draw IPC data */
     for (uint32_t i = 0; i < draw_count && i < DX9MT_METAL_IPC_MAX_DRAWS;
          ++i) {
@@ -1888,6 +2005,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         MTLRenderPassDescriptor *pass_desc;
         NSNumber *target_key;
         BOOL seen_target;
+        id<MTLTexture> depth_tex = nil;
 
         if (encoder) {
           [encoder endEncoding];
@@ -1908,6 +2026,29 @@ static void render_frame(const volatile unsigned char *ipc_base) {
             pass_desc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
           }
           [cleared_targets addObject:target_key];
+        }
+
+        /* RB4: attach depth texture */
+        if (target_is_drawable) {
+          depth_tex = ensure_drawable_depth_texture(s_width, s_height);
+        } else {
+          depth_tex = depth_texture_for_rt(
+              draw_rt_id, d->render_target_width, d->render_target_height);
+        }
+        if (depth_tex) {
+          pass_desc.depthAttachment.texture = depth_tex;
+          pass_desc.depthAttachment.storeAction = MTLStoreActionStore;
+          if (seen_target) {
+            pass_desc.depthAttachment.loadAction = MTLLoadActionLoad;
+          } else {
+            if (target_is_drawable && clear_depth_flag) {
+              pass_desc.depthAttachment.loadAction = MTLLoadActionClear;
+              pass_desc.depthAttachment.clearDepth = clear_depth;
+            } else {
+              pass_desc.depthAttachment.loadAction = MTLLoadActionClear;
+              pass_desc.depthAttachment.clearDepth = 1.0;
+            }
+          }
         }
 
         encoder = [cmd_buf renderCommandEncoderWithDescriptor:pass_desc];
@@ -2186,6 +2327,14 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         }
       }
 
+      /* RB4: set depth/stencil state per draw */
+      {
+        id<MTLDepthStencilState> ds_state = depth_stencil_state_for_draw(d);
+        if (ds_state) {
+          [encoder setDepthStencilState:ds_state];
+        }
+      }
+
       [encoder drawIndexedPrimitives:d3d_prim_to_mtl(d->primitive_type)
                           indexCount:index_count
                            indexType:mtl_index_type
@@ -2222,6 +2371,16 @@ static void render_frame(const volatile unsigned char *ipc_base) {
           overlay_desc.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, a);
           [cleared_targets addObject:drawable_key];
         }
+        /* RB4: overlay depth attachment (required by PSO, but unused) */
+        {
+          id<MTLTexture> overlay_depth =
+              ensure_drawable_depth_texture(s_width, s_height);
+          if (overlay_depth) {
+            overlay_desc.depthAttachment.texture = overlay_depth;
+            overlay_desc.depthAttachment.loadAction = MTLLoadActionDontCare;
+            overlay_desc.depthAttachment.storeAction = MTLStoreActionDontCare;
+          }
+        }
         encoder = [cmd_buf renderCommandEncoderWithDescriptor:overlay_desc];
         active_target_is_drawable = 1;
         active_rt_id = 0;
@@ -2256,6 +2415,9 @@ static void render_frame(const volatile unsigned char *ipc_base) {
                      {ndc_x, ndc_y, ndc_w, ndc_h}};
 
       [encoder setRenderPipelineState:s_overlay_pso];
+      if (s_no_depth_state) {
+        [encoder setDepthStencilState:s_no_depth_state];
+      }
       [encoder setVertexBytes:&constants
                        length:sizeof(constants)
                       atIndex:0];

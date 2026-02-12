@@ -2,58 +2,56 @@
 
 ## Where We Are
 
-RB3 Phase 3 complete. The Metal viewer now has a full D3D9 SM2.0/SM3.0 bytecode-to-MSL transpiler. Shader bytecode is transmitted from the frontend through IPC, parsed into an intermediate representation, emitted as MSL source, compiled with Metal, and cached. Draws with translated shaders use the full constant arrays instead of the hardcoded WVP/c0 approximations. The existing TSS combiner and c0 tint fallback paths remain as automatic fallback when translation fails.
+RB4 complete. The full data pipeline from frontend render state capture through IPC to Metal depth testing is operational. The Metal viewer creates per-render-target Depth32Float textures, caches MTLDepthStencilState objects, attaches depth to every render pass, and binds depth state per draw. All three PSO paths (fixed-function geometry, translated shader, overlay) include the depth format. Stencil state fields are transmitted but not yet consumed for stencil operations.
 
-## Immediate Next: Shader Translation Hardening
+The FNV main menu continues to render correctly -- the menu is 2D so depth state is effectively transparent (zenable=1, zwrite=1, zfunc=LESSEQUAL with all geometry at the same depth).
+
+## Immediate Next: RB5 -- In-Game Rendering
 
 ### The situation
 
-The transpiler is structurally complete but untested against real FNV bytecode. The first run will likely surface MSL compilation errors from:
-- VS/PS interface mismatches (output struct fields must match input struct fields)
-- Missing attribute mappings (vertex elements the shader expects but the PSO doesn't declare)
-- Edge cases in register usage or instruction patterns FNV shaders actually use
+The main menu is fully rendering. To advance into gameplay, the viewer needs to handle the more diverse rendering that FNV uses in-game: 3D geometry with actual depth variation, potentially skinned meshes, landscape, multiple render targets, shadow passes, and more shader variety.
+
+### Shader Translation Hardening
+
+The transpiler handles FNV's menu shaders but gameplay shaders may use:
+1. **Flow control** -- `if`/`else`/`endif`, `rep`/`endrep`, `break`/`breakc` (currently emitted as comments)
+2. **Relative addressing** -- `a0` register for dynamic constant array indexing (`c[a0.x + N]`)
+3. **Multi-texture** -- gameplay PS may sample from multiple texture stages
+4. **More instruction patterns** -- any SM2/SM3 opcodes not yet seen in the menu
+
+### Render State Coverage
+
+Gameplay draws will exercise render states the menu doesn't use:
+- **Cull mode** -- back-face culling for 3D geometry
+- **Fog** -- distance fog in outdoor scenes
+- **Stencil operations** -- shadow volumes, UI masking (state already transmitted, need MTL stencil ops)
+- **Blend operations** -- SUBTRACT, REVSUBTRACT, MIN, MAX (currently only ADD)
+- **Separate alpha blend** -- independent alpha channel blend factors
 
 ### Steps
 
-1. **Run FNV** and examine stderr for shader compilation errors
-2. **Fix MSL compilation issues** one by one -- the error messages include the full MSL source and parsed IR for diagnosis
-3. **A/B comparison** with `DX9MT_SHADER_TRANSLATE=0` to verify translated output matches the existing fallback
-4. **Flow control** -- if FNV's gameplay shaders use `if`/`else`/`endif` or `rep`/`endrep`, implement proper MSL emission (currently emitted as comments)
-5. **Relative addressing** -- `a0` register for dynamic constant array indexing (`c[a0.x + N]`)
-
-## After Hardening: RB4 -- Depth/Stencil + Pass Structure
-
-### Depth state
-
-Need actual render state values for:
-- `D3DRS_ZENABLE`, `D3DRS_ZWRITEENABLE`, `D3DRS_ZFUNC`
-
-Maps to `MTLDepthStencilDescriptor` -> `MTLDepthStencilState`. Also needs a depth texture attachment on the render pass. Without this, z-fighting and draw-order artifacts will appear in gameplay.
-
-### Stencil state
-
-- `D3DRS_STENCILENABLE`, `D3DRS_STENCILFUNC`, `D3DRS_STENCILPASS`, etc.
-
-FNV uses stencil for shadow volumes and some UI masking.
+1. **Enter FNV gameplay** -- start a new game or load a save, observe what breaks
+2. **Fix shader compilation errors** -- stderr will show full MSL source for failures
+3. **Add missing render states** as needed (cull, fog, stencil ops)
+4. **Multi-texture** -- when gameplay PS samples multiple textures
+5. **Validate depth correctness** -- 3D scenes should have proper occlusion now
 
 ## Medium Term
-
-### Blend-op fidelity
-Currently only SRCALPHA/INVSRCALPHA is tested. Need full `D3DRS_BLENDOP` (ADD, SUBTRACT, REVSUBTRACT, MIN, MAX) and separate alpha blend support.
 
 ### Wine unix lib integration
 Replace IPC with in-process `__wine_unix_call` for zero-copy data sharing and synchronized present. The `libdx9mt_unixlib.dylib` is already built with Metal support.
 
-### In-game rendering
-FNV gameplay uses much more diverse rendering: skinned meshes, landscape, multiple render targets, shadow passes. Requires all of the above plus:
-- Multi-texture stages (stages 1-7) in translated shaders
-- Fog state
-- Cull mode / fill mode render states
-- More vertex declaration formats
+### Performance optimization
+- Buffer ring allocator to replace per-draw `newBufferWithBytes` allocations
+- State deduplication to avoid redundant PSO/DSS lookups
+- PSO cache serialization to disk for faster startup
+- Async shader compilation to avoid hitching on new shaders
 
 ## Priority Order
 
-1. **Shader translation hardening** -- fix MSL compilation issues with real FNV bytecode
-2. **Depth/stencil state** -- prevents z-fighting and draw ordering issues in gameplay
-3. **Wine unix lib integration** -- performance, zero-copy, proper architecture
-4. **In-game render state coverage** -- fog, cull, multi-texture, etc.
+1. **In-game rendering** -- enter gameplay, fix what breaks
+2. **Shader hardening** -- flow control, relative addressing, multi-texture
+3. **Render state coverage** -- cull, fog, stencil ops
+4. **Wine unix lib integration** -- performance, zero-copy, proper architecture
+5. **Performance optimization** -- buffer recycling, state dedup, async compile

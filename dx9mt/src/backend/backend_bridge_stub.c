@@ -149,6 +149,16 @@ typedef struct dx9mt_backend_draw_command {
   uint32_t vs_bytecode_dwords;
   dx9mt_upload_ref ps_bytecode;
   uint32_t ps_bytecode_dwords;
+
+  /* RB4: depth/stencil render states */
+  uint32_t rs_zenable;
+  uint32_t rs_zwriteenable;
+  uint32_t rs_zfunc;
+  uint32_t rs_stencilenable;
+  uint32_t rs_stencilfunc;
+  uint32_t rs_stencilref;
+  uint32_t rs_stencilmask;
+  uint32_t rs_stencilwritemask;
 } dx9mt_backend_draw_command;
 
 #define DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME 8192u
@@ -268,6 +278,14 @@ dx9mt_backend_draw_command_hash(const dx9mt_backend_draw_command *command) {
   hash = dx9mt_backend_hash_u32(hash, command->rs_alpha_test_enable);
   hash = dx9mt_backend_hash_u32(hash, command->rs_alpha_ref);
   hash = dx9mt_backend_hash_u32(hash, command->rs_alpha_func);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_zenable);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_zwriteenable);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_zfunc);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_stencilenable);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_stencilfunc);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_stencilref);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_stencilmask);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_stencilwritemask);
   hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_vs);
   hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_ps);
   return hash;
@@ -668,6 +686,14 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
   command->rs_alpha_test_enable = draw_packet->rs_alpha_test_enable;
   command->rs_alpha_ref = draw_packet->rs_alpha_ref;
   command->rs_alpha_func = draw_packet->rs_alpha_func;
+  command->rs_zenable = draw_packet->rs_zenable;
+  command->rs_zwriteenable = draw_packet->rs_zwriteenable;
+  command->rs_zfunc = draw_packet->rs_zfunc;
+  command->rs_stencilenable = draw_packet->rs_stencilenable;
+  command->rs_stencilfunc = draw_packet->rs_stencilfunc;
+  command->rs_stencilref = draw_packet->rs_stencilref;
+  command->rs_stencilmask = draw_packet->rs_stencilmask;
+  command->rs_stencilwritemask = draw_packet->rs_stencilwritemask;
   command->constants_vs = draw_packet->constants_vs;
   command->constants_ps = draw_packet->constants_ps;
   command->viewport_x = draw_packet->viewport_x;
@@ -1131,6 +1157,14 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       d->rs_alpha_test_enable = cmd->rs_alpha_test_enable;
       d->rs_alpha_ref = cmd->rs_alpha_ref;
       d->rs_alpha_func = cmd->rs_alpha_func;
+      d->rs_zenable = cmd->rs_zenable;
+      d->rs_zwriteenable = cmd->rs_zwriteenable;
+      d->rs_zfunc = cmd->rs_zfunc;
+      d->rs_stencilenable = cmd->rs_stencilenable;
+      d->rs_stencilfunc = cmd->rs_stencilfunc;
+      d->rs_stencilref = cmd->rs_stencilref;
+      d->rs_stencilmask = cmd->rs_stencilmask;
+      d->rs_stencilwritemask = cmd->rs_stencilwritemask;
 
       /* Copy VB data into bulk region */
       data = dx9mt_frontend_upload_resolve(&cmd->vertex_data);

@@ -104,6 +104,23 @@ The Metal viewer now has four tiers for fragment shading, tried in order:
 ### D3D9 TSS state is irrelevant when a pixel shader is active
 When a pixel shader is bound, D3D9 completely ignores texture stage state. Games may set TSS to anything (including DISABLE) while a pixel shader handles all texturing. The viewer mirrors this: `use_stage0_combiner` is only set when `pixel_shader_id == 0`.
 
+## Depth/Stencil (RB4)
+
+### Metal requires depth format on PSO even if depth test is disabled
+All PSOs that render into a pass with a depth attachment must declare `depthAttachmentPixelFormat`. Even the overlay PSO (which doesn't care about depth) needs this set to `Depth32Float` because the render pass has a depth attachment. Without it, Metal will fail PSO creation with a format mismatch.
+
+### Depth textures are per-render-target, not per-frame
+Each render target (including the drawable) needs its own `Depth32Float` texture. The viewer caches these in `s_depth_texture_cache` keyed by RT ID, and separately caches the drawable depth texture. When a render target changes size, the depth texture is recreated. Depth textures use `MTLStorageModePrivate` since they never need CPU access.
+
+### Depth clear follows the game's Clear() flags
+D3D9's `Clear()` has separate flags for color (0x1) and depth (0x2). The depth clear value (`clear_z`) is transmitted through IPC in the frame header. On first use of a render target, if the game issued a depth clear, the render pass uses `MTLLoadActionClear` with the game's clear_z value. On subsequent uses (when the target was already rendered to this frame), the pass uses `MTLLoadActionLoad` to preserve the depth buffer.
+
+### 2D menu rendering is depth-transparent
+FNV's main menu draws 2D quads (POSITIONT) with default depth state (zenable=1, zwrite=1, zfunc=LESSEQUAL). Since all geometry is at the same depth, depth testing passes for everything and the result is identical to no depth test. This means RB4 can be validated by checking that the menu still looks correct -- any regression would indicate a PSO or render pass configuration bug.
+
+### Stencil state fields are transmitted but not yet consumed
+The 5 stencil fields (enable, func, ref, mask, writemask) are transmitted through the full pipeline and visible in frame dumps, but the Metal viewer doesn't create stencil textures or configure stencil operations on the MTLDepthStencilDescriptor yet. This is deferred to when FNV gameplay actually uses stencil (shadow volumes, UI masking).
+
 ## Debugging
 
 ### Frame dump for per-draw diagnosis

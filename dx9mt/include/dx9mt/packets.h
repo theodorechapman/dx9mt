@@ -125,6 +125,16 @@ typedef struct dx9mt_packet_draw_indexed {
   uint32_t vs_bytecode_dwords;
   dx9mt_upload_ref ps_bytecode;
   uint32_t ps_bytecode_dwords;
+
+  /* RB4: depth/stencil render states */
+  uint32_t rs_zenable;
+  uint32_t rs_zwriteenable;
+  uint32_t rs_zfunc;
+  uint32_t rs_stencilenable;
+  uint32_t rs_stencilfunc;
+  uint32_t rs_stencilref;
+  uint32_t rs_stencilmask;
+  uint32_t rs_stencilwritemask;
 } dx9mt_packet_draw_indexed;
 
 typedef struct dx9mt_packet_present {
