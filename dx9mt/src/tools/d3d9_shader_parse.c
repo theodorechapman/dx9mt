@@ -306,10 +306,11 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         dcl->reg_type = (uint8_t)decode_reg_type(reg_token);
         dcl->reg_number = decode_reg_number(reg_token);
         dcl->write_mask = (uint8_t)((reg_token >> 16) & 0xFu);
-        if (dcl->reg_type == DX9MT_SM_REG_SAMPLER &&
+        if (out->shader_type == 0 &&
+            dcl->reg_type == DX9MT_SM_REG_SAMPLER &&
             dcl->reg_number > 0u) {
           snprintf(out->error_msg, sizeof(out->error_msg),
-                   "unsupported sampler index %u (multi-texture path not implemented)",
+                   "unsupported PS sampler index %u (multi-texture path not implemented)",
                    dcl->reg_number);
           out->has_error = 1;
           return -1;
@@ -419,44 +420,15 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
       continue;
     }
 
-    /* Flow control */
-    if (opcode == DX9MT_SM_OP_REP || opcode == DX9MT_SM_OP_IF) {
-      /* rep i# / if b# : flow control not yet supported */
-      if (pos + 1 > dword_count) {
-        snprintf(out->error_msg, sizeof(out->error_msg),
-                 "truncated flow control at dword %u", pos);
-        out->has_error = 1;
-        return -1;
-      }
-      pos += 1;
-      snprintf(out->error_msg, sizeof(out->error_msg),
-               "unsupported flow control opcode %u", opcode);
-      out->has_error = 1;
-      return -1;
-    }
-    if (opcode == DX9MT_SM_OP_IFC || opcode == DX9MT_SM_OP_BREAKC) {
-      /* ifc src0, src1 / breakc src0, src1 */
-      if (pos + 2 > dword_count) {
-        snprintf(out->error_msg, sizeof(out->error_msg),
-                 "truncated flow control at dword %u", pos);
-        out->has_error = 1;
-        return -1;
-      }
-      pos += 2;
-      snprintf(out->error_msg, sizeof(out->error_msg),
-               "unsupported flow control opcode %u", opcode);
-      out->has_error = 1;
-      return -1;
-    }
-    if (opcode == DX9MT_SM_OP_ENDREP || opcode == DX9MT_SM_OP_ELSE ||
+    /* Flow control -- reject all unsupported flow-control opcodes */
+    if (opcode == DX9MT_SM_OP_REP || opcode == DX9MT_SM_OP_IF ||
+        opcode == DX9MT_SM_OP_IFC || opcode == DX9MT_SM_OP_BREAKC ||
+        opcode == DX9MT_SM_OP_ENDREP || opcode == DX9MT_SM_OP_ELSE ||
         opcode == DX9MT_SM_OP_ENDIF || opcode == DX9MT_SM_OP_BREAK) {
-      /* No operands */
-      if (out->instruction_count < DX9MT_SM_MAX_INSTRUCTIONS) {
-        dx9mt_sm_instruction *inst = &out->instructions[out->instruction_count++];
-        memset(inst, 0, sizeof(*inst));
-        inst->opcode = opcode;
-      }
-      continue;
+      snprintf(out->error_msg, sizeof(out->error_msg),
+               "unsupported flow control opcode %u", opcode);
+      out->has_error = 1;
+      return -1;
     }
 
     /* Regular arithmetic/texture instructions */
@@ -538,10 +510,11 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
     for (int s = 0; s < src_count; ++s) {
       uint32_t src_token = bytecode[pos++];
       inst->src[s] = decode_src(src_token);
-      if (inst->src[s].type == DX9MT_SM_REG_SAMPLER &&
+      if (out->shader_type == 0 &&
+          inst->src[s].type == DX9MT_SM_REG_SAMPLER &&
           inst->src[s].number > 0u) {
         snprintf(out->error_msg, sizeof(out->error_msg),
-                 "unsupported sampler index %u in instruction source",
+                 "unsupported PS sampler index %u in instruction source",
                  inst->src[s].number);
         out->has_error = 1;
         return -1;

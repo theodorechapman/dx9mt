@@ -198,16 +198,6 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
   int has_dst = 1;
   switch (inst->opcode) {
   case DX9MT_SM_OP_NOP:
-  case DX9MT_SM_OP_ENDREP:
-  case DX9MT_SM_OP_ELSE:
-  case DX9MT_SM_OP_ENDIF:
-  case DX9MT_SM_OP_BREAK:
-    has_dst = 0;
-    break;
-  case DX9MT_SM_OP_REP:
-  case DX9MT_SM_OP_IF:
-  case DX9MT_SM_OP_IFC:
-  case DX9MT_SM_OP_BREAKC:
     has_dst = 0;
     break;
   default:
@@ -472,32 +462,6 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
 
   case DX9MT_SM_OP_TEXKILL:
     emit(ctx, "  if (any(%s.xyz < float3(0.0))) discard_fragment();\n", dst);
-    return;
-
-  /* Flow control -- emit as comments for now (FNV menu unlikely to need) */
-  case DX9MT_SM_OP_REP:
-    emit(ctx, "  // rep (flow control not yet translated)\n");
-    return;
-  case DX9MT_SM_OP_ENDREP:
-    emit(ctx, "  // endrep\n");
-    return;
-  case DX9MT_SM_OP_IF:
-    emit(ctx, "  // if (flow control not yet translated)\n");
-    return;
-  case DX9MT_SM_OP_IFC:
-    emit(ctx, "  // ifc (flow control not yet translated)\n");
-    return;
-  case DX9MT_SM_OP_ELSE:
-    emit(ctx, "  // else\n");
-    return;
-  case DX9MT_SM_OP_ENDIF:
-    emit(ctx, "  // endif\n");
-    return;
-  case DX9MT_SM_OP_BREAK:
-    emit(ctx, "  // break\n");
-    return;
-  case DX9MT_SM_OP_BREAKC:
-    emit(ctx, "  // breakc\n");
     return;
 
   default:
