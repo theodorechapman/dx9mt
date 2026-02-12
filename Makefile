@@ -1,5 +1,5 @@
-WINE := $(CURDIR)/Wine Staging.app/Contents/Resources/wine/bin/wine
-WINESERVER := $(CURDIR)/Wine Staging.app/Contents/Resources/wine/bin/wineserver
+WINE := /opt/homebrew/bin/wine
+WINESERVER := /opt/homebrew/bin/wineserver
 WINEPREFIX := $(CURDIR)/wineprefix
 WINE_SILENT := WINEDEBUG=-all "$(WINE)"
 
@@ -61,8 +61,6 @@ run: install-dx9mt-fnv
 	@set -e; \
 	pkill -f dx9mt_metal_viewer 2>/dev/null || true; \
 	: > "$(DX9MT_RUNTIME_LOG)"; \
-	: > "$(DX9MT_LAUNCHER_LOG)"; \
-	: > "$(DX9MT_STEAM_LOG)"; \
 	echo "Creating Metal IPC shared file"; \
 	dd if=/dev/zero of="$(DX9MT_METAL_IPC_FILE)" bs=1048576 count=16 >/dev/null 2>&1; \
 	if [ -x "$(DX9MT_METAL_VIEWER)" ]; then \
@@ -74,29 +72,13 @@ run: install-dx9mt-fnv
 	else \
 		echo "Metal viewer not found at $(DX9MT_METAL_VIEWER), skipping"; \
 	fi; \
-	echo "Starting wineserver"; \
-	"$(WINESERVER)" -p >/dev/null 2>&1 || true; \
-	echo "Starting Steam (log: $(DX9MT_STEAM_LOG))"; \
-	DX9MT_LOG_PATH="$(DX9MT_RUNTIME_LOG)" WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" "$(WINE)" "$(STEAM_WIN_PATH)" >>"$(DX9MT_STEAM_LOG)" 2>&1 & \
-	STEAM_PID=$$!; \
-	echo "Steam pid $$STEAM_PID, waiting $(STEAM_STARTUP_WAIT)s"; \
-	sleep "$(STEAM_STARTUP_WAIT)"; \
-	if ! kill -0 $$STEAM_PID 2>/dev/null; then \
-		echo "Steam exited before launcher start. Check $(DX9MT_STEAM_LOG)."; \
-		exit 1; \
-	fi; \
-	echo "Launching FalloutNVLauncher.exe (log: $(DX9MT_LAUNCHER_LOG))"; \
-	echo "dx9mt runtime log: $(DX9MT_RUNTIME_LOG)"; \
-	DX9MT_LOG_PATH="$(DX9MT_RUNTIME_LOG)" WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" "$(WINE)" "$(LAUNCHER_WIN_PATH)" >>"$(DX9MT_LAUNCHER_LOG)" 2>&1 & \
-	LAUNCHER_PID=$$!; \
-	echo "Launcher command pid $$LAUNCHER_PID"; \
-	sleep 2; \
-	if kill -0 $$LAUNCHER_PID 2>/dev/null; then \
-		echo "Launcher command still running."; \
-	else \
-		echo "Launcher command returned quickly (this can be normal if it hands off)."; \
-	fi; \
-	echo "Run complete. Use 'make show-logs' after reproducing behavior."
+	echo "Starting Steam"; \
+	DX9MT_LOG_PATH="$(DX9MT_RUNTIME_LOG)" WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" \
+	"$(WINE)" "$(STEAM_WIN_PATH)" >>"$(DX9MT_STEAM_LOG)" 2>&1 & \
+	echo "Launching FNV via NVSE (log: $(DX9MT_RUNTIME_LOG))"; \
+	cd "$(FNV_DIR)" && \
+	DX9MT_LOG_PATH="$(DX9MT_RUNTIME_LOG)" WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" \
+	"$(WINE)" nvse_loader.exe 2>&1 | tee "$(DX9MT_RUNTIME_LOG)"
 
 show-logs:
 	@echo "== dx9mt runtime log: $(DX9MT_RUNTIME_LOG) =="; \

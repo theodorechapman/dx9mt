@@ -78,6 +78,10 @@ typedef struct dx9mt_backend_draw_command {
   uint32_t primitive_count;
   uint32_t render_target_id;
   uint32_t depth_stencil_id;
+  uint32_t render_target_texture_id;
+  uint32_t render_target_width;
+  uint32_t render_target_height;
+  uint32_t render_target_format;
   uint32_t vertex_buffer_id;
   uint32_t index_buffer_id;
   uint32_t vertex_decl_id;
@@ -91,6 +95,32 @@ typedef struct dx9mt_backend_draw_command {
   uint32_t texture_stage_hash;
   uint32_t sampler_state_hash;
   uint32_t stream_binding_hash;
+  uint32_t texture0_id;
+  uint32_t texture0_generation;
+  uint32_t texture0_format;
+  uint32_t texture0_width;
+  uint32_t texture0_height;
+  uint32_t texture0_pitch;
+  dx9mt_upload_ref texture0_data;
+  uint32_t sampler0_min_filter;
+  uint32_t sampler0_mag_filter;
+  uint32_t sampler0_mip_filter;
+  uint32_t sampler0_address_u;
+  uint32_t sampler0_address_v;
+  uint32_t sampler0_address_w;
+  uint32_t tss0_color_op;
+  uint32_t tss0_color_arg1;
+  uint32_t tss0_color_arg2;
+  uint32_t tss0_alpha_op;
+  uint32_t tss0_alpha_arg1;
+  uint32_t tss0_alpha_arg2;
+  uint32_t rs_texture_factor;
+  uint32_t rs_alpha_blend_enable;
+  uint32_t rs_src_blend;
+  uint32_t rs_dest_blend;
+  uint32_t rs_alpha_test_enable;
+  uint32_t rs_alpha_ref;
+  uint32_t rs_alpha_func;
   dx9mt_upload_ref constants_vs;
   dx9mt_upload_ref constants_ps;
 
@@ -126,6 +156,7 @@ typedef struct dx9mt_backend_frame_replay_state {
   dx9mt_packet_clear last_clear_packet;
   int have_present_packet;
   uint32_t present_packet_frame_id;
+  uint32_t present_render_target_id;
   dx9mt_backend_draw_command
       draws[DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME];
 } dx9mt_backend_frame_replay_state;
@@ -188,6 +219,10 @@ dx9mt_backend_draw_command_hash(const dx9mt_backend_draw_command *command) {
   hash = dx9mt_backend_hash_u32(hash, command->primitive_count);
   hash = dx9mt_backend_hash_u32(hash, command->render_target_id);
   hash = dx9mt_backend_hash_u32(hash, command->depth_stencil_id);
+  hash = dx9mt_backend_hash_u32(hash, command->render_target_texture_id);
+  hash = dx9mt_backend_hash_u32(hash, command->render_target_width);
+  hash = dx9mt_backend_hash_u32(hash, command->render_target_height);
+  hash = dx9mt_backend_hash_u32(hash, command->render_target_format);
   hash = dx9mt_backend_hash_u32(hash, command->vertex_buffer_id);
   hash = dx9mt_backend_hash_u32(hash, command->index_buffer_id);
   hash = dx9mt_backend_hash_u32(hash, command->vertex_decl_id);
@@ -201,6 +236,32 @@ dx9mt_backend_draw_command_hash(const dx9mt_backend_draw_command *command) {
   hash = dx9mt_backend_hash_u32(hash, command->texture_stage_hash);
   hash = dx9mt_backend_hash_u32(hash, command->sampler_state_hash);
   hash = dx9mt_backend_hash_u32(hash, command->stream_binding_hash);
+  hash = dx9mt_backend_hash_u32(hash, command->texture0_id);
+  hash = dx9mt_backend_hash_u32(hash, command->texture0_generation);
+  hash = dx9mt_backend_hash_u32(hash, command->texture0_format);
+  hash = dx9mt_backend_hash_u32(hash, command->texture0_width);
+  hash = dx9mt_backend_hash_u32(hash, command->texture0_height);
+  hash = dx9mt_backend_hash_u32(hash, command->texture0_pitch);
+  hash = dx9mt_backend_hash_upload_ref(hash, &command->texture0_data);
+  hash = dx9mt_backend_hash_u32(hash, command->sampler0_min_filter);
+  hash = dx9mt_backend_hash_u32(hash, command->sampler0_mag_filter);
+  hash = dx9mt_backend_hash_u32(hash, command->sampler0_mip_filter);
+  hash = dx9mt_backend_hash_u32(hash, command->sampler0_address_u);
+  hash = dx9mt_backend_hash_u32(hash, command->sampler0_address_v);
+  hash = dx9mt_backend_hash_u32(hash, command->sampler0_address_w);
+  hash = dx9mt_backend_hash_u32(hash, command->tss0_color_op);
+  hash = dx9mt_backend_hash_u32(hash, command->tss0_color_arg1);
+  hash = dx9mt_backend_hash_u32(hash, command->tss0_color_arg2);
+  hash = dx9mt_backend_hash_u32(hash, command->tss0_alpha_op);
+  hash = dx9mt_backend_hash_u32(hash, command->tss0_alpha_arg1);
+  hash = dx9mt_backend_hash_u32(hash, command->tss0_alpha_arg2);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_texture_factor);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_alpha_blend_enable);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_src_blend);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_dest_blend);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_alpha_test_enable);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_alpha_ref);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_alpha_func);
   hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_vs);
   hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_ps);
   return hash;
@@ -558,6 +619,10 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
   command->primitive_count = draw_packet->primitive_count;
   command->render_target_id = draw_packet->render_target_id;
   command->depth_stencil_id = draw_packet->depth_stencil_id;
+  command->render_target_texture_id = draw_packet->render_target_texture_id;
+  command->render_target_width = draw_packet->render_target_width;
+  command->render_target_height = draw_packet->render_target_height;
+  command->render_target_format = draw_packet->render_target_format;
   command->vertex_buffer_id = draw_packet->vertex_buffer_id;
   command->index_buffer_id = draw_packet->index_buffer_id;
   command->vertex_decl_id = draw_packet->vertex_decl_id;
@@ -571,6 +636,32 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
   command->texture_stage_hash = draw_packet->texture_stage_hash;
   command->sampler_state_hash = draw_packet->sampler_state_hash;
   command->stream_binding_hash = draw_packet->stream_binding_hash;
+  command->texture0_id = draw_packet->texture0_id;
+  command->texture0_generation = draw_packet->texture0_generation;
+  command->texture0_format = draw_packet->texture0_format;
+  command->texture0_width = draw_packet->texture0_width;
+  command->texture0_height = draw_packet->texture0_height;
+  command->texture0_pitch = draw_packet->texture0_pitch;
+  command->texture0_data = draw_packet->texture0_data;
+  command->sampler0_min_filter = draw_packet->sampler0_min_filter;
+  command->sampler0_mag_filter = draw_packet->sampler0_mag_filter;
+  command->sampler0_mip_filter = draw_packet->sampler0_mip_filter;
+  command->sampler0_address_u = draw_packet->sampler0_address_u;
+  command->sampler0_address_v = draw_packet->sampler0_address_v;
+  command->sampler0_address_w = draw_packet->sampler0_address_w;
+  command->tss0_color_op = draw_packet->tss0_color_op;
+  command->tss0_color_arg1 = draw_packet->tss0_color_arg1;
+  command->tss0_color_arg2 = draw_packet->tss0_color_arg2;
+  command->tss0_alpha_op = draw_packet->tss0_alpha_op;
+  command->tss0_alpha_arg1 = draw_packet->tss0_alpha_arg1;
+  command->tss0_alpha_arg2 = draw_packet->tss0_alpha_arg2;
+  command->rs_texture_factor = draw_packet->rs_texture_factor;
+  command->rs_alpha_blend_enable = draw_packet->rs_alpha_blend_enable;
+  command->rs_src_blend = draw_packet->rs_src_blend;
+  command->rs_dest_blend = draw_packet->rs_dest_blend;
+  command->rs_alpha_test_enable = draw_packet->rs_alpha_test_enable;
+  command->rs_alpha_ref = draw_packet->rs_alpha_ref;
+  command->rs_alpha_func = draw_packet->rs_alpha_func;
   command->constants_vs = draw_packet->constants_vs;
   command->constants_ps = draw_packet->constants_ps;
   command->viewport_x = draw_packet->viewport_x;
@@ -784,6 +875,12 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
                                              header->sequence)) {
         return -1;
       }
+      if (draw_packet->texture0_data.size > 0 &&
+          !dx9mt_backend_validate_upload_ref(&draw_packet->texture0_data,
+                                             "texture0_data",
+                                             header->sequence)) {
+        return -1;
+      }
       g_last_draw_state_hash = draw_packet->state_block_hash;
       g_last_draw_primitive_type = draw_packet->primitive_type;
       g_last_draw_primitive_count = draw_packet->primitive_count;
@@ -832,6 +929,8 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
       }
       g_frame_replay_state.have_present_packet = 1;
       g_frame_replay_state.present_packet_frame_id = present_packet->frame_id;
+      g_frame_replay_state.present_render_target_id =
+          present_packet->render_target_id;
     }
 
     if (dx9mt_backend_trace_packets_enabled()) {
@@ -977,6 +1076,11 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       d->num_vertices = cmd->num_vertices;
       d->start_index = cmd->start_index;
       d->primitive_count = cmd->primitive_count;
+      d->render_target_id = cmd->render_target_id;
+      d->render_target_texture_id = cmd->render_target_texture_id;
+      d->render_target_width = cmd->render_target_width;
+      d->render_target_height = cmd->render_target_height;
+      d->render_target_format = cmd->render_target_format;
       d->viewport_x = cmd->viewport_x;
       d->viewport_y = cmd->viewport_y;
       d->viewport_width = cmd->viewport_width;
@@ -988,9 +1092,35 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       d->scissor_right = cmd->scissor_right;
       d->scissor_bottom = cmd->scissor_bottom;
       d->fvf = cmd->fvf;
+      d->pixel_shader_id = cmd->pixel_shader_id;
       d->stream0_offset = cmd->stream0_offset;
       d->stream0_stride = cmd->stream0_stride;
       d->index_format = cmd->index_format;
+      d->texture0_id = cmd->texture0_id;
+      d->texture0_generation = cmd->texture0_generation;
+      d->texture0_format = cmd->texture0_format;
+      d->texture0_width = cmd->texture0_width;
+      d->texture0_height = cmd->texture0_height;
+      d->texture0_pitch = cmd->texture0_pitch;
+      d->sampler0_min_filter = cmd->sampler0_min_filter;
+      d->sampler0_mag_filter = cmd->sampler0_mag_filter;
+      d->sampler0_mip_filter = cmd->sampler0_mip_filter;
+      d->sampler0_address_u = cmd->sampler0_address_u;
+      d->sampler0_address_v = cmd->sampler0_address_v;
+      d->sampler0_address_w = cmd->sampler0_address_w;
+      d->tss0_color_op = cmd->tss0_color_op;
+      d->tss0_color_arg1 = cmd->tss0_color_arg1;
+      d->tss0_color_arg2 = cmd->tss0_color_arg2;
+      d->tss0_alpha_op = cmd->tss0_alpha_op;
+      d->tss0_alpha_arg1 = cmd->tss0_alpha_arg1;
+      d->tss0_alpha_arg2 = cmd->tss0_alpha_arg2;
+      d->rs_texture_factor = cmd->rs_texture_factor;
+      d->rs_alpha_blend_enable = cmd->rs_alpha_blend_enable;
+      d->rs_src_blend = cmd->rs_src_blend;
+      d->rs_dest_blend = cmd->rs_dest_blend;
+      d->rs_alpha_test_enable = cmd->rs_alpha_test_enable;
+      d->rs_alpha_ref = cmd->rs_alpha_ref;
+      d->rs_alpha_func = cmd->rs_alpha_func;
 
       /* Copy VB data into bulk region */
       data = dx9mt_frontend_upload_resolve(&cmd->vertex_data);
@@ -1049,6 +1179,18 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
                cmd->constants_ps.size);
         bulk_used += (cmd->constants_ps.size + 15u) & ~15u;
       }
+
+      /* Copy stage-0 texture upload when present (texture cache updates). */
+      data = dx9mt_frontend_upload_resolve(&cmd->texture0_data);
+      if (data && cmd->texture0_data.size > 0 &&
+          bulk_offset + bulk_used + cmd->texture0_data.size <=
+              DX9MT_METAL_IPC_SIZE) {
+        d->texture0_bulk_offset = bulk_used;
+        d->texture0_bulk_size = cmd->texture0_data.size;
+        memcpy(ipc_base + bulk_offset + bulk_used, data,
+               cmd->texture0_data.size);
+        bulk_used += (cmd->texture0_data.size + 15u) & ~15u;
+      }
     }
 
     g_metal_ipc_ptr->width = g_present_target.width;
@@ -1061,6 +1203,8 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
     g_metal_ipc_ptr->draw_count = draw_count;
     g_metal_ipc_ptr->replay_hash = snapshot.replay_hash;
     g_metal_ipc_ptr->frame_id = frame_id;
+    g_metal_ipc_ptr->present_render_target_id =
+        g_frame_replay_state.present_render_target_id;
     g_metal_ipc_ptr->bulk_data_offset = bulk_offset;
     g_metal_ipc_ptr->bulk_data_used = bulk_used;
     /* Write sequence last -- the viewer polls this field. */

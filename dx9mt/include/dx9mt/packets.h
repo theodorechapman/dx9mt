@@ -44,6 +44,10 @@ typedef struct dx9mt_packet_draw_indexed {
   uint32_t primitive_count;
   uint32_t render_target_id;
   uint32_t depth_stencil_id;
+  uint32_t render_target_texture_id;
+  uint32_t render_target_width;
+  uint32_t render_target_height;
+  uint32_t render_target_format;
   uint32_t vertex_buffer_id;
   uint32_t index_buffer_id;
   uint32_t vertex_decl_id;
@@ -57,6 +61,40 @@ typedef struct dx9mt_packet_draw_indexed {
   uint32_t texture_stage_hash;
   uint32_t sampler_state_hash;
   uint32_t stream_binding_hash;
+
+  /* RB3 Phase 2A: concrete stage-0 texture + sampler state */
+  uint32_t texture0_id;
+  uint32_t texture0_generation;
+  uint32_t texture0_format;
+  uint32_t texture0_width;
+  uint32_t texture0_height;
+  uint32_t texture0_pitch;
+  dx9mt_upload_ref texture0_data;
+
+  uint32_t sampler0_min_filter;
+  uint32_t sampler0_mag_filter;
+  uint32_t sampler0_mip_filter;
+  uint32_t sampler0_address_u;
+  uint32_t sampler0_address_v;
+  uint32_t sampler0_address_w;
+
+  /* RB3 Phase 2C: stage-0 fixed-function combiner state */
+  uint32_t tss0_color_op;
+  uint32_t tss0_color_arg1;
+  uint32_t tss0_color_arg2;
+  uint32_t tss0_alpha_op;
+  uint32_t tss0_alpha_arg1;
+  uint32_t tss0_alpha_arg2;
+  uint32_t rs_texture_factor;
+
+  /* RB3 Phase 2B: key render states for UI composition */
+  uint32_t rs_alpha_blend_enable;
+  uint32_t rs_src_blend;
+  uint32_t rs_dest_blend;
+  uint32_t rs_alpha_test_enable;
+  uint32_t rs_alpha_ref;
+  uint32_t rs_alpha_func;
+
   dx9mt_upload_ref constants_vs;
   dx9mt_upload_ref constants_ps;
 
@@ -87,6 +125,7 @@ typedef struct dx9mt_packet_present {
   dx9mt_packet_header header;
   uint32_t frame_id;
   uint32_t flags;
+  uint32_t render_target_id;
 } dx9mt_packet_present;
 
 typedef struct dx9mt_packet_clear {

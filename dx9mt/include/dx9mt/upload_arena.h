@@ -5,6 +5,7 @@
 
 enum {
   DX9MT_UPLOAD_ARENA_SLOTS = 3,
+  DX9MT_UPLOAD_ARENA_BYTES_PER_SLOT = 8u << 20,
 };
 
 /*

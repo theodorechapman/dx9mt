@@ -23,9 +23,19 @@
 #define DX9MT_MAX_SHADER_FLOAT_CONSTANTS 256
 #define DX9MT_MAX_SHADER_INT_CONSTANTS 16
 #define DX9MT_MAX_SHADER_BOOL_CONSTANTS 16
-#define DX9MT_UPLOAD_BYTES_PER_SLOT (1u << 20)
+#define DX9MT_UPLOAD_BYTES_PER_SLOT DX9MT_UPLOAD_ARENA_BYTES_PER_SLOT
+#define DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL 60u
 #define DX9MT_DRAW_SHADER_CONSTANT_BYTES                                          \
   (DX9MT_MAX_SHADER_FLOAT_CONSTANTS * 4u * sizeof(float))
+
+#ifndef D3DFMT_DXT1
+#define DX9MT_MAKEFOURCC(ch0, ch1, ch2, ch3)                                      \
+  ((uint32_t)(uint8_t)(ch0) | ((uint32_t)(uint8_t)(ch1) << 8) |                   \
+   ((uint32_t)(uint8_t)(ch2) << 16) | ((uint32_t)(uint8_t)(ch3) << 24))
+#define D3DFMT_DXT1 ((D3DFORMAT)DX9MT_MAKEFOURCC('D', 'X', 'T', '1'))
+#define D3DFMT_DXT3 ((D3DFORMAT)DX9MT_MAKEFOURCC('D', 'X', 'T', '3'))
+#define D3DFMT_DXT5 ((D3DFORMAT)DX9MT_MAKEFOURCC('D', 'X', 'T', '5'))
+#endif
 
 static WINBOOL dx9mt_should_log_method_sample(LONG *counter, LONG first_n,
                                               LONG every_n) {
@@ -155,6 +165,9 @@ struct dx9mt_texture {
   UINT levels;
   DWORD lod;
   D3DTEXTUREFILTERTYPE autogen_filter;
+  uint32_t generation;
+  uint32_t last_upload_generation;
+  uint32_t last_upload_frame_id;
   IDirect3DSurface9 **surfaces;
 };
 
@@ -170,6 +183,7 @@ struct dx9mt_cube_texture {
   UINT levels;
   DWORD lod;
   D3DTEXTUREFILTERTYPE autogen_filter;
+  uint32_t generation;
   IDirect3DSurface9 **surfaces;
 };
 
@@ -371,6 +385,32 @@ dx9mt_texture_object_id_from_base_iface(IDirect3DBaseTexture9 *iface) {
   return 0;
 }
 
+static dx9mt_object_id
+dx9mt_surface_container_texture_id(const dx9mt_surface *surface) {
+  IUnknown *container;
+  IDirect3DBaseTexture9 *base_texture = NULL;
+  dx9mt_object_id texture_id = 0;
+
+  if (!surface) {
+    return 0;
+  }
+
+  container = surface->container;
+  if (!container) {
+    return 0;
+  }
+
+  if (FAILED(container->lpVtbl->QueryInterface(
+          container, &IID_IDirect3DBaseTexture9, (void **)&base_texture)) ||
+      !base_texture) {
+    return 0;
+  }
+
+  texture_id = dx9mt_texture_object_id_from_base_iface(base_texture);
+  IDirect3DBaseTexture9_Release(base_texture);
+  return texture_id;
+}
+
 static uint32_t dx9mt_hash_u32(uint32_t hash, uint32_t value) {
   hash ^= value;
   hash *= 16777619u;
@@ -547,6 +587,10 @@ dx9mt_hash_draw_state(const dx9mt_packet_draw_indexed *packet) {
 
   hash = dx9mt_hash_u32(hash, packet->render_target_id);
   hash = dx9mt_hash_u32(hash, packet->depth_stencil_id);
+  hash = dx9mt_hash_u32(hash, packet->render_target_texture_id);
+  hash = dx9mt_hash_u32(hash, packet->render_target_width);
+  hash = dx9mt_hash_u32(hash, packet->render_target_height);
+  hash = dx9mt_hash_u32(hash, packet->render_target_format);
   hash = dx9mt_hash_u32(hash, packet->vertex_buffer_id);
   hash = dx9mt_hash_u32(hash, packet->index_buffer_id);
   hash = dx9mt_hash_u32(hash, packet->vertex_decl_id);
@@ -561,6 +605,27 @@ dx9mt_hash_draw_state(const dx9mt_packet_draw_indexed *packet) {
   hash = dx9mt_hash_u32(hash, packet->texture_stage_hash);
   hash = dx9mt_hash_u32(hash, packet->sampler_state_hash);
   hash = dx9mt_hash_u32(hash, packet->stream_binding_hash);
+  hash = dx9mt_hash_u32(hash, packet->texture0_id);
+  hash = dx9mt_hash_u32(hash, packet->texture0_generation);
+  hash = dx9mt_hash_u32(hash, packet->sampler0_min_filter);
+  hash = dx9mt_hash_u32(hash, packet->sampler0_mag_filter);
+  hash = dx9mt_hash_u32(hash, packet->sampler0_mip_filter);
+  hash = dx9mt_hash_u32(hash, packet->sampler0_address_u);
+  hash = dx9mt_hash_u32(hash, packet->sampler0_address_v);
+  hash = dx9mt_hash_u32(hash, packet->sampler0_address_w);
+  hash = dx9mt_hash_u32(hash, packet->tss0_color_op);
+  hash = dx9mt_hash_u32(hash, packet->tss0_color_arg1);
+  hash = dx9mt_hash_u32(hash, packet->tss0_color_arg2);
+  hash = dx9mt_hash_u32(hash, packet->tss0_alpha_op);
+  hash = dx9mt_hash_u32(hash, packet->tss0_alpha_arg1);
+  hash = dx9mt_hash_u32(hash, packet->tss0_alpha_arg2);
+  hash = dx9mt_hash_u32(hash, packet->rs_texture_factor);
+  hash = dx9mt_hash_u32(hash, packet->rs_alpha_blend_enable);
+  hash = dx9mt_hash_u32(hash, packet->rs_src_blend);
+  hash = dx9mt_hash_u32(hash, packet->rs_dest_blend);
+  hash = dx9mt_hash_u32(hash, packet->rs_alpha_test_enable);
+  hash = dx9mt_hash_u32(hash, packet->rs_alpha_ref);
+  hash = dx9mt_hash_u32(hash, packet->rs_alpha_func);
   return hash;
 }
 
@@ -580,6 +645,97 @@ static UINT dx9mt_bytes_per_pixel(D3DFORMAT format) {
   default:
     return 4;
   }
+}
+
+static WINBOOL dx9mt_format_is_block_compressed(D3DFORMAT format) {
+  return format == D3DFMT_DXT1 || format == D3DFMT_DXT3 ||
+         format == D3DFMT_DXT5;
+}
+
+static UINT dx9mt_format_block_bytes(D3DFORMAT format) {
+  if (format == D3DFMT_DXT1) {
+    return 8;
+  }
+  if (format == D3DFMT_DXT3 || format == D3DFMT_DXT5) {
+    return 16;
+  }
+  return 0;
+}
+
+static uint32_t dx9mt_texture_next_generation(uint32_t generation) {
+  ++generation;
+  if (generation == 0) {
+    generation = 1;
+  }
+  return generation;
+}
+
+static uint32_t dx9mt_surface_upload_size_from_desc(const D3DSURFACE_DESC *desc,
+                                                    UINT pitch) {
+  uint32_t block_rows;
+
+  if (!desc || pitch == 0) {
+    return 0;
+  }
+  if (dx9mt_format_is_block_compressed(desc->Format)) {
+    block_rows = (desc->Height + 3u) / 4u;
+    if (block_rows == 0) {
+      block_rows = 1;
+    }
+    return (uint32_t)(pitch * block_rows);
+  }
+  return (uint32_t)(pitch * desc->Height);
+}
+
+static uint32_t dx9mt_surface_upload_size(const dx9mt_surface *surface) {
+  if (!surface) {
+    return 0;
+  }
+  return dx9mt_surface_upload_size_from_desc(&surface->desc, surface->pitch);
+}
+
+static void dx9mt_texture_mark_dirty(dx9mt_texture *texture) {
+  if (!texture) {
+    return;
+  }
+  texture->generation = dx9mt_texture_next_generation(texture->generation);
+}
+
+static void dx9mt_cube_texture_mark_dirty(dx9mt_cube_texture *texture) {
+  if (!texture) {
+    return;
+  }
+  texture->generation = dx9mt_texture_next_generation(texture->generation);
+}
+
+static void dx9mt_surface_mark_container_dirty(dx9mt_surface *surface) {
+  IDirect3DBaseTexture9 *base = NULL;
+  HRESULT hr;
+
+  if (!surface || !surface->container) {
+    return;
+  }
+
+  hr = surface->container->lpVtbl->QueryInterface(
+      surface->container, &IID_IDirect3DBaseTexture9, (void **)&base);
+  if (FAILED(hr) || !base) {
+    return;
+  }
+
+  switch (IDirect3DBaseTexture9_GetType(base)) {
+  case D3DRTYPE_TEXTURE:
+    dx9mt_texture_mark_dirty(
+        dx9mt_texture_from_iface((IDirect3DTexture9 *)base));
+    break;
+  case D3DRTYPE_CUBETEXTURE:
+    dx9mt_cube_texture_mark_dirty(
+        dx9mt_cube_texture_from_iface((IDirect3DCubeTexture9 *)base));
+    break;
+  default:
+    break;
+  }
+
+  IDirect3DBaseTexture9_Release(base);
 }
 
 static int dx9mt_env_flag_enabled(const char *name) {
@@ -615,7 +771,22 @@ static int dx9mt_frontend_soft_present_enabled(void) {
 }
 
 static UINT dx9mt_surface_pitch(const D3DSURFACE_DESC *desc) {
-  return desc->Width * dx9mt_bytes_per_pixel(desc->Format);
+  UINT block_bytes;
+  UINT block_columns;
+
+  if (!desc || desc->Width == 0) {
+    return 0;
+  }
+  if (!dx9mt_format_is_block_compressed(desc->Format)) {
+    return desc->Width * dx9mt_bytes_per_pixel(desc->Format);
+  }
+
+  block_bytes = dx9mt_format_block_bytes(desc->Format);
+  block_columns = (desc->Width + 3u) / 4u;
+  if (block_columns == 0) {
+    block_columns = 1;
+  }
+  return block_columns * block_bytes;
 }
 
 static HRESULT dx9mt_safe_addref(IUnknown *obj) {
@@ -682,7 +853,7 @@ static HRESULT dx9mt_surface_ensure_sysmem(dx9mt_surface *surface) {
     return D3D_OK;
   }
 
-  size = (SIZE_T)surface->pitch * (SIZE_T)surface->desc.Height;
+  size = (SIZE_T)dx9mt_surface_upload_size(surface);
   if (size == 0) {
     return D3D_OK;
   }
@@ -787,6 +958,7 @@ static HRESULT dx9mt_surface_copy_rect(dx9mt_surface *dst, const RECT *dst_rect,
                                (SIZE_T)dst_r.left * dst_bpp;
       memmove(dst_row, src_row, row_bytes);
     }
+    dx9mt_surface_mark_container_dirty(dst);
     return D3D_OK;
   }
 
@@ -803,6 +975,7 @@ static HRESULT dx9mt_surface_copy_rect(dx9mt_surface *dst, const RECT *dst_rect,
     }
   }
 
+  dx9mt_surface_mark_container_dirty(dst);
   return D3D_OK;
 }
 
@@ -912,6 +1085,7 @@ static HRESULT dx9mt_surface_fill_rect(dx9mt_surface *surface, const RECT *rect,
     }
   }
 
+  dx9mt_surface_mark_container_dirty(surface);
   return D3D_OK;
 }
 
@@ -1272,7 +1446,7 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
                                               const RECT *rect,
                                               DWORD flags) {
   dx9mt_surface *self = dx9mt_surface_from_iface(iface);
-  UINT size;
+  uint32_t size;
 
   (void)rect;
   (void)flags;
@@ -1286,7 +1460,7 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
   }
 
   if (!self->sysmem) {
-    size = self->pitch * self->desc.Height;
+    size = dx9mt_surface_upload_size(self);
     self->sysmem = (unsigned char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                               size);
     if (!self->sysmem) {
@@ -1300,7 +1474,8 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
 }
 
 static HRESULT WINAPI dx9mt_surface_UnlockRect(IDirect3DSurface9 *iface) {
-  (void)iface;
+  dx9mt_surface *self = dx9mt_surface_from_iface(iface);
+  dx9mt_surface_mark_container_dirty(self);
   return D3D_OK;
 }
 
@@ -1658,6 +1833,9 @@ static HRESULT dx9mt_texture_create(dx9mt_device *device, UINT width, UINT heigh
   texture->height = height;
   texture->levels = levels;
   texture->autogen_filter = D3DTEXF_LINEAR;
+  texture->generation = 1;
+  texture->last_upload_generation = 0;
+  texture->last_upload_frame_id = 0;
 
   lockable = ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) == 0);
   level_w = width;
@@ -1884,8 +2062,9 @@ static HRESULT WINAPI dx9mt_texture_UnlockRect(IDirect3DTexture9 *iface,
 
 static HRESULT WINAPI dx9mt_texture_AddDirtyRect(IDirect3DTexture9 *iface,
                                                   const RECT *dirty_rect) {
-  (void)iface;
+  dx9mt_texture *self = dx9mt_texture_from_iface(iface);
   (void)dirty_rect;
+  dx9mt_texture_mark_dirty(self);
   return D3D_OK;
 }
 
@@ -2015,6 +2194,7 @@ static HRESULT dx9mt_cube_texture_create(dx9mt_device *device, UINT edge_length,
   cube->edge_length = edge_length;
   cube->levels = levels;
   cube->autogen_filter = D3DTEXF_LINEAR;
+  cube->generation = 1;
 
   lockable = ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) == 0);
 
@@ -2248,11 +2428,12 @@ static HRESULT WINAPI dx9mt_cube_texture_UnlockRect(
 static HRESULT WINAPI dx9mt_cube_texture_AddDirtyRect(
     IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type,
     const RECT *dirty_rect) {
-  (void)iface;
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
   (void)dirty_rect;
   if (!dx9mt_cube_face_valid(face_type)) {
     return D3DERR_INVALIDCALL;
   }
+  dx9mt_cube_texture_mark_dirty(self);
   return D3D_OK;
 }
 
@@ -3623,6 +3804,49 @@ static void dx9mt_device_init_vtbl(void) {
   InterlockedExchange(&g_dx9mt_device_vtbl_state, 2);
 }
 
+static void dx9mt_device_init_default_states(dx9mt_device *self) {
+  uint32_t stage;
+  uint32_t sampler;
+
+  if (!self) {
+    return;
+  }
+
+  for (sampler = 0; sampler < DX9MT_MAX_SAMPLERS; ++sampler) {
+    self->sampler_states[sampler][D3DSAMP_ADDRESSU] = D3DTADDRESS_WRAP;
+    self->sampler_states[sampler][D3DSAMP_ADDRESSV] = D3DTADDRESS_WRAP;
+    self->sampler_states[sampler][D3DSAMP_ADDRESSW] = D3DTADDRESS_WRAP;
+    self->sampler_states[sampler][D3DSAMP_MAGFILTER] = D3DTEXF_POINT;
+    self->sampler_states[sampler][D3DSAMP_MINFILTER] = D3DTEXF_POINT;
+    self->sampler_states[sampler][D3DSAMP_MIPFILTER] = D3DTEXF_NONE;
+    self->sampler_states[sampler][D3DSAMP_MAXANISOTROPY] = 1;
+  }
+
+  for (stage = 0; stage < DX9MT_MAX_TEXTURE_STAGES; ++stage) {
+    self->tex_stage_states[stage][D3DTSS_COLOROP] =
+        (stage == 0) ? D3DTOP_MODULATE : D3DTOP_DISABLE;
+    self->tex_stage_states[stage][D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+    self->tex_stage_states[stage][D3DTSS_COLORARG2] = D3DTA_CURRENT;
+    self->tex_stage_states[stage][D3DTSS_ALPHAOP] =
+        (stage == 0) ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
+    self->tex_stage_states[stage][D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+    self->tex_stage_states[stage][D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
+    self->tex_stage_states[stage][D3DTSS_RESULTARG] = D3DTA_CURRENT;
+    self->tex_stage_states[stage][D3DTSS_TEXCOORDINDEX] = stage;
+  }
+
+  self->render_states[D3DRS_ZENABLE] = D3DZB_TRUE;
+  self->render_states[D3DRS_ZWRITEENABLE] = TRUE;
+  self->render_states[D3DRS_ALPHABLENDENABLE] = FALSE;
+  self->render_states[D3DRS_SRCBLEND] = D3DBLEND_ONE;
+  self->render_states[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
+  self->render_states[D3DRS_BLENDOP] = D3DBLENDOP_ADD;
+  self->render_states[D3DRS_TEXTUREFACTOR] = 0xFFFFFFFFu;
+  self->render_states[D3DRS_ALPHATESTENABLE] = FALSE;
+  self->render_states[D3DRS_ALPHAREF] = 0;
+  self->render_states[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
+}
+
 static void dx9mt_device_release_bindings(dx9mt_device *self) {
   UINT i;
 
@@ -3844,6 +4068,8 @@ static HRESULT WINAPI dx9mt_device_Present(IDirect3DDevice9 *iface,
   packet.header.size = (uint16_t)sizeof(packet);
   packet.header.sequence = dx9mt_runtime_next_packet_sequence();
   packet.frame_id = self->frame_id;
+  packet.render_target_id =
+      dx9mt_surface_object_id_from_iface(self->render_targets[0]);
 
   dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
   hr = dx9mt_backend_bridge_present(self->frame_id) == 0 ? D3D_OK : D3DERR_DEVICELOST;
@@ -4555,6 +4781,262 @@ static HRESULT WINAPI dx9mt_device_DrawPrimitive(IDirect3DDevice9 *iface,
   return D3D_OK;
 }
 
+/*
+ * Convert a D3D9 FVF bitmask to an array of D3DVERTEXELEMENT9 entries.
+ * Returns the number of elements produced (excluding end sentinel).
+ * The element order matches the D3D9 FVF vertex data layout:
+ *   position → blend weights → normal → psize → diffuse → specular → texcoords
+ */
+static uint16_t dx9mt_fvf_to_vertex_elements(DWORD fvf,
+                                              D3DVERTEXELEMENT9 *elems,
+                                              uint16_t max_elems) {
+  uint16_t count = 0;
+  WORD offset = 0;
+  DWORD pos_type;
+  DWORD tex_count;
+  DWORD i;
+  DWORD blend_count;
+
+  if (!elems || max_elems == 0 || fvf == 0) {
+    return 0;
+  }
+
+  pos_type = fvf & D3DFVF_POSITION_MASK;
+
+  /* Position */
+  if (pos_type == D3DFVF_XYZRHW) {
+    if (count >= max_elems) return count;
+    elems[count].Stream = 0;
+    elems[count].Offset = offset;
+    elems[count].Type = D3DDECLTYPE_FLOAT4;
+    elems[count].Method = 0;
+    elems[count].Usage = D3DDECLUSAGE_POSITIONT;
+    elems[count].UsageIndex = 0;
+    count++;
+    offset += 16;
+  } else if (pos_type == D3DFVF_XYZ || pos_type == D3DFVF_XYZW) {
+    if (count >= max_elems) return count;
+    elems[count].Stream = 0;
+    elems[count].Offset = offset;
+    elems[count].Type = (pos_type == D3DFVF_XYZW) ? D3DDECLTYPE_FLOAT4
+                                                   : D3DDECLTYPE_FLOAT3;
+    elems[count].Method = 0;
+    elems[count].Usage = D3DDECLUSAGE_POSITION;
+    elems[count].UsageIndex = 0;
+    count++;
+    offset += (pos_type == D3DFVF_XYZW) ? 16 : 12;
+  } else if (pos_type >= D3DFVF_XYZB1 && pos_type <= D3DFVF_XYZB5) {
+    if (count >= max_elems) return count;
+    elems[count].Stream = 0;
+    elems[count].Offset = offset;
+    elems[count].Type = D3DDECLTYPE_FLOAT3;
+    elems[count].Method = 0;
+    elems[count].Usage = D3DDECLUSAGE_POSITION;
+    elems[count].UsageIndex = 0;
+    count++;
+    offset += 12;
+    blend_count = (pos_type - D3DFVF_XYZ) / 2;
+    if (blend_count > 0 && count < max_elems) {
+      elems[count].Stream = 0;
+      elems[count].Offset = offset;
+      elems[count].Type = (blend_count == 1) ? D3DDECLTYPE_FLOAT1
+                        : (blend_count == 2) ? D3DDECLTYPE_FLOAT2
+                        : (blend_count == 3) ? D3DDECLTYPE_FLOAT3
+                        :                      D3DDECLTYPE_FLOAT4;
+      elems[count].Method = 0;
+      elems[count].Usage = D3DDECLUSAGE_BLENDWEIGHT;
+      elems[count].UsageIndex = 0;
+      count++;
+    }
+    offset += (WORD)(blend_count * 4);
+  }
+
+  /* Normal */
+  if (fvf & D3DFVF_NORMAL) {
+    if (count < max_elems) {
+      elems[count].Stream = 0;
+      elems[count].Offset = offset;
+      elems[count].Type = D3DDECLTYPE_FLOAT3;
+      elems[count].Method = 0;
+      elems[count].Usage = D3DDECLUSAGE_NORMAL;
+      elems[count].UsageIndex = 0;
+      count++;
+    }
+    offset += 12;
+  }
+
+  /* Point size */
+  if (fvf & D3DFVF_PSIZE) {
+    if (count < max_elems) {
+      elems[count].Stream = 0;
+      elems[count].Offset = offset;
+      elems[count].Type = D3DDECLTYPE_FLOAT1;
+      elems[count].Method = 0;
+      elems[count].Usage = D3DDECLUSAGE_PSIZE;
+      elems[count].UsageIndex = 0;
+      count++;
+    }
+    offset += 4;
+  }
+
+  /* Diffuse color */
+  if (fvf & D3DFVF_DIFFUSE) {
+    if (count < max_elems) {
+      elems[count].Stream = 0;
+      elems[count].Offset = offset;
+      elems[count].Type = D3DDECLTYPE_D3DCOLOR;
+      elems[count].Method = 0;
+      elems[count].Usage = D3DDECLUSAGE_COLOR;
+      elems[count].UsageIndex = 0;
+      count++;
+    }
+    offset += 4;
+  }
+
+  /* Specular color */
+  if (fvf & D3DFVF_SPECULAR) {
+    if (count < max_elems) {
+      elems[count].Stream = 0;
+      elems[count].Offset = offset;
+      elems[count].Type = D3DDECLTYPE_D3DCOLOR;
+      elems[count].Method = 0;
+      elems[count].Usage = D3DDECLUSAGE_COLOR;
+      elems[count].UsageIndex = 1;
+      count++;
+    }
+    offset += 4;
+  }
+
+  /* Texture coordinates */
+  tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+  for (i = 0; i < tex_count; ++i) {
+    DWORD fmt_bits = (fvf >> (16 + i * 2)) & 0x3;
+    BYTE decl_type;
+    WORD size;
+    switch (fmt_bits) {
+    case 0:  decl_type = D3DDECLTYPE_FLOAT2; size = 8;  break;
+    case 1:  decl_type = D3DDECLTYPE_FLOAT3; size = 12; break;
+    case 2:  decl_type = D3DDECLTYPE_FLOAT4; size = 16; break;
+    default: decl_type = D3DDECLTYPE_FLOAT1; size = 4;  break;
+    }
+    if (count < max_elems) {
+      elems[count].Stream = 0;
+      elems[count].Offset = offset;
+      elems[count].Type = decl_type;
+      elems[count].Method = 0;
+      elems[count].Usage = D3DDECLUSAGE_TEXCOORD;
+      elems[count].UsageIndex = (BYTE)i;
+      count++;
+    }
+    offset += size;
+  }
+
+  return count;
+}
+
+static void
+dx9mt_device_fill_draw_texture_stage0(dx9mt_device *self,
+                                      dx9mt_packet_draw_indexed *packet) {
+  IDirect3DBaseTexture9 *base_texture;
+  D3DRESOURCETYPE type;
+  dx9mt_texture *texture;
+  uint32_t level;
+  dx9mt_surface *surface;
+  uint32_t upload_size;
+  WINBOOL should_upload;
+
+  if (!self || !packet) {
+    return;
+  }
+
+  packet->sampler0_min_filter = self->sampler_states[0][D3DSAMP_MINFILTER];
+  packet->sampler0_mag_filter = self->sampler_states[0][D3DSAMP_MAGFILTER];
+  packet->sampler0_mip_filter = self->sampler_states[0][D3DSAMP_MIPFILTER];
+  packet->sampler0_address_u = self->sampler_states[0][D3DSAMP_ADDRESSU];
+  packet->sampler0_address_v = self->sampler_states[0][D3DSAMP_ADDRESSV];
+  packet->sampler0_address_w = self->sampler_states[0][D3DSAMP_ADDRESSW];
+  packet->tss0_color_op = self->tex_stage_states[0][D3DTSS_COLOROP];
+  packet->tss0_color_arg1 = self->tex_stage_states[0][D3DTSS_COLORARG1];
+  packet->tss0_color_arg2 = self->tex_stage_states[0][D3DTSS_COLORARG2];
+  packet->tss0_alpha_op = self->tex_stage_states[0][D3DTSS_ALPHAOP];
+  packet->tss0_alpha_arg1 = self->tex_stage_states[0][D3DTSS_ALPHAARG1];
+  packet->tss0_alpha_arg2 = self->tex_stage_states[0][D3DTSS_ALPHAARG2];
+  packet->rs_texture_factor = self->render_states[D3DRS_TEXTUREFACTOR];
+  packet->rs_alpha_blend_enable = self->render_states[D3DRS_ALPHABLENDENABLE];
+  packet->rs_src_blend = self->render_states[D3DRS_SRCBLEND];
+  packet->rs_dest_blend = self->render_states[D3DRS_DESTBLEND];
+  packet->rs_alpha_test_enable = self->render_states[D3DRS_ALPHATESTENABLE];
+  packet->rs_alpha_ref = self->render_states[D3DRS_ALPHAREF];
+  packet->rs_alpha_func = self->render_states[D3DRS_ALPHAFUNC];
+
+  base_texture = self->textures[0];
+  if (!base_texture) {
+    return;
+  }
+
+  type = IDirect3DBaseTexture9_GetType(base_texture);
+  if (type != D3DRTYPE_TEXTURE) {
+    return;
+  }
+
+  texture = dx9mt_texture_from_iface((IDirect3DTexture9 *)base_texture);
+  if (!texture || texture->levels == 0 || !texture->surfaces) {
+    return;
+  }
+
+  level = texture->lod;
+  if (level >= texture->levels) {
+    level = 0;
+  }
+  if (!texture->surfaces[level]) {
+    return;
+  }
+  surface = dx9mt_surface_from_iface(texture->surfaces[level]);
+
+  packet->texture0_id = texture->object_id;
+  packet->texture0_generation = texture->generation;
+  packet->texture0_format = (uint32_t)texture->format;
+  packet->texture0_width = texture->width >> level;
+  packet->texture0_height = texture->height >> level;
+  if (packet->texture0_width == 0) {
+    packet->texture0_width = 1;
+  }
+  if (packet->texture0_height == 0) {
+    packet->texture0_height = 1;
+  }
+  packet->texture0_pitch = surface->pitch;
+
+  if (!surface->sysmem) {
+    return;
+  }
+
+  upload_size = dx9mt_surface_upload_size(surface);
+  if (upload_size == 0) {
+    return;
+  }
+
+  should_upload = FALSE;
+  if (texture->last_upload_generation != texture->generation) {
+    should_upload = TRUE;
+  } else if (texture->last_upload_frame_id != self->frame_id) {
+    /* Periodically refresh static textures so viewer cache can recover. */
+    if (((self->frame_id + texture->object_id) %
+         DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL) == 0u) {
+      should_upload = TRUE;
+    }
+  }
+  if (!should_upload) {
+    return;
+  }
+
+  packet->texture0_data =
+      dx9mt_frontend_upload_copy(self->frame_id, surface->sysmem, upload_size);
+  if (packet->texture0_data.size > 0) {
+    texture->last_upload_generation = texture->generation;
+    texture->last_upload_frame_id = self->frame_id;
+  }
+}
+
 static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
     IDirect3DDevice9 *iface, D3DPRIMITIVETYPE primitive_type,
     INT base_vertex_index, UINT min_vertex_index, UINT num_vertices,
@@ -4576,6 +5058,13 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
       dx9mt_surface_object_id_from_iface(self->render_targets[0]);
   packet.depth_stencil_id =
       dx9mt_surface_object_id_from_iface(self->depth_stencil);
+  if (self->render_targets[0]) {
+    dx9mt_surface *rt0 = dx9mt_surface_from_iface(self->render_targets[0]);
+    packet.render_target_texture_id = dx9mt_surface_container_texture_id(rt0);
+    packet.render_target_width = rt0->desc.Width;
+    packet.render_target_height = rt0->desc.Height;
+    packet.render_target_format = (uint32_t)rt0->desc.Format;
+  }
   packet.vertex_buffer_id =
       dx9mt_vb_object_id_from_iface(self->streams[0]);
   packet.index_buffer_id = dx9mt_ib_object_id_from_iface(self->indices);
@@ -4635,8 +5124,21 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
           self->frame_id, decl->elements,
           decl->count * (uint32_t)sizeof(D3DVERTEXELEMENT9));
       packet.vertex_decl_count = (uint16_t)decl->count;
+    } else if (self->fvf != 0) {
+      /* No vertex declaration -- synthesize from FVF code. */
+      D3DVERTEXELEMENT9 fvf_elems[16];
+      uint16_t fvf_count =
+          dx9mt_fvf_to_vertex_elements(self->fvf, fvf_elems, 16);
+      if (fvf_count > 0) {
+        packet.vertex_decl_data = dx9mt_frontend_upload_copy(
+            self->frame_id, fvf_elems,
+            fvf_count * (uint32_t)sizeof(D3DVERTEXELEMENT9));
+        packet.vertex_decl_count = fvf_count;
+      }
     }
   }
+
+  dx9mt_device_fill_draw_texture_stage0(self, &packet);
 
   packet.state_block_hash = dx9mt_hash_draw_state(&packet);
 
@@ -4661,6 +5163,8 @@ static HRESULT WINAPI dx9mt_device_SetVertexDeclaration(
   dx9mt_safe_addref((IUnknown *)decl);
   dx9mt_safe_release((IUnknown *)self->vertex_decl);
   self->vertex_decl = decl;
+  /* In real D3D9, SetVertexDeclaration replaces the active FVF. */
+  self->fvf = 0;
   return D3D_OK;
 }
 
@@ -4681,6 +5185,9 @@ static HRESULT WINAPI dx9mt_device_GetVertexDeclaration(
 static HRESULT WINAPI dx9mt_device_SetFVF(IDirect3DDevice9 *iface, DWORD fvf) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   self->fvf = fvf;
+  /* In real D3D9, SetFVF replaces the active vertex declaration. */
+  dx9mt_safe_release((IUnknown *)self->vertex_decl);
+  self->vertex_decl = NULL;
   return D3D_OK;
 }
 
@@ -5047,6 +5554,7 @@ HRESULT dx9mt_device_create(IDirect3D9 *parent, UINT adapter,
   device->behavior_flags = behavior_flags;
   device->software_vp = (behavior_flags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) != 0;
   device->frame_id = 1;
+  dx9mt_device_init_default_states(device);
 
   if (parent) {
     IDirect3D9_AddRef(parent);
