@@ -267,9 +267,9 @@ static NSString *const s_shader_source =
      "  uint alpha_arg1;\n"
      "  uint alpha_arg2;\n"
      "  uint texture_factor_argb;\n"
+     "  uint has_pixel_shader;\n"
      "  uint _pad0;\n"
-     "  uint _pad1;\n"
-     "  uint _pad2;\n"
+     "  float4 ps_c0;\n"
      "};\n"
      "static inline float4 d3d_decode_tfactor(uint argb) {\n"
      "  float a = float((argb >> 24) & 0xFFu) / 255.0;\n"
@@ -457,6 +457,8 @@ static NSString *const s_shader_source =
      "    float a2 = d3d_resolve_alpha(p.alpha_arg2, current, diffuse, texel, tfactor);\n"
      "    out_color.rgb = d3d_color_op(p.color_op, c1, c2, current, diffuse, texel, tfactor);\n"
      "    out_color.a = d3d_alpha_op(p.alpha_op, a1, a2, current, diffuse, texel, tfactor);\n"
+     "  } else if (p.has_pixel_shader != 0u) {\n"
+     "    out_color = p.ps_c0;\n"
      "  } else {\n"
      "    out_color = diffuse;\n"
      "  }\n"
@@ -489,6 +491,8 @@ static NSString *const s_shader_source =
      "    float a2 = d3d_resolve_alpha(p.alpha_arg2, current, diffuse, t, tfactor);\n"
      "    out_color.rgb = d3d_color_op(p.color_op, c1, c2, current, diffuse, t, tfactor);\n"
      "    out_color.a = d3d_alpha_op(p.alpha_op, a1, a2, current, diffuse, t, tfactor);\n"
+     "  } else if (p.has_pixel_shader != 0u) {\n"
+     "    out_color = t * p.ps_c0;\n"
      "  } else {\n"
      "    out_color = diffuse * t;\n"
      "  }\n"
@@ -1813,25 +1817,43 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         uint32_t alpha_arg1;
         uint32_t alpha_arg2;
         uint32_t texture_factor_argb;
+        uint32_t has_pixel_shader;
         uint32_t _pad0;
-        uint32_t _pad1;
-        uint32_t _pad2;
-      } frag_params = {(uint32_t)(decl_has_color ? 1 : 0),
-                       (uint32_t)(d->pixel_shader_id == 0 ? 1 : 0),
-                       (uint32_t)(d->texture0_format == D3DFMT_A8 ? 1 : 0),
-                       (uint32_t)(d->texture0_format == D3DFMT_X8R8G8B8 ? 1
-                                                                         : 0),
-                       (uint32_t)(d->rs_alpha_test_enable ? 1 : 0),
-                       (float)(d->rs_alpha_ref & 0xFFu) / 255.0f,
-                       alpha_func,
-                       color_op,
-                       d->tss0_color_arg1,
-                       d->tss0_color_arg2,
-                       alpha_op,
-                       d->tss0_alpha_arg1,
-                       d->tss0_alpha_arg2,
-                       d->rs_texture_factor,
-                       0, 0, 0};
+        float ps_c0[4];
+      } frag_params;
+      memset(&frag_params, 0, sizeof(frag_params));
+      frag_params.use_vertex_color = (uint32_t)(decl_has_color ? 1 : 0);
+      frag_params.use_stage0_combiner =
+          (uint32_t)(d->pixel_shader_id == 0 ? 1 : 0);
+      frag_params.alpha_only =
+          (uint32_t)(d->texture0_format == D3DFMT_A8 ? 1 : 0);
+      frag_params.force_alpha_one =
+          (uint32_t)(d->texture0_format == D3DFMT_X8R8G8B8 ? 1 : 0);
+      frag_params.alpha_test_enable =
+          (uint32_t)(d->rs_alpha_test_enable ? 1 : 0);
+      frag_params.alpha_ref = (float)(d->rs_alpha_ref & 0xFFu) / 255.0f;
+      frag_params.alpha_func = alpha_func;
+      frag_params.color_op = color_op;
+      frag_params.color_arg1 = d->tss0_color_arg1;
+      frag_params.color_arg2 = d->tss0_color_arg2;
+      frag_params.alpha_op = alpha_op;
+      frag_params.alpha_arg1 = d->tss0_alpha_arg1;
+      frag_params.alpha_arg2 = d->tss0_alpha_arg2;
+      frag_params.texture_factor_argb = d->rs_texture_factor;
+      frag_params.has_pixel_shader =
+          (uint32_t)(d->pixel_shader_id != 0 ? 1 : 0);
+      frag_params.ps_c0[0] = 1.0f;
+      frag_params.ps_c0[1] = 1.0f;
+      frag_params.ps_c0[2] = 1.0f;
+      frag_params.ps_c0[3] = 1.0f;
+      if (d->pixel_shader_id != 0 && d->ps_constants_size >= 16) {
+        const float *ps_data = (const float *)(ipc_base + bulk_off +
+                                                d->ps_constants_bulk_offset);
+        frag_params.ps_c0[0] = ps_data[0];
+        frag_params.ps_c0[1] = ps_data[1];
+        frag_params.ps_c0[2] = ps_data[2];
+        frag_params.ps_c0[3] = ps_data[3];
+      }
       if (draw_texture) {
         [encoder setFragmentBytes:&frag_params
                            length:sizeof(frag_params)
