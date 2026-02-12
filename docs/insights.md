@@ -33,26 +33,54 @@ The PE DLL accesses Unix paths via the Z: drive. `CreateFileA("Z:\\tmp\\foo")` m
 Originally `BeginScene` called `begin_frame()` as a direct side-channel. Now it emits a `BEGIN_FRAME` packet through `submit_packets`, making the stream self-describing. The backend parser dispatches `BEGIN_FRAME` packets to the same `begin_frame()` logic.
 
 ### Draw packet carries full geometry data
-`dx9mt_packet_draw_indexed` includes upload refs for VB data, IB data, vertex declaration, VS constants, and PS constants. The frontend copies all this into the upload arena on every `DrawIndexedPrimitive`. The IPC writer then copies from the arena into the shared memory bulk region.
+`dx9mt_packet_draw_indexed` includes upload refs for VB data, IB data, vertex declaration, VS constants, PS constants, and texture data. The frontend copies all this into the upload arena on every `DrawIndexedPrimitive`. The IPC writer then copies from the arena into the shared memory bulk region.
 
 ### Upload arena overflow returns zero-ref, not corrupt data
 When a slot runs out of space, `dx9mt_frontend_upload_copy` returns a zero-ref instead of wrapping to offset 0. The backend rejects draws with zero-size constant refs. This prevents silent shader constant corruption.
 
 ## Metal Rendering
 
-### WVP matrix extraction works for FNV
-D3D9 SM3.0 vertex shaders commonly store the world-view-projection matrix in constants c0-c3. The Metal vertex shader reads these 4 float4s, transposes from D3D9 row-major to Metal column-major, and multiplies the position. FNV's main menu renders correctly with this approach.
+### WVP matrix extraction works for FNV menu
+D3D9 SM3.0 vertex shaders commonly store the world-view-projection matrix in constants c0-c3. The Metal vertex shader reads these 4 float4s, transposes from D3D9 row-major to Metal column-major, and multiplies the position. FNV's main menu renders correctly with this approach. This is a temporary approximation until proper shader translation.
 
 ### D3D9 vertex declarations map cleanly to Metal vertex descriptors
-`D3DVERTEXELEMENT9` (stream, offset, type, usage) translates to `MTLVertexDescriptor` attributes. Type mapping: `D3DDECLTYPE_FLOAT3` -> `MTLVertexFormatFloat3`, `D3DDECLTYPE_D3DCOLOR` -> `MTLVertexFormatUChar4Normalized`, etc. The PSO is cached by vertex stride.
+`D3DVERTEXELEMENT9` (stream, offset, type, usage) translates to `MTLVertexDescriptor` attributes. Type mapping: `D3DDECLTYPE_FLOAT3` -> `MTLVertexFormatFloat3`, `D3DDECLTYPE_D3DCOLOR` -> `MTLVertexFormatUChar4Normalized`, etc. The PSO is cached by (vertex layout + blend state) hash.
 
-### Metal buffer creation per-draw is wasteful but sufficient for now
-Each draw creates `newBufferWithBytes` for VB and IB. At ~19 draws/frame with small buffers this doesn't bottleneck. Optimization path: buffer ring allocator with sub-allocation.
+### FVF-to-vertex-declaration conversion
+Games using `SetFVF` instead of `SetVertexDeclaration` get their FVF bitmask converted to an equivalent `D3DVERTEXELEMENT9` array in the frontend's `DrawIndexedPrimitive`. This handles position type variants (XYZ, XYZRHW, XYZW, XYZBn), normals, diffuse/specular colors, and texture coordinates with per-coordinate format bits.
 
 ### Standalone NSWindow works alongside Wine
 The Metal viewer creates its own `NSWindow` with `CAMetalLayer`. Wine's macOS driver runs its own `NSApplication` event loop. The viewer runs a separate `NSApplication` in its own process, avoiding conflicts. `dispatch_sync(main_queue)` handles window creation from non-main threads.
 
+## Texture Pipeline
+
+### Texture caching with generation tracking
+Each `dx9mt_texture` has a `generation` counter incremented on Lock/Unlock, AddDirtyRect, and surface copy operations. The frontend only uploads texture data when the generation changes (or on a periodic 60-frame refresh for cache recovery). The viewer caches `MTLTexture` objects by `(object_id, generation)` and skips re-creation when the generation matches.
+
+### DXT compressed texture support
+D3D9 DXT1/DXT3/DXT5 formats map directly to Metal's BC1_RGBA/BC2_RGBA/BC3_RGBA. Block-compressed pitch is calculated as `((width + 3) / 4) * block_bytes` where block_bytes is 8 for DXT1 and 16 for DXT3/DXT5. The frontend computes this correctly for both surface allocation and upload sizing.
+
+### Render-target texture routing
+Draws can target offscreen render targets (not just the swapchain). The viewer tracks per-draw `render_target_id` and creates separate `MTLTexture` objects for each RT. When a later draw samples a texture whose `texture_id` matches a previous RT's `render_target_texture_id`, the viewer substitutes the RT's Metal texture. This enables render-to-texture effects (e.g., UI compositing).
+
+## Fragment Shader Strategy
+
+### Three-tier fragment shader fallback
+The Metal viewer uses a tiered approach for fragment shading:
+
+1. **TSS fixed-function combiner** (`use_stage0_combiner=1`, when `pixel_shader_id==0`): Full D3D9 texture stage state evaluation. Supports all D3DTOP operations (MODULATE, SELECTARG, ADD, BLEND*, etc.) with configurable arg sources (TEXTURE, CURRENT, DIFFUSE, TFACTOR).
+
+2. **PS constant c0 tint** (`has_pixel_shader=1`): When a D3D9 pixel shader is active but can't be translated, the viewer reads PS constant register c0 and multiplies it by the texture sample. This approximation works for FNV's menu shaders (which are essentially `output = texture * c0`).
+
+3. **Raw passthrough** (no PS, no TSS): `output = diffuse * texture` (textured) or `output = diffuse` (non-textured).
+
+### D3D9 TSS state is irrelevant when a pixel shader is active
+When a pixel shader is bound, D3D9 completely ignores texture stage state. Games may set TSS to anything (including DISABLE) while a pixel shader handles all texturing. The viewer mirrors this: `use_stage0_combiner` is only set when `pixel_shader_id == 0`.
+
 ## Debugging
+
+### Frame dump for per-draw diagnosis
+The Metal viewer can dump per-draw state to `/tmp/dx9mt_frame_dump.txt`. Each draw shows: primitive type/count, vertex format, texture info (id, generation, format, size, upload status), TSS state, sampler state, blend state, viewport, and vertex data samples. Key field: `upload=0` means the texture is in the viewer's cache (no upload needed this frame), NOT that data is missing.
 
 ### Sampled logging prevents log flooding
 High-frequency calls (GetDeviceCaps, CheckDeviceFormat, DebugSetMute) use `dx9mt_should_log_method_sample(&counter, first_n, every_n)`. First N calls logged in full, then every Nth call. Backend frames log on frames 0-9 then every 120th.
