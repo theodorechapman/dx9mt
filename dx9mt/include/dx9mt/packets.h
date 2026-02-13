@@ -135,6 +135,9 @@ typedef struct dx9mt_packet_draw_indexed {
   uint32_t rs_stencilref;
   uint32_t rs_stencilmask;
   uint32_t rs_stencilwritemask;
+
+  /* RB5: rasterizer state */
+  uint32_t rs_cull_mode;
 } dx9mt_packet_draw_indexed;
 
 typedef struct dx9mt_packet_present {

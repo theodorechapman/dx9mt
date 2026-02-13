@@ -904,6 +904,19 @@ static id<MTLTexture> ensure_drawable_depth_texture(uint32_t w, uint32_t h) {
   return s_drawable_depth_texture;
 }
 
+static MTLCullMode d3d_cull_to_mtl(uint32_t cull_mode) {
+  switch (cull_mode) {
+  case 1: /* D3DCULL_NONE */
+    return MTLCullModeNone;
+  case 2: /* D3DCULL_CW */
+    return MTLCullModeFront;
+  case 3: /* D3DCULL_CCW */
+    return MTLCullModeBack;
+  default:
+    return MTLCullModeBack;
+  }
+}
+
 static id<MTLDepthStencilState>
 depth_stencil_state_for_draw(const volatile dx9mt_metal_ipc_draw *d) {
   uint32_t zenable = d->rs_zenable;
@@ -1778,8 +1791,8 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
             d3d_blend_name(d->rs_dest_blend));
     fprintf(f, "  alpha_test: enable=%u  ref=%u  func=%u\n",
             d->rs_alpha_test_enable, d->rs_alpha_ref, d->rs_alpha_func);
-    fprintf(f, "  depth: enable=%u  write=%u  func=%u\n",
-            d->rs_zenable, d->rs_zwriteenable, d->rs_zfunc);
+    fprintf(f, "  depth: enable=%u  write=%u  func=%u  cull=%u\n",
+            d->rs_zenable, d->rs_zwriteenable, d->rs_zfunc, d->rs_cull_mode);
     fprintf(f, "  stencil: enable=%u  func=%u  ref=%u  mask=0x%08x  writemask=0x%08x\n",
             d->rs_stencilenable, d->rs_stencilfunc, d->rs_stencilref,
             d->rs_stencilmask, d->rs_stencilwritemask);
@@ -2330,6 +2343,9 @@ static void render_frame(const volatile unsigned char *ipc_base) {
           [encoder setDepthStencilState:ds_state];
         }
       }
+
+      /* RB5: set cull mode per draw */
+      [encoder setCullMode:d3d_cull_to_mtl(d->rs_cull_mode)];
 
       [encoder drawIndexedPrimitives:d3d_prim_to_mtl(d->primitive_type)
                           indexCount:index_count

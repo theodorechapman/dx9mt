@@ -120,6 +120,9 @@ typedef struct dx9mt_metal_ipc_draw {
   uint32_t rs_stencilref;
   uint32_t rs_stencilmask;
   uint32_t rs_stencilwritemask;
+
+  /* RB5: rasterizer state */
+  uint32_t rs_cull_mode;
 } dx9mt_metal_ipc_draw;
 
 typedef struct dx9mt_metal_ipc_header {

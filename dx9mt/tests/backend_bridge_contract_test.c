@@ -68,6 +68,7 @@ static dx9mt_packet_draw_indexed make_valid_draw_packet(uint32_t sequence) {
   packet.rs_stencilref = 0;
   packet.rs_stencilmask = 0xFFFFFFFFu;
   packet.rs_stencilwritemask = 0xFFFFFFFFu;
+  packet.rs_cull_mode = 2;          /* D3DCULL_CCW */
   return packet;
 }
 

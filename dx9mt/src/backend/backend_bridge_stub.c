@@ -159,6 +159,9 @@ typedef struct dx9mt_backend_draw_command {
   uint32_t rs_stencilref;
   uint32_t rs_stencilmask;
   uint32_t rs_stencilwritemask;
+
+  /* RB5: rasterizer state */
+  uint32_t rs_cull_mode;
 } dx9mt_backend_draw_command;
 
 #define DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME 8192u
@@ -286,6 +289,7 @@ dx9mt_backend_draw_command_hash(const dx9mt_backend_draw_command *command) {
   hash = dx9mt_backend_hash_u32(hash, command->rs_stencilref);
   hash = dx9mt_backend_hash_u32(hash, command->rs_stencilmask);
   hash = dx9mt_backend_hash_u32(hash, command->rs_stencilwritemask);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_cull_mode);
   hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_vs);
   hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_ps);
   return hash;
@@ -694,6 +698,7 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
   command->rs_stencilref = draw_packet->rs_stencilref;
   command->rs_stencilmask = draw_packet->rs_stencilmask;
   command->rs_stencilwritemask = draw_packet->rs_stencilwritemask;
+  command->rs_cull_mode = draw_packet->rs_cull_mode;
   command->constants_vs = draw_packet->constants_vs;
   command->constants_ps = draw_packet->constants_ps;
   command->viewport_x = draw_packet->viewport_x;
@@ -1165,6 +1170,7 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       d->rs_stencilref = cmd->rs_stencilref;
       d->rs_stencilmask = cmd->rs_stencilmask;
       d->rs_stencilwritemask = cmd->rs_stencilwritemask;
+      d->rs_cull_mode = cmd->rs_cull_mode;
 
       /* Copy VB data into bulk region */
       data = dx9mt_frontend_upload_resolve(&cmd->vertex_data);

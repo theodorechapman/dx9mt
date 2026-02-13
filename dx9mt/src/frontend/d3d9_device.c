@@ -634,6 +634,7 @@ dx9mt_hash_draw_state(const dx9mt_packet_draw_indexed *packet) {
   hash = dx9mt_hash_u32(hash, packet->rs_stencilref);
   hash = dx9mt_hash_u32(hash, packet->rs_stencilmask);
   hash = dx9mt_hash_u32(hash, packet->rs_stencilwritemask);
+  hash = dx9mt_hash_u32(hash, packet->rs_cull_mode);
   return hash;
 }
 
@@ -3859,6 +3860,7 @@ static void dx9mt_device_init_default_states(dx9mt_device *self) {
   self->render_states[D3DRS_STENCILREF] = 0;
   self->render_states[D3DRS_STENCILMASK] = 0xFFFFFFFFu;
   self->render_states[D3DRS_STENCILWRITEMASK] = 0xFFFFFFFFu;
+  self->render_states[D3DRS_CULLMODE] = D3DCULL_CCW;
 }
 
 static void dx9mt_device_release_bindings(dx9mt_device *self) {
@@ -4990,6 +4992,7 @@ dx9mt_device_fill_draw_texture_stage0(dx9mt_device *self,
   packet->rs_stencilref = self->render_states[D3DRS_STENCILREF];
   packet->rs_stencilmask = self->render_states[D3DRS_STENCILMASK];
   packet->rs_stencilwritemask = self->render_states[D3DRS_STENCILWRITEMASK];
+  packet->rs_cull_mode = self->render_states[D3DRS_CULLMODE];
 
   base_texture = self->textures[0];
   if (!base_texture) {

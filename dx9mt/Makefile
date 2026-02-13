@@ -4,7 +4,7 @@ BACKEND_CC ?= clang
 BUILD_DIR := build
 OBJ_DIR := $(BUILD_DIR)/obj
 
-FRONTEND_CFLAGS := -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude -DWIN32_LEAN_AND_MEAN
+FRONTEND_CFLAGS := -std=c11 -Wall -Wextra -Wno-unused-parameter -Iinclude -DWIN32_LEAN_AND_MEAN 
 FRONTEND_LDFLAGS := -shared -Wl,--kill-at -luuid -lgdi32
 FRONTEND_DEF := src/frontend/d3d9.def
 

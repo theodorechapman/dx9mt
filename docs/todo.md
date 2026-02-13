@@ -60,9 +60,11 @@
 ## Current Priority: RB5 -- In-Game Rendering
 
 ### Shader Translation Hardening
-- [x] Hard-fail on malformed streams and unsupported flow-control opcodes (rep/endif/if/etc.)
+- [x] Hard-fail on malformed streams and unsupported flow-control opcodes (all: rep/endrep/if/ifc/else/endif/break/breakc)
 - [x] Hard-fail on unsupported relative addressing (a0 dynamic indexing)
-- [x] Hard-fail on unsupported multi-texture declarations/usages beyond s0
+- [x] Hard-fail on unsupported multi-texture declarations/usages beyond s0 (PS only; VS allows multi-sampler for vtf)
+- [x] Remove dead flow-control comment emission from MSL emitter
+- [x] Graceful fallback to TSS/c0 path when shader translation fails (instead of skipping draw)
 - [ ] Flow control translation (if/else/endif, rep/endrep, break/breakc)
 - [ ] Relative addressing (a0 register for dynamic constant indexing)
 - [ ] Multi-texture support in translated PS (tex1..tex7 bindings)
