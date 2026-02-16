@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "dx9mt/packets.h" /* DX9MT_MAX_PS_SAMPLERS */
+
 /*
  * Shared memory IPC for PE DLL <-> native Metal viewer.
  *
@@ -53,22 +55,22 @@ typedef struct dx9mt_metal_ipc_draw {
   uint32_t stream0_stride;
   uint32_t index_format;
 
-  /* RB3 Phase 2A: concrete stage-0 texture + sampler state */
-  uint32_t texture0_id;
-  uint32_t texture0_generation;
-  uint32_t texture0_format;
-  uint32_t texture0_width;
-  uint32_t texture0_height;
-  uint32_t texture0_pitch;
+  /* RB5: multi-texture stage arrays (stages 0..7) */
+  uint32_t tex_id[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_generation[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_format[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_width[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_height[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_pitch[DX9MT_MAX_PS_SAMPLERS];
 
-  uint32_t sampler0_min_filter;
-  uint32_t sampler0_mag_filter;
-  uint32_t sampler0_mip_filter;
-  uint32_t sampler0_address_u;
-  uint32_t sampler0_address_v;
-  uint32_t sampler0_address_w;
+  uint32_t sampler_min_filter[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_mag_filter[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_mip_filter[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_address_u[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_address_v[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_address_w[DX9MT_MAX_PS_SAMPLERS];
 
-  /* RB3 Phase 2C: stage-0 fixed-function combiner state */
+  /* Stage-0 fixed-function combiner state (TSS path only) */
   uint32_t tss0_color_op;
   uint32_t tss0_color_arg1;
   uint32_t tss0_color_arg2;
@@ -90,8 +92,8 @@ typedef struct dx9mt_metal_ipc_draw {
   uint32_t vb_bulk_size;
   uint32_t ib_bulk_offset;
   uint32_t ib_bulk_size;
-  uint32_t texture0_bulk_offset;
-  uint32_t texture0_bulk_size;
+  uint32_t tex_bulk_offset[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_bulk_size[DX9MT_MAX_PS_SAMPLERS];
 
   /* Vertex declaration: D3DVERTEXELEMENT9 is 8 bytes each */
   uint32_t decl_bulk_offset;

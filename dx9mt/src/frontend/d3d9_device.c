@@ -605,14 +605,16 @@ dx9mt_hash_draw_state(const dx9mt_packet_draw_indexed *packet) {
   hash = dx9mt_hash_u32(hash, packet->texture_stage_hash);
   hash = dx9mt_hash_u32(hash, packet->sampler_state_hash);
   hash = dx9mt_hash_u32(hash, packet->stream_binding_hash);
-  hash = dx9mt_hash_u32(hash, packet->texture0_id);
-  hash = dx9mt_hash_u32(hash, packet->texture0_generation);
-  hash = dx9mt_hash_u32(hash, packet->sampler0_min_filter);
-  hash = dx9mt_hash_u32(hash, packet->sampler0_mag_filter);
-  hash = dx9mt_hash_u32(hash, packet->sampler0_mip_filter);
-  hash = dx9mt_hash_u32(hash, packet->sampler0_address_u);
-  hash = dx9mt_hash_u32(hash, packet->sampler0_address_v);
-  hash = dx9mt_hash_u32(hash, packet->sampler0_address_w);
+  for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+    hash = dx9mt_hash_u32(hash, packet->tex_id[s]);
+    hash = dx9mt_hash_u32(hash, packet->tex_generation[s]);
+    hash = dx9mt_hash_u32(hash, packet->sampler_min_filter[s]);
+    hash = dx9mt_hash_u32(hash, packet->sampler_mag_filter[s]);
+    hash = dx9mt_hash_u32(hash, packet->sampler_mip_filter[s]);
+    hash = dx9mt_hash_u32(hash, packet->sampler_address_u[s]);
+    hash = dx9mt_hash_u32(hash, packet->sampler_address_v[s]);
+    hash = dx9mt_hash_u32(hash, packet->sampler_address_w[s]);
+  }
   hash = dx9mt_hash_u32(hash, packet->tss0_color_op);
   hash = dx9mt_hash_u32(hash, packet->tss0_color_arg1);
   hash = dx9mt_hash_u32(hash, packet->tss0_color_arg2);
@@ -4951,26 +4953,15 @@ static uint16_t dx9mt_fvf_to_vertex_elements(DWORD fvf,
 }
 
 static void
-dx9mt_device_fill_draw_texture_stage0(dx9mt_device *self,
-                                      dx9mt_packet_draw_indexed *packet) {
-  IDirect3DBaseTexture9 *base_texture;
-  D3DRESOURCETYPE type;
-  dx9mt_texture *texture;
-  uint32_t level;
-  dx9mt_surface *surface;
-  uint32_t upload_size;
-  WINBOOL should_upload;
+dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
+                                       dx9mt_packet_draw_indexed *packet) {
+  uint32_t stage;
 
   if (!self || !packet) {
     return;
   }
 
-  packet->sampler0_min_filter = self->sampler_states[0][D3DSAMP_MINFILTER];
-  packet->sampler0_mag_filter = self->sampler_states[0][D3DSAMP_MAGFILTER];
-  packet->sampler0_mip_filter = self->sampler_states[0][D3DSAMP_MIPFILTER];
-  packet->sampler0_address_u = self->sampler_states[0][D3DSAMP_ADDRESSU];
-  packet->sampler0_address_v = self->sampler_states[0][D3DSAMP_ADDRESSV];
-  packet->sampler0_address_w = self->sampler_states[0][D3DSAMP_ADDRESSW];
+  /* Stage-0 fixed-function combiner state (TSS path only) */
   packet->tss0_color_op = self->tex_stage_states[0][D3DTSS_COLOROP];
   packet->tss0_color_arg1 = self->tex_stage_states[0][D3DTSS_COLORARG1];
   packet->tss0_color_arg2 = self->tex_stage_states[0][D3DTSS_COLORARG2];
@@ -4978,6 +4969,8 @@ dx9mt_device_fill_draw_texture_stage0(dx9mt_device *self,
   packet->tss0_alpha_arg1 = self->tex_stage_states[0][D3DTSS_ALPHAARG1];
   packet->tss0_alpha_arg2 = self->tex_stage_states[0][D3DTSS_ALPHAARG2];
   packet->rs_texture_factor = self->render_states[D3DRS_TEXTUREFACTOR];
+
+  /* Global render states */
   packet->rs_alpha_blend_enable = self->render_states[D3DRS_ALPHABLENDENABLE];
   packet->rs_src_blend = self->render_states[D3DRS_SRCBLEND];
   packet->rs_dest_blend = self->render_states[D3DRS_DESTBLEND];
@@ -4994,71 +4987,88 @@ dx9mt_device_fill_draw_texture_stage0(dx9mt_device *self,
   packet->rs_stencilwritemask = self->render_states[D3DRS_STENCILWRITEMASK];
   packet->rs_cull_mode = self->render_states[D3DRS_CULLMODE];
 
-  base_texture = self->textures[0];
-  if (!base_texture) {
-    return;
-  }
+  /* Per-stage texture and sampler data */
+  for (stage = 0; stage < DX9MT_MAX_PS_SAMPLERS; ++stage) {
+    IDirect3DBaseTexture9 *base_texture;
+    D3DRESOURCETYPE type;
+    dx9mt_texture *texture;
+    uint32_t level;
+    dx9mt_surface *surface;
+    uint32_t upload_size;
+    WINBOOL should_upload;
 
-  type = IDirect3DBaseTexture9_GetType(base_texture);
-  if (type != D3DRTYPE_TEXTURE) {
-    return;
-  }
+    packet->sampler_min_filter[stage] = self->sampler_states[stage][D3DSAMP_MINFILTER];
+    packet->sampler_mag_filter[stage] = self->sampler_states[stage][D3DSAMP_MAGFILTER];
+    packet->sampler_mip_filter[stage] = self->sampler_states[stage][D3DSAMP_MIPFILTER];
+    packet->sampler_address_u[stage] = self->sampler_states[stage][D3DSAMP_ADDRESSU];
+    packet->sampler_address_v[stage] = self->sampler_states[stage][D3DSAMP_ADDRESSV];
+    packet->sampler_address_w[stage] = self->sampler_states[stage][D3DSAMP_ADDRESSW];
 
-  texture = dx9mt_texture_from_iface((IDirect3DTexture9 *)base_texture);
-  if (!texture || texture->levels == 0 || !texture->surfaces) {
-    return;
-  }
-
-  level = texture->lod;
-  if (level >= texture->levels) {
-    level = 0;
-  }
-  if (!texture->surfaces[level]) {
-    return;
-  }
-  surface = dx9mt_surface_from_iface(texture->surfaces[level]);
-
-  packet->texture0_id = texture->object_id;
-  packet->texture0_generation = texture->generation;
-  packet->texture0_format = (uint32_t)texture->format;
-  packet->texture0_width = texture->width >> level;
-  packet->texture0_height = texture->height >> level;
-  if (packet->texture0_width == 0) {
-    packet->texture0_width = 1;
-  }
-  if (packet->texture0_height == 0) {
-    packet->texture0_height = 1;
-  }
-  packet->texture0_pitch = surface->pitch;
-
-  if (!surface->sysmem) {
-    return;
-  }
-
-  upload_size = dx9mt_surface_upload_size(surface);
-  if (upload_size == 0) {
-    return;
-  }
-
-  should_upload = FALSE;
-  if (texture->last_upload_generation != texture->generation) {
-    should_upload = TRUE;
-  } else if (texture->last_upload_frame_id != self->frame_id) {
-    /* Periodically refresh static textures so viewer cache can recover. */
-    if (((self->frame_id + texture->object_id) %
-         DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL) == 0u) {
-      should_upload = TRUE;
+    base_texture = self->textures[stage];
+    if (!base_texture) {
+      continue;
     }
-  }
-  if (!should_upload) {
-    return;
-  }
 
-  packet->texture0_data =
-      dx9mt_frontend_upload_copy(self->frame_id, surface->sysmem, upload_size);
-  if (packet->texture0_data.size > 0) {
-    texture->last_upload_generation = texture->generation;
-    texture->last_upload_frame_id = self->frame_id;
+    type = IDirect3DBaseTexture9_GetType(base_texture);
+    if (type != D3DRTYPE_TEXTURE) {
+      continue;
+    }
+
+    texture = dx9mt_texture_from_iface((IDirect3DTexture9 *)base_texture);
+    if (!texture || texture->levels == 0 || !texture->surfaces) {
+      continue;
+    }
+
+    level = texture->lod;
+    if (level >= texture->levels) {
+      level = 0;
+    }
+    if (!texture->surfaces[level]) {
+      continue;
+    }
+    surface = dx9mt_surface_from_iface(texture->surfaces[level]);
+
+    packet->tex_id[stage] = texture->object_id;
+    packet->tex_generation[stage] = texture->generation;
+    packet->tex_format[stage] = (uint32_t)texture->format;
+    packet->tex_width[stage] = texture->width >> level;
+    packet->tex_height[stage] = texture->height >> level;
+    if (packet->tex_width[stage] == 0) {
+      packet->tex_width[stage] = 1;
+    }
+    if (packet->tex_height[stage] == 0) {
+      packet->tex_height[stage] = 1;
+    }
+    packet->tex_pitch[stage] = surface->pitch;
+
+    if (!surface->sysmem) {
+      continue;
+    }
+
+    upload_size = dx9mt_surface_upload_size(surface);
+    if (upload_size == 0) {
+      continue;
+    }
+
+    should_upload = FALSE;
+    if (texture->last_upload_generation != texture->generation) {
+      should_upload = TRUE;
+    } else if (texture->last_upload_frame_id != self->frame_id) {
+      if (((self->frame_id + texture->object_id) %
+           DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL) == 0u) {
+        should_upload = TRUE;
+      }
+    }
+    if (!should_upload) {
+      continue;
+    }
+
+    packet->tex_data[stage] =
+        dx9mt_frontend_upload_copy(self->frame_id, surface->sysmem, upload_size);
+    if (packet->tex_data[stage].size > 0) {
+      texture->last_upload_generation = texture->generation;
+      texture->last_upload_frame_id = self->frame_id;
+    }
   }
 }
 
@@ -5181,7 +5191,7 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
     }
   }
 
-  dx9mt_device_fill_draw_texture_stage0(self, &packet);
+  dx9mt_device_fill_draw_texture_stages(self, &packet);
 
   packet.state_block_hash = dx9mt_hash_draw_state(&packet);
 

@@ -33,7 +33,7 @@ The PE DLL accesses Unix paths via the Z: drive. `CreateFileA("Z:\\tmp\\foo")` m
 Originally `BeginScene` called `begin_frame()` as a direct side-channel. Now it emits a `BEGIN_FRAME` packet through `submit_packets`, making the stream self-describing. The backend parser dispatches `BEGIN_FRAME` packets to the same `begin_frame()` logic.
 
 ### Draw packet carries full geometry data + shader bytecode
-`dx9mt_packet_draw_indexed` includes upload refs for VB data, IB data, vertex declaration, VS constants, PS constants, texture data, and VS/PS shader bytecode. The frontend copies all this into the upload arena on every `DrawIndexedPrimitive`. The IPC writer then copies from the arena into the shared memory bulk region. Shader bytecode is small (1-10KB per shader) and many draws reuse the same shader, so the same bytecode is uploaded redundantly per-draw but the viewer deduplicates by hash.
+`dx9mt_packet_draw_indexed` includes upload refs for VB data, IB data, vertex declaration, VS constants, PS constants, texture data (8 stages), and VS/PS shader bytecode. The frontend copies all this into the upload arena on every `DrawIndexedPrimitive`. The IPC writer then copies from the arena into the shared memory bulk region. Shader bytecode is small (1-10KB per shader) and many draws reuse the same shader, so the same bytecode is uploaded redundantly per-draw but the viewer deduplicates by hash.
 
 ### Upload arena overflow returns zero-ref, not corrupt data
 When a slot runs out of space, `dx9mt_frontend_upload_copy` returns a zero-ref instead of wrapping to offset 0. The backend rejects draws with zero-size constant refs. This prevents silent shader constant corruption.
@@ -52,6 +52,9 @@ Games using `SetFVF` instead of `SetVertexDeclaration` get their FVF bitmask con
 ### Standalone NSWindow works alongside Wine
 The Metal viewer creates its own `NSWindow` with `CAMetalLayer`. Wine's macOS driver runs its own `NSApplication` event loop. The viewer runs a separate `NSApplication` in its own process, avoiding conflicts. `dispatch_sync(main_queue)` handles window creation from non-main threads.
 
+### D3D9 cull mode winding convention
+D3D9 uses left-handed winding by default. D3DCULL_CW means "cull faces with clockwise winding" which are front faces in Metal's right-handed convention. So D3DCULL_CW maps to MTLCullModeFront and D3DCULL_CCW maps to MTLCullModeBack. The default D3D9 cull mode is D3DCULL_CCW (back-face culling), which maps to MTLCullModeBack. This is set per-draw via `[encoder setCullMode:]`, not baked into the PSO.
+
 ## Texture Pipeline
 
 ### Texture caching with generation tracking
@@ -63,27 +66,52 @@ D3D9 DXT1/DXT3/DXT5 formats map directly to Metal's BC1_RGBA/BC2_RGBA/BC3_RGBA. 
 ### Render-target texture routing
 Draws can target offscreen render targets (not just the swapchain). The viewer tracks per-draw `render_target_id` and creates separate `MTLTexture` objects for each RT. When a later draw samples a texture whose `texture_id` matches a previous RT's `render_target_texture_id`, the viewer substitutes the RT's Metal texture. This enables render-to-texture effects (e.g., UI compositing).
 
-## Shader Translation (RB3 Phase 3)
+### Multi-texture uses arrays, not duplicated fields
+The initial stage-0-only implementation used individual fields (`texture0_id`, `sampler0_min_filter`, etc.) across packets, IPC, and backend structs. For multi-texture (stages 0-7), these were refactored to fixed-size arrays (`tex_id[DX9MT_MAX_PS_SAMPLERS]`, `sampler_min_filter[DX9MT_MAX_PS_SAMPLERS]`). This keeps the code manageable -- copy/hash/validation sites use loops instead of 8x field duplication. The wire format is internal-only so there are no backward compatibility concerns. TSS combiner fields remain stage-0-only since they are irrelevant when a pixel shader is active.
+
+### Multi-texture data budget
+With 8 stages, texture metadata per draw grew from ~80 bytes to ~640 bytes. With DX9MT_METAL_IPC_MAX_DRAWS=256 draws and 16MB IPC, each draw has ~64KB budget, so this fits comfortably. Texture upload data is dominated by cache behavior -- most draws transmit 0 bytes for cached textures. Only first-seen or dirty textures upload actual pixel data.
+
+## Shader Translation (RB3 Phase 3 + RB5)
 
 ### D3D9 SM2.0/SM3.0 bytecode format
 The bytecode is a stream of 32-bit DWORD tokens. Token 0 is the version (`0xFFFE03xx` for VS 3.x, `0xFFFF03xx` for PS 3.x). Each instruction is an opcode token followed by destination and source register tokens. The stream ends with `0x0000FFFF`. Register tokens encode type (5 bits split across bits [30:28] and [12:11]), number (bits [10:0]), and for sources: swizzle (bits [23:16], 2 bits per component) and modifier (bits [27:24]). For destinations: write mask (bits [19:16]) and result modifier (bits [23:20]).
 
-### Transpiler architecture: parse → IR → MSL source → compile → cache
+### Transpiler architecture: parse -> IR -> MSL source -> compile -> cache
 The bytecode is parsed into a flat IR (`dx9mt_sm_program` with instruction/dcl/def arrays), then emitted as MSL source text, compiled with `[MTLDevice newLibraryWithSource:]`, and the resulting `MTLFunction` cached by bytecode hash. Compilation happens once per unique shader; subsequent draws just look up the cache. Failures are sticky (cached as NSNull) to avoid retrying every frame.
 
 ### VS/PS interface uses a "fat" interpolant struct
 The emitted VS output struct and PS input struct must have matching field names and types. Rather than dynamically matching VS output semantics to PS input semantics (complex), the emitter generates per-shader structs based on dcl declarations. The VS writes its declared outputs; the PS reads its declared inputs. As long as the same VS/PS pair is used together, the structs match.
 
 ### Register mapping is straightforward for SM3.0
-- `r#` → `float4 r#` (local variable, initialized to 0)
-- `v#` → `in.v#` (from `[[stage_in]]` struct)
-- `c#` → `c[#]` (constant buffer at buffer index 1 for VS, 0 for PS)
-- `s#` + `texld` → `tex#.sample(samp#, coord.xy)` (texture + sampler pair)
-- `oPos` (rastout 0) → `out.position` with `[[position]]`
-- `oC0` → return value of fragment function
+- `r#` -> `float4 r#` (local variable, initialized to 0)
+- `v#` -> `in.v#` (from `[[stage_in]]` struct)
+- `c#` -> `c[#]` (constant buffer at buffer index 1 for VS, 0 for PS)
+- `i#` -> `float4 i#` (from `defi`, used as loop bounds via `int(i#.x)`)
+- `b#` -> `float4 b#` (from `defb`, used as boolean predicate via `b#.x != 0.0`)
+- `s#` + `texld` -> `tex#.sample(samp#, coord.xy)` (texture + sampler pair)
+- `oPos` (rastout 0) -> `out.position` with `[[position]]`
+- `oC0` -> return value of fragment function
 
 ### D3D9 swizzle maps directly to MSL component access
 D3D9 swizzle encodes 4 component indices (0=x, 1=y, 2=z, 3=w). Identity swizzle `.xyzw` is omitted. Replicate swizzle `.xxxx` emits `.x`. The emitter handles all modifiers: negate `(-expr)`, abs `abs(expr)`, complement `(1.0 - expr)`, x2 `(expr * 2.0)`, bias `(expr - 0.5)`.
+
+### Flow control token format differs from arithmetic instructions
+Arithmetic instructions follow the pattern: opcode token, destination token, source tokens. Flow control opcodes have different layouts:
+- `ifc`/`breakc`: opcode token (comparison in bits 18-20) + 2 source tokens, no destination. The comparison (GT=1, EQ=2, GE=3, LT=4, NE=5, LE=6) must be extracted before consuming source tokens.
+- `rep`/`if`: opcode token + 1 source token (integer or boolean register), no destination.
+- `else`/`endif`/`endrep`/`break`: opcode token only, no additional tokens.
+
+The parser previously used `opcode_src_count()` returning -2 for flow control (special marker), which caused the hard-fail path. Now each opcode is handled individually before the generic arithmetic parsing.
+
+### ifc/breakc compare scalar .x components
+D3D9 `ifc` compares the .x component of two source registers. The emitter generates `if (s0.x > s1.x) {` rather than vector comparison. This matches D3D9 spec behavior where the comparison operates on the first component.
+
+### rep loops use integer constant registers coerced to float4
+D3D9's `defi i0, 4, 0, 0, 0` defines an integer constant. The emitter stores these as `float4 i0 = float4(4.0, 0.0, 0.0, 0.0)` and the `rep` loop uses `int(i0.x)` for the bound. This avoids a separate integer register type system while maintaining correct loop counts (integer constants are always small whole numbers).
+
+### Multi-texture emitter was already correct
+The MSL emitter generates `tex%u.sample(samp%u, coord.xy)` using the sampler register number from bytecode, and the PS function signature declares `texture2d<float> tex%u [[texture(%u)]]` / `sampler samp%u [[sampler(%u)]]` for each declared sampler. This naturally supports any sampler index 0-7. The only blocker was the data pipeline (individual stage-0 fields) and the parser's explicit rejection of PS sampler index > 0.
 
 ### POSITIONT draws skip translation entirely
 Pre-transformed vertices (D3DFVF_XYZRHW / `dcl_positiont`) are already in screen space. The existing hardcoded `geo_vertex` shader with a synthetic screen-to-NDC matrix handles these correctly. When the vertex declaration has POSITIONT, the viewer uses the fallback path and only the PS could potentially be translated (currently skipped -- both VS and PS are needed for the translated path).
@@ -93,9 +121,9 @@ Pre-transformed vertices (D3DFVF_XYZRHW / `dcl_positiont`) are already in screen
 ### Four-tier fragment shader approach (with translation)
 The Metal viewer now has four tiers for fragment shading, tried in order:
 
-1. **Translated shader** (when bytecode is available and compiles): Full D3D9 shader translated to MSL. Reads from constant buffer, samples textures, executes all arithmetic. Uses the full VS/PS constant arrays at buffer indices 1 and 0 respectively.
+1. **Translated shader** (when bytecode is available and compiles): Full D3D9 shader translated to MSL. Reads from constant buffer, samples textures (up to 8 stages), executes all arithmetic including flow control. Uses the full VS/PS constant arrays at buffer indices 1 and 0 respectively.
 
-2. **TSS fixed-function combiner** (`use_stage0_combiner=1`, when `pixel_shader_id==0`): Full D3D9 texture stage state evaluation. Supports all D3DTOP operations (MODULATE, SELECTARG, ADD, BLEND*, etc.) with configurable arg sources (TEXTURE, CURRENT, DIFFUSE, TFACTOR).
+2. **TSS fixed-function combiner** (`use_stage0_combiner=1`, when `pixel_shader_id==0`): Full D3D9 texture stage state evaluation. Supports all D3DTOP operations (MODULATE, SELECTARG, ADD, BLEND*, etc.) with configurable arg sources (TEXTURE, CURRENT, DIFFUSE, TFACTOR). Stage 0 only.
 
 3. **PS constant c0 tint** (`has_pixel_shader=1`, translation failed): When a D3D9 pixel shader is active but translation failed, the viewer reads PS constant register c0 and multiplies it by the texture sample. This approximation works for FNV's menu shaders.
 
@@ -124,7 +152,7 @@ The 5 stencil fields (enable, func, ref, mask, writemask) are transmitted throug
 ## Debugging
 
 ### Frame dump for per-draw diagnosis
-The Metal viewer can dump per-draw state to `/tmp/dx9mt_frame_dump.txt`. Each draw shows: primitive type/count, vertex format, texture info (id, generation, format, size, upload status), TSS state, sampler state, blend state, viewport, and vertex data samples. Key field: `upload=0` means the texture is in the viewer's cache (no upload needed this frame), NOT that data is missing.
+The Metal viewer can dump per-draw state to `/tmp/dx9mt_frame_dump.txt`. Each draw shows: primitive type/count, vertex format, per-stage texture info (id, generation, format, size, upload status for all active stages 0-7), per-stage sampler state, TSS state, blend state, depth state, cull mode, viewport, and vertex data samples. Key field: `upload=0` means the texture is in the viewer's cache (no upload needed this frame), NOT that data is missing.
 
 ### Sampled logging prevents log flooding
 High-frequency calls (GetDeviceCaps, CheckDeviceFormat, DebugSetMute) use `dx9mt_should_log_method_sample(&counter, first_n, every_n)`. First N calls logged in full, then every Nth call. Backend frames log on frames 0-9 then every 120th.

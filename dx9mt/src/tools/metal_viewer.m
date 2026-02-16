@@ -956,7 +956,8 @@ static MTLSamplerMipFilter d3d_filter_to_mtl_mip(uint32_t filter) {
 }
 
 static id<MTLSamplerState>
-sampler_state_for_draw(const volatile dx9mt_metal_ipc_draw *draw) {
+sampler_state_for_draw_stage(const volatile dx9mt_metal_ipc_draw *draw,
+                             uint32_t stage) {
   uint64_t key_value;
   NSNumber *key;
   id<MTLSamplerState> state;
@@ -972,12 +973,12 @@ sampler_state_for_draw(const volatile dx9mt_metal_ipc_draw *draw) {
     return nil;
   }
 
-  min_filter = draw->sampler0_min_filter;
-  mag_filter = draw->sampler0_mag_filter;
-  mip_filter = draw->sampler0_mip_filter;
-  address_u = draw->sampler0_address_u;
-  address_v = draw->sampler0_address_v;
-  address_w = draw->sampler0_address_w;
+  min_filter = draw->sampler_min_filter[stage];
+  mag_filter = draw->sampler_mag_filter[stage];
+  mip_filter = draw->sampler_mip_filter[stage];
+  address_u = draw->sampler_address_u[stage];
+  address_v = draw->sampler_address_v[stage];
+  address_w = draw->sampler_address_w[stage];
 
   key_value = (uint64_t)min_filter | ((uint64_t)mag_filter << 8) |
               ((uint64_t)mip_filter << 16) | ((uint64_t)address_u << 24) |
@@ -1068,8 +1069,9 @@ render_target_texture_for_draw(const volatile dx9mt_metal_ipc_draw *draw) {
 }
 
 static id<MTLTexture>
-texture_for_draw(const volatile unsigned char *ipc_base, uint32_t bulk_off,
-                 const volatile dx9mt_metal_ipc_draw *draw) {
+texture_for_draw_stage(const volatile unsigned char *ipc_base, uint32_t bulk_off,
+                       const volatile dx9mt_metal_ipc_draw *draw,
+                       uint32_t stage) {
   uint32_t texture_id;
   uint32_t generation;
   uint32_t format;
@@ -1091,17 +1093,17 @@ texture_for_draw(const volatile unsigned char *ipc_base, uint32_t bulk_off,
     return nil;
   }
 
-  texture_id = draw->texture0_id;
+  texture_id = draw->tex_id[stage];
   if (texture_id == 0) {
     return nil;
   }
-  generation = draw->texture0_generation;
-  format = draw->texture0_format;
-  width = draw->texture0_width;
-  height = draw->texture0_height;
-  pitch = draw->texture0_pitch;
-  upload_offset = draw->texture0_bulk_offset;
-  upload_size = draw->texture0_bulk_size;
+  generation = draw->tex_generation[stage];
+  format = draw->tex_format[stage];
+  width = draw->tex_width[stage];
+  height = draw->tex_height[stage];
+  pitch = draw->tex_pitch[stage];
+  upload_offset = draw->tex_bulk_offset[stage];
+  upload_size = draw->tex_bulk_size[stage];
 
   key = @(texture_id);
   texture = [s_texture_rt_overrides objectForKey:key];
@@ -1760,18 +1762,19 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
       fprintf(f, "\n");
     }
 
-    /* Texture */
-    fprintf(f, "  tex0: id=%u gen=%u fmt=%s size=%ux%u pitch=%u upload=%u\n",
-            d->texture0_id, d->texture0_generation,
-            d3d_fmt_name(d->texture0_format),
-            d->texture0_width, d->texture0_height,
-            d->texture0_pitch, d->texture0_bulk_size);
-
-    /* Sampler */
-    fprintf(f, "  sampler0: min=%u mag=%u mip=%u addr=(%u,%u,%u)\n",
-            d->sampler0_min_filter, d->sampler0_mag_filter,
-            d->sampler0_mip_filter, d->sampler0_address_u,
-            d->sampler0_address_v, d->sampler0_address_w);
+    /* Textures and samplers */
+    for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+      if (d->tex_id[s] == 0) continue;
+      fprintf(f, "  tex%u: id=%u gen=%u fmt=%s size=%ux%u pitch=%u upload=%u\n",
+              s, d->tex_id[s], d->tex_generation[s],
+              d3d_fmt_name(d->tex_format[s]),
+              d->tex_width[s], d->tex_height[s],
+              d->tex_pitch[s], d->tex_bulk_size[s]);
+      fprintf(f, "  sampler%u: min=%u mag=%u mip=%u addr=(%u,%u,%u)\n",
+              s, d->sampler_min_filter[s], d->sampler_mag_filter[s],
+              d->sampler_mip_filter[s], d->sampler_address_u[s],
+              d->sampler_address_v[s], d->sampler_address_w[s]);
+    }
 
     /* TSS combiner */
     fprintf(f, "  tss0: color_op=%s  arg1=%s  arg2=%s\n",
@@ -1886,20 +1889,22 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
     }
 
     /* Save texture data to file */
-    if (d->texture0_bulk_size > 0 && d->texture0_id != 0) {
-      char tex_path[256];
-      snprintf(tex_path, sizeof(tex_path), "/tmp/dx9mt_tex_%u.raw",
-               d->texture0_id);
-      FILE *tf = fopen(tex_path, "wb");
-      if (tf) {
-        const void *tex_data = (const void *)(ipc_base + bulk_off +
-                                               d->texture0_bulk_offset);
-        fwrite(tex_data, 1, d->texture0_bulk_size, tf);
-        fclose(tf);
-        fprintf(f, "  >> texture saved: %s (%u bytes, %s %ux%u)\n",
-                tex_path, d->texture0_bulk_size,
-                d3d_fmt_name(d->texture0_format),
-                d->texture0_width, d->texture0_height);
+    for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+      if (d->tex_bulk_size[s] > 0 && d->tex_id[s] != 0) {
+        char tex_path[256];
+        snprintf(tex_path, sizeof(tex_path), "/tmp/dx9mt_tex_%u_s%u.raw",
+                 d->tex_id[s], s);
+        FILE *tf = fopen(tex_path, "wb");
+        if (tf) {
+          const void *tex_data = (const void *)(ipc_base + bulk_off +
+                                                 d->tex_bulk_offset[s]);
+          fwrite(tex_data, 1, d->tex_bulk_size[s], tf);
+          fclose(tf);
+          fprintf(f, "  >> texture saved: %s (%u bytes, %s %ux%u)\n",
+                  tex_path, d->tex_bulk_size[s],
+                  d3d_fmt_name(d->tex_format[s]),
+                  d->tex_width[s], d->tex_height[s]);
+        }
       }
     }
     fprintf(f, "\n");
@@ -2072,7 +2077,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         active_target_is_drawable = target_is_drawable;
       }
 
-      draw_texture = texture_for_draw(ipc_base, bulk_off, d);
+      draw_texture = texture_for_draw_stage(ipc_base, bulk_off, d, 0);
 
       /* Parse vertex declaration from bulk data to build PSO.
        * Fall back to FVF-derived elements when no declaration is present. */
@@ -2090,7 +2095,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         }
       }
 
-      expects_texture = (d->texture0_id != 0 && decl_has_texcoord);
+      expects_texture = (d->tex_id[0] != 0 && decl_has_texcoord);
       if (expects_texture && !draw_texture) {
         /*
          * Texture content is unavailable (typically render-to-texture path not
@@ -2100,7 +2105,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
       }
 
       if (draw_texture && decl_has_texcoord) {
-        draw_sampler = sampler_state_for_draw(d);
+        draw_sampler = sampler_state_for_draw_stage(d, 0);
         textured = 1;
       } else {
         draw_texture = nil;
@@ -2228,9 +2233,16 @@ static void render_frame(const volatile unsigned char *ipc_base) {
           static const float zero[4] = {0, 0, 0, 0};
           [encoder setFragmentBytes:zero length:sizeof(zero) atIndex:0];
         }
-        if (draw_texture) {
-          [encoder setFragmentTexture:draw_texture atIndex:0];
-          [encoder setFragmentSamplerState:draw_sampler atIndex:0];
+        /* Bind textures and samplers for all active stages */
+        for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+          if (d->tex_id[s] == 0) continue;
+          id<MTLTexture> stage_tex =
+              texture_for_draw_stage(ipc_base, bulk_off, d, s);
+          if (stage_tex) {
+            [encoder setFragmentTexture:stage_tex atIndex:s];
+            [encoder setFragmentSamplerState:sampler_state_for_draw_stage(d, s)
+                                     atIndex:s];
+          }
         }
       } else {
         /* Hardcoded shader path (TSS combiner / ps_c0 tint / passthrough) */
@@ -2270,9 +2282,9 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         frag_params.use_stage0_combiner =
             (uint32_t)(d->pixel_shader_id == 0 ? 1 : 0);
         frag_params.alpha_only =
-            (uint32_t)(d->texture0_format == D3DFMT_A8 ? 1 : 0);
+            (uint32_t)(d->tex_format[0] == D3DFMT_A8 ? 1 : 0);
         frag_params.force_alpha_one =
-            (uint32_t)(d->texture0_format == D3DFMT_X8R8G8B8 ? 1 : 0);
+            (uint32_t)(d->tex_format[0] == D3DFMT_X8R8G8B8 ? 1 : 0);
         frag_params.alpha_test_enable =
             (uint32_t)(d->rs_alpha_test_enable ? 1 : 0);
         frag_params.alpha_ref = (float)(d->rs_alpha_ref & 0xFFu) / 255.0f;

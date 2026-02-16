@@ -95,19 +95,22 @@ typedef struct dx9mt_backend_draw_command {
   uint32_t texture_stage_hash;
   uint32_t sampler_state_hash;
   uint32_t stream_binding_hash;
-  uint32_t texture0_id;
-  uint32_t texture0_generation;
-  uint32_t texture0_format;
-  uint32_t texture0_width;
-  uint32_t texture0_height;
-  uint32_t texture0_pitch;
-  dx9mt_upload_ref texture0_data;
-  uint32_t sampler0_min_filter;
-  uint32_t sampler0_mag_filter;
-  uint32_t sampler0_mip_filter;
-  uint32_t sampler0_address_u;
-  uint32_t sampler0_address_v;
-  uint32_t sampler0_address_w;
+
+  /* RB5: multi-texture stage arrays (stages 0..7) */
+  uint32_t tex_id[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_generation[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_format[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_width[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_height[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t tex_pitch[DX9MT_MAX_PS_SAMPLERS];
+  dx9mt_upload_ref tex_data[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_min_filter[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_mag_filter[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_mip_filter[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_address_u[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_address_v[DX9MT_MAX_PS_SAMPLERS];
+  uint32_t sampler_address_w[DX9MT_MAX_PS_SAMPLERS];
+
   uint32_t tss0_color_op;
   uint32_t tss0_color_arg1;
   uint32_t tss0_color_arg2;
@@ -255,19 +258,21 @@ dx9mt_backend_draw_command_hash(const dx9mt_backend_draw_command *command) {
   hash = dx9mt_backend_hash_u32(hash, command->texture_stage_hash);
   hash = dx9mt_backend_hash_u32(hash, command->sampler_state_hash);
   hash = dx9mt_backend_hash_u32(hash, command->stream_binding_hash);
-  hash = dx9mt_backend_hash_u32(hash, command->texture0_id);
-  hash = dx9mt_backend_hash_u32(hash, command->texture0_generation);
-  hash = dx9mt_backend_hash_u32(hash, command->texture0_format);
-  hash = dx9mt_backend_hash_u32(hash, command->texture0_width);
-  hash = dx9mt_backend_hash_u32(hash, command->texture0_height);
-  hash = dx9mt_backend_hash_u32(hash, command->texture0_pitch);
-  hash = dx9mt_backend_hash_upload_ref(hash, &command->texture0_data);
-  hash = dx9mt_backend_hash_u32(hash, command->sampler0_min_filter);
-  hash = dx9mt_backend_hash_u32(hash, command->sampler0_mag_filter);
-  hash = dx9mt_backend_hash_u32(hash, command->sampler0_mip_filter);
-  hash = dx9mt_backend_hash_u32(hash, command->sampler0_address_u);
-  hash = dx9mt_backend_hash_u32(hash, command->sampler0_address_v);
-  hash = dx9mt_backend_hash_u32(hash, command->sampler0_address_w);
+  for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+    hash = dx9mt_backend_hash_u32(hash, command->tex_id[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->tex_generation[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->tex_format[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->tex_width[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->tex_height[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->tex_pitch[s]);
+    hash = dx9mt_backend_hash_upload_ref(hash, &command->tex_data[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->sampler_min_filter[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->sampler_mag_filter[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->sampler_mip_filter[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->sampler_address_u[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->sampler_address_v[s]);
+    hash = dx9mt_backend_hash_u32(hash, command->sampler_address_w[s]);
+  }
   hash = dx9mt_backend_hash_u32(hash, command->tss0_color_op);
   hash = dx9mt_backend_hash_u32(hash, command->tss0_color_arg1);
   hash = dx9mt_backend_hash_u32(hash, command->tss0_color_arg2);
@@ -664,19 +669,21 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
   command->texture_stage_hash = draw_packet->texture_stage_hash;
   command->sampler_state_hash = draw_packet->sampler_state_hash;
   command->stream_binding_hash = draw_packet->stream_binding_hash;
-  command->texture0_id = draw_packet->texture0_id;
-  command->texture0_generation = draw_packet->texture0_generation;
-  command->texture0_format = draw_packet->texture0_format;
-  command->texture0_width = draw_packet->texture0_width;
-  command->texture0_height = draw_packet->texture0_height;
-  command->texture0_pitch = draw_packet->texture0_pitch;
-  command->texture0_data = draw_packet->texture0_data;
-  command->sampler0_min_filter = draw_packet->sampler0_min_filter;
-  command->sampler0_mag_filter = draw_packet->sampler0_mag_filter;
-  command->sampler0_mip_filter = draw_packet->sampler0_mip_filter;
-  command->sampler0_address_u = draw_packet->sampler0_address_u;
-  command->sampler0_address_v = draw_packet->sampler0_address_v;
-  command->sampler0_address_w = draw_packet->sampler0_address_w;
+  for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+    command->tex_id[s] = draw_packet->tex_id[s];
+    command->tex_generation[s] = draw_packet->tex_generation[s];
+    command->tex_format[s] = draw_packet->tex_format[s];
+    command->tex_width[s] = draw_packet->tex_width[s];
+    command->tex_height[s] = draw_packet->tex_height[s];
+    command->tex_pitch[s] = draw_packet->tex_pitch[s];
+    command->tex_data[s] = draw_packet->tex_data[s];
+    command->sampler_min_filter[s] = draw_packet->sampler_min_filter[s];
+    command->sampler_mag_filter[s] = draw_packet->sampler_mag_filter[s];
+    command->sampler_mip_filter[s] = draw_packet->sampler_mip_filter[s];
+    command->sampler_address_u[s] = draw_packet->sampler_address_u[s];
+    command->sampler_address_v[s] = draw_packet->sampler_address_v[s];
+    command->sampler_address_w[s] = draw_packet->sampler_address_w[s];
+  }
   command->tss0_color_op = draw_packet->tss0_color_op;
   command->tss0_color_arg1 = draw_packet->tss0_color_arg1;
   command->tss0_color_arg2 = draw_packet->tss0_color_arg2;
@@ -916,11 +923,13 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
                                              header->sequence)) {
         return -1;
       }
-      if (draw_packet->texture0_data.size > 0 &&
-          !dx9mt_backend_validate_upload_ref(&draw_packet->texture0_data,
-                                             "texture0_data",
-                                             header->sequence)) {
-        return -1;
+      for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+        if (draw_packet->tex_data[s].size > 0 &&
+            !dx9mt_backend_validate_upload_ref(&draw_packet->tex_data[s],
+                                               "tex_data",
+                                               header->sequence)) {
+          return -1;
+        }
       }
       g_last_draw_state_hash = draw_packet->state_block_hash;
       g_last_draw_primitive_type = draw_packet->primitive_type;
@@ -1137,18 +1146,20 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       d->stream0_offset = cmd->stream0_offset;
       d->stream0_stride = cmd->stream0_stride;
       d->index_format = cmd->index_format;
-      d->texture0_id = cmd->texture0_id;
-      d->texture0_generation = cmd->texture0_generation;
-      d->texture0_format = cmd->texture0_format;
-      d->texture0_width = cmd->texture0_width;
-      d->texture0_height = cmd->texture0_height;
-      d->texture0_pitch = cmd->texture0_pitch;
-      d->sampler0_min_filter = cmd->sampler0_min_filter;
-      d->sampler0_mag_filter = cmd->sampler0_mag_filter;
-      d->sampler0_mip_filter = cmd->sampler0_mip_filter;
-      d->sampler0_address_u = cmd->sampler0_address_u;
-      d->sampler0_address_v = cmd->sampler0_address_v;
-      d->sampler0_address_w = cmd->sampler0_address_w;
+      for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+        d->tex_id[s] = cmd->tex_id[s];
+        d->tex_generation[s] = cmd->tex_generation[s];
+        d->tex_format[s] = cmd->tex_format[s];
+        d->tex_width[s] = cmd->tex_width[s];
+        d->tex_height[s] = cmd->tex_height[s];
+        d->tex_pitch[s] = cmd->tex_pitch[s];
+        d->sampler_min_filter[s] = cmd->sampler_min_filter[s];
+        d->sampler_mag_filter[s] = cmd->sampler_mag_filter[s];
+        d->sampler_mip_filter[s] = cmd->sampler_mip_filter[s];
+        d->sampler_address_u[s] = cmd->sampler_address_u[s];
+        d->sampler_address_v[s] = cmd->sampler_address_v[s];
+        d->sampler_address_w[s] = cmd->sampler_address_w[s];
+      }
       d->tss0_color_op = cmd->tss0_color_op;
       d->tss0_color_arg1 = cmd->tss0_color_arg1;
       d->tss0_color_arg2 = cmd->tss0_color_arg2;
@@ -1230,16 +1241,18 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
         bulk_used += (cmd->constants_ps.size + 15u) & ~15u;
       }
 
-      /* Copy stage-0 texture upload when present (texture cache updates). */
-      data = dx9mt_frontend_upload_resolve(&cmd->texture0_data);
-      if (data && cmd->texture0_data.size > 0 &&
-          bulk_offset + bulk_used + cmd->texture0_data.size <=
-              DX9MT_METAL_IPC_SIZE) {
-        d->texture0_bulk_offset = bulk_used;
-        d->texture0_bulk_size = cmd->texture0_data.size;
-        memcpy(ipc_base + bulk_offset + bulk_used, data,
-               cmd->texture0_data.size);
-        bulk_used += (cmd->texture0_data.size + 15u) & ~15u;
+      /* Copy per-stage texture uploads when present (texture cache updates). */
+      for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+        data = dx9mt_frontend_upload_resolve(&cmd->tex_data[s]);
+        if (data && cmd->tex_data[s].size > 0 &&
+            bulk_offset + bulk_used + cmd->tex_data[s].size <=
+                DX9MT_METAL_IPC_SIZE) {
+          d->tex_bulk_offset[s] = bulk_used;
+          d->tex_bulk_size[s] = cmd->tex_data[s].size;
+          memcpy(ipc_base + bulk_offset + bulk_used, data,
+                 cmd->tex_data[s].size);
+          bulk_used += (cmd->tex_data[s].size + 15u) & ~15u;
+        }
       }
 
       /* Copy VS/PS shader bytecode for translation. */

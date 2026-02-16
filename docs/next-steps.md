@@ -2,40 +2,46 @@
 
 ## Where We Are
 
-RB4 complete. The full data pipeline from frontend render state capture through IPC to Metal depth testing is operational. The Metal viewer creates per-render-target Depth32Float textures, caches MTLDepthStencilState objects, attaches depth to every render pass, and binds depth state per draw. All three PSO paths (fixed-function geometry, translated shader, overlay) include the depth format. Stencil state fields are transmitted but not yet consumed for stencil operations.
+RB5 is in progress. The major infrastructure for in-game rendering is now in place:
 
-The FNV main menu continues to render correctly -- the menu is 2D so depth state is effectively transparent (zenable=1, zwrite=1, zfunc=LESSEQUAL with all geometry at the same depth).
+- **Cull mode** -- D3DRS_CULLMODE transmitted through full pipeline and applied per-draw via `[encoder setCullMode:]`. D3D9 left-handed winding convention mapped correctly (D3DCULL_CW -> MTLCullModeFront, D3DCULL_CCW -> MTLCullModeBack). Default is D3DCULL_CCW.
 
-## Immediate Next: RB5 -- In-Game Rendering
+- **Shader flow control** -- The transpiler now handles if/ifc/else/endif, rep/endrep, break/breakc. Comparison operators (GT/EQ/GE/LT/NE/LE) extracted from instruction token bits 18-20. Integer constant registers from `defi` emitted as `float4 i#` for loop bounds. Boolean constant registers from `defb` emitted as `float4 b#` for predicates. Shaders using these opcodes now translate to MSL instead of falling back to the TSS/c0 path.
+
+- **Multi-texture** -- The entire pipeline was refactored from individual `texture0_*`/`sampler0_*` fields to `[DX9MT_MAX_PS_SAMPLERS]` arrays (8 stages). Frontend captures texture metadata + sampler state for all bound stages. Backend bridge copies all stages through hash/record/IPC. Metal viewer binds all active stages at matching `[[texture(N)]]`/`[[sampler(N)]]` indices. The shader emitter already generated correct multi-texture MSL -- only the data pipeline was blocking. PS sampler index > 0 rejection removed from parser.
+
+The FNV main menu continues to render correctly. The system is ready for in-game testing.
+
+## Immediate Next: Test In-Game Rendering
 
 ### The situation
 
-The main menu is fully rendering. To advance into gameplay, the viewer needs to handle the more diverse rendering that FNV uses in-game: 3D geometry with actual depth variation, potentially skinned meshes, landscape, multiple render targets, shadow passes, and more shader variety.
-
-### Shader Translation Hardening
-
-The transpiler handles FNV's menu shaders but gameplay shaders may use:
-1. **Flow control** -- `if`/`else`/`endif`, `rep`/`endrep`, `break`/`breakc` (currently emitted as comments)
-2. **Relative addressing** -- `a0` register for dynamic constant array indexing (`c[a0.x + N]`)
-3. **Multi-texture** -- gameplay PS may sample from multiple texture stages
-4. **More instruction patterns** -- any SM2/SM3 opcodes not yet seen in the menu
-
-### Render State Coverage
-
-Gameplay draws will exercise render states the menu doesn't use:
-- **Cull mode** -- back-face culling for 3D geometry
-- **Fog** -- distance fog in outdoor scenes
-- **Stencil operations** -- shadow volumes, UI masking (state already transmitted, need MTL stencil ops)
-- **Blend operations** -- SUBTRACT, REVSUBTRACT, MIN, MAX (currently only ADD)
-- **Separate alpha blend** -- independent alpha channel blend factors
+The infrastructure for 3D rendering is now in place: depth testing, cull mode, flow control, and multi-texture. The next step is to enter FNV gameplay and see what happens.
 
 ### Steps
 
-1. **Enter FNV gameplay** -- start a new game or load a save, observe what breaks
-2. **Fix shader compilation errors** -- stderr will show full MSL source for failures
-3. **Add missing render states** as needed (cull, fog, stencil ops)
-4. **Multi-texture** -- when gameplay PS samples multiple textures
-5. **Validate depth correctness** -- 3D scenes should have proper occlusion now
+1. **Enter FNV gameplay** -- start a new game or load a save, observe what renders and what breaks
+2. **Fix shader compilation errors** -- stderr will show full MSL source for failures. Most likely causes:
+   - Relative addressing (`c[a0.x + N]`) -- still hard-fails, needed for skinned meshes
+   - Unhandled opcodes -- any SM2/SM3 ops not yet in the emitter
+3. **Add missing render states** as needed:
+   - **Fog** -- outdoor scenes will look wrong without distance fog
+   - **Stencil operations** -- shadow volumes, UI masking (state transmitted, need MTL stencil ops)
+   - **Blend operations** -- SUBTRACT, REVSUBTRACT, MIN, MAX (currently only ADD)
+4. **Validate depth correctness** -- 3D scenes should have proper occlusion
+5. **Check multi-texture binding** -- normal maps, specular maps should now be sampled correctly
+
+### Remaining RB5 Items
+
+| Item | Priority | Notes |
+|------|----------|-------|
+| Relative addressing (a0) | High | Blocks skinned character rendering |
+| VS/PS linkage validation | Medium | Wrong output but won't crash |
+| Fog state | Medium | Cosmetic, outdoor scenes |
+| Stencil operations | Medium | Shadow volumes, masking |
+| Blend-op fidelity | Low | SUBTRACT/MIN/MAX are rare |
+| Fill mode | Low | Almost always solid |
+| Separate alpha blend | Low | Uncommon in FNV |
 
 ## Medium Term
 
@@ -50,8 +56,8 @@ Replace IPC with in-process `__wine_unix_call` for zero-copy data sharing and sy
 
 ## Priority Order
 
-1. **In-game rendering** -- enter gameplay, fix what breaks
-2. **Shader hardening** -- flow control, relative addressing, multi-texture
-3. **Render state coverage** -- cull, fog, stencil ops
+1. **Test in-game rendering** -- enter gameplay, observe, iterate
+2. **Relative addressing** -- unblock skinned mesh shaders
+3. **Render state coverage** -- fog, stencil ops as needed
 4. **Wine unix lib integration** -- performance, zero-copy, proper architecture
 5. **Performance optimization** -- buffer recycling, state dedup, async compile

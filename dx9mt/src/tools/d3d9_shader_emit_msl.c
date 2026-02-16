@@ -184,6 +184,18 @@ static void src_expr(char *out, size_t out_sz, const dx9mt_sm_register *r,
   }
 }
 
+static const char *comparison_op_str(uint8_t cmp) {
+  switch (cmp) {
+  case DX9MT_SM_CMP_GT: return ">";
+  case DX9MT_SM_CMP_EQ: return "==";
+  case DX9MT_SM_CMP_GE: return ">=";
+  case DX9MT_SM_CMP_LT: return "<";
+  case DX9MT_SM_CMP_NE: return "!=";
+  case DX9MT_SM_CMP_LE: return "<=";
+  default:              return "!=";
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Instruction emission                                                */
 /* ------------------------------------------------------------------ */
@@ -464,6 +476,54 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     emit(ctx, "  if (any(%s.xyz < float3(0.0))) discard_fragment();\n", dst);
     return;
 
+  case DX9MT_SM_OP_IFC: {
+    char s0e[128], s1e[128];
+    src_expr(s0e, sizeof(s0e), &inst->src[0], is_vs, major_ver);
+    src_expr(s1e, sizeof(s1e), &inst->src[1], is_vs, major_ver);
+    emit(ctx, "  if (%s.x %s %s.x) {\n",
+         s0e, comparison_op_str(inst->comparison), s1e);
+    return;
+  }
+
+  case DX9MT_SM_OP_IF: {
+    char s0e[128];
+    src_expr(s0e, sizeof(s0e), &inst->src[0], is_vs, major_ver);
+    emit(ctx, "  if (%s.x != 0.0) {\n", s0e);
+    return;
+  }
+
+  case DX9MT_SM_OP_ELSE:
+    emit(ctx, "  } else {\n");
+    return;
+
+  case DX9MT_SM_OP_ENDIF:
+    emit(ctx, "  }\n");
+    return;
+
+  case DX9MT_SM_OP_REP: {
+    char s0e[128];
+    src_expr(s0e, sizeof(s0e), &inst->src[0], is_vs, major_ver);
+    emit(ctx, "  for (int rep_i = 0; rep_i < int(%s.x); rep_i++) {\n", s0e);
+    return;
+  }
+
+  case DX9MT_SM_OP_ENDREP:
+    emit(ctx, "  }\n");
+    return;
+
+  case DX9MT_SM_OP_BREAK:
+    emit(ctx, "  break;\n");
+    return;
+
+  case DX9MT_SM_OP_BREAKC: {
+    char s0e[128], s1e[128];
+    src_expr(s0e, sizeof(s0e), &inst->src[0], is_vs, major_ver);
+    src_expr(s1e, sizeof(s1e), &inst->src[1], is_vs, major_ver);
+    emit(ctx, "  if (%s.x %s %s.x) break;\n",
+         s0e, comparison_op_str(inst->comparison), s1e);
+    return;
+  }
+
   default:
     emit(ctx, "  // unsupported opcode %u\n", inst->opcode);
     return;
@@ -662,6 +722,13 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
     const dx9mt_sm_def_entry *d = &prog->defs[i];
     if (d->reg_type == DX9MT_SM_REG_CONST) {
       emit(&ctx, "  // def c%u overridden by inline constant\n", d->reg_number);
+    } else if (d->reg_type == DX9MT_SM_REG_CONSTINT) {
+      emit(&ctx, "  float4 i%u = float4(%d.0, %d.0, %d.0, %d.0);\n",
+           d->reg_number, d->values.i[0], d->values.i[1],
+           d->values.i[2], d->values.i[3]);
+    } else if (d->reg_type == DX9MT_SM_REG_CONSTBOOL) {
+      emit(&ctx, "  float4 b%u = float4(%s, 0.0, 0.0, 0.0);\n",
+           d->reg_number, d->values.b ? "1.0" : "0.0");
     }
   }
 
@@ -803,6 +870,13 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
     const dx9mt_sm_def_entry *d = &prog->defs[i];
     if (d->reg_type == DX9MT_SM_REG_CONST) {
       emit(&ctx, "  // def c%u overridden by inline constant\n", d->reg_number);
+    } else if (d->reg_type == DX9MT_SM_REG_CONSTINT) {
+      emit(&ctx, "  float4 i%u = float4(%d.0, %d.0, %d.0, %d.0);\n",
+           d->reg_number, d->values.i[0], d->values.i[1],
+           d->values.i[2], d->values.i[3]);
+    } else if (d->reg_type == DX9MT_SM_REG_CONSTBOOL) {
+      emit(&ctx, "  float4 b%u = float4(%s, 0.0, 0.0, 0.0);\n",
+           d->reg_number, d->values.b ? "1.0" : "0.0");
     }
   }
 

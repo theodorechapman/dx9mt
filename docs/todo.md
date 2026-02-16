@@ -60,18 +60,18 @@
 ## Current Priority: RB5 -- In-Game Rendering
 
 ### Shader Translation Hardening
-- [x] Hard-fail on malformed streams and unsupported flow-control opcodes (all: rep/endrep/if/ifc/else/endif/break/breakc)
+- [x] Hard-fail on malformed streams and unsupported flow-control opcodes
 - [x] Hard-fail on unsupported relative addressing (a0 dynamic indexing)
-- [x] Hard-fail on unsupported multi-texture declarations/usages beyond s0 (PS only; VS allows multi-sampler for vtf)
+- [x] Hard-fail on unsupported multi-texture declarations/usages beyond s0
 - [x] Remove dead flow-control comment emission from MSL emitter
 - [x] Graceful fallback to TSS/c0 path when shader translation fails (instead of skipping draw)
-- [ ] Flow control translation (if/else/endif, rep/endrep, break/breakc)
+- [x] Flow control translation (if/ifc/else/endif, rep/endrep, break/breakc)
+- [x] Multi-texture support in translated PS (tex0..tex7 bindings)
 - [ ] Relative addressing (a0 register for dynamic constant indexing)
-- [ ] Multi-texture support in translated PS (tex1..tex7 bindings)
 - [ ] VS/PS interface linkage validation (match output semantics to input semantics)
 
 ### Render State Coverage
-- [ ] Cull mode (D3DRS_CULLMODE -> MTLCullMode)
+- [x] Cull mode (D3DRS_CULLMODE -> MTLCullMode)
 - [ ] Fog state (D3DRS_FOGENABLE, fog color, fog mode)
 - [ ] Fill mode (D3DRS_FILLMODE -> MTLTriangleFillMode)
 - [ ] Stencil operations (D3DRS_STENCILPASS, STENCILFAIL, STENCILZFAIL)
@@ -79,8 +79,10 @@
 - [ ] Separate alpha blend support (D3DRS_SEPARATEALPHABLENDENABLE)
 
 ### Multi-texture
-- [ ] Texture stages 1-7 data transmission
-- [ ] Multiple texture/sampler bindings in translated shaders
+- [x] Texture stages 0-7 data transmission (array-based pipeline)
+- [x] Multiple texture/sampler bindings in translated shaders
+- [x] Per-stage texture upload in IPC bulk region
+- [x] PS sampler index > 0 rejection removed from parser
 
 ## Later
 

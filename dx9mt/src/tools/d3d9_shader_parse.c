@@ -306,15 +306,6 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         dcl->reg_type = (uint8_t)decode_reg_type(reg_token);
         dcl->reg_number = decode_reg_number(reg_token);
         dcl->write_mask = (uint8_t)((reg_token >> 16) & 0xFu);
-        if (out->shader_type == 0 &&
-            dcl->reg_type == DX9MT_SM_REG_SAMPLER &&
-            dcl->reg_number > 0u) {
-          snprintf(out->error_msg, sizeof(out->error_msg),
-                   "unsupported PS sampler index %u (multi-texture path not implemented)",
-                   dcl->reg_number);
-          out->has_error = 1;
-          return -1;
-        }
         /* For sampler declarations, the semantic token encodes sampler type */
         if (dcl->reg_type == DX9MT_SM_REG_SAMPLER) {
           dcl->sampler_type = (uint16_t)((sem_token >> 27) & 0xFu);
@@ -420,15 +411,68 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
       continue;
     }
 
-    /* Flow control -- reject all unsupported flow-control opcodes */
-    if (opcode == DX9MT_SM_OP_REP || opcode == DX9MT_SM_OP_IF ||
-        opcode == DX9MT_SM_OP_IFC || opcode == DX9MT_SM_OP_BREAKC ||
-        opcode == DX9MT_SM_OP_ENDREP || opcode == DX9MT_SM_OP_ELSE ||
-        opcode == DX9MT_SM_OP_ENDIF || opcode == DX9MT_SM_OP_BREAK) {
-      snprintf(out->error_msg, sizeof(out->error_msg),
-               "unsupported flow control opcode %u", opcode);
-      out->has_error = 1;
-      return -1;
+    /* Flow control: ifc src0, src1 (comparison in instruction token bits 18-20) */
+    if (opcode == DX9MT_SM_OP_IFC || opcode == DX9MT_SM_OP_BREAKC) {
+      if (pos + 2 > dword_count) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "truncated %s at dword %u",
+                 opcode == DX9MT_SM_OP_IFC ? "ifc" : "breakc", pos);
+        out->has_error = 1;
+        return -1;
+      }
+      if (out->instruction_count >= DX9MT_SM_MAX_INSTRUCTIONS) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "too many instructions (>%u)", DX9MT_SM_MAX_INSTRUCTIONS);
+        out->has_error = 1;
+        return -1;
+      }
+      dx9mt_sm_instruction *inst = &out->instructions[out->instruction_count++];
+      memset(inst, 0, sizeof(*inst));
+      inst->opcode = opcode;
+      inst->comparison = (uint8_t)((instr_token >> 18) & 0x7u);
+      inst->num_sources = 2;
+      inst->src[0] = decode_src(bytecode[pos++]);
+      inst->src[1] = decode_src(bytecode[pos++]);
+      continue;
+    }
+
+    /* Flow control: rep i# / if b# (one source token) */
+    if (opcode == DX9MT_SM_OP_REP || opcode == DX9MT_SM_OP_IF) {
+      if (pos + 1 > dword_count) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "truncated %s at dword %u",
+                 opcode == DX9MT_SM_OP_REP ? "rep" : "if", pos);
+        out->has_error = 1;
+        return -1;
+      }
+      if (out->instruction_count >= DX9MT_SM_MAX_INSTRUCTIONS) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "too many instructions (>%u)", DX9MT_SM_MAX_INSTRUCTIONS);
+        out->has_error = 1;
+        return -1;
+      }
+      dx9mt_sm_instruction *inst = &out->instructions[out->instruction_count++];
+      memset(inst, 0, sizeof(*inst));
+      inst->opcode = opcode;
+      inst->num_sources = 1;
+      inst->src[0] = decode_src(bytecode[pos++]);
+      continue;
+    }
+
+    /* Flow control: else / endif / endrep / break (no operands) */
+    if (opcode == DX9MT_SM_OP_ELSE || opcode == DX9MT_SM_OP_ENDIF ||
+        opcode == DX9MT_SM_OP_ENDREP || opcode == DX9MT_SM_OP_BREAK) {
+      if (out->instruction_count >= DX9MT_SM_MAX_INSTRUCTIONS) {
+        snprintf(out->error_msg, sizeof(out->error_msg),
+                 "too many instructions (>%u)", DX9MT_SM_MAX_INSTRUCTIONS);
+        out->has_error = 1;
+        return -1;
+      }
+      dx9mt_sm_instruction *inst = &out->instructions[out->instruction_count++];
+      memset(inst, 0, sizeof(*inst));
+      inst->opcode = opcode;
+      inst->num_sources = 0;
+      continue;
     }
 
     /* Regular arithmetic/texture instructions */
@@ -510,16 +554,6 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
     for (int s = 0; s < src_count; ++s) {
       uint32_t src_token = bytecode[pos++];
       inst->src[s] = decode_src(src_token);
-      if (out->shader_type == 0 &&
-          inst->src[s].type == DX9MT_SM_REG_SAMPLER &&
-          inst->src[s].number > 0u) {
-        snprintf(out->error_msg, sizeof(out->error_msg),
-                 "unsupported PS sampler index %u in instruction source",
-                 inst->src[s].number);
-        out->has_error = 1;
-        return -1;
-      }
-
       /* Skip relative addressing token if present */
       if (inst->src[s].has_relative) {
         if (pos >= dword_count) {

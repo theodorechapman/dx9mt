@@ -113,6 +113,17 @@ enum dx9mt_sm_result_mod {
   DX9MT_SM_RMOD_CENTROID = 4,  /* centroid (ignored) */
 };
 
+/* Comparison type for ifc/breakc (encoded in bits 18-20 of instruction token) */
+enum dx9mt_sm_comparison {
+  DX9MT_SM_CMP_RESERVED = 0,
+  DX9MT_SM_CMP_GT       = 1,
+  DX9MT_SM_CMP_EQ       = 2,
+  DX9MT_SM_CMP_GE       = 3,
+  DX9MT_SM_CMP_LT       = 4,
+  DX9MT_SM_CMP_NE       = 5,
+  DX9MT_SM_CMP_LE       = 6,
+};
+
 /* Sampler type for dcl */
 enum dx9mt_sm_sampler_type {
   DX9MT_SM_SAMP_2D     = 2,
