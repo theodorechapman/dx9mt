@@ -27,6 +27,17 @@ Stale wineserver state masks override changes. Always `wineserver --kill` before
 ### Win32 file paths through Wine
 The PE DLL accesses Unix paths via the Z: drive. `CreateFileA("Z:\\tmp\\foo")` maps to `/tmp/foo`. This is the standard Wine path mapping and is used for the IPC shared memory file.
 
+## Threading and Stability
+
+### FNV requests `D3DCREATE_MULTITHREADED` in the gameplay path
+During save-load / in-game initialization, FNV creates the D3D9 device with behavior flags `0x00000054`, which includes `D3DCREATE_MULTITHREADED`. This means the runtime must serialize API entry points across threads.
+
+### Missing frontend serialization can crash game code, not just rendering
+The observed save-load crash (`falloutnv+0x757aa9`, `movl (%esi), %eax`, `ESI=0`) occurred on a worker thread while the frontend showed heavy concurrent resource creation. Without runtime-style serialization, caller-visible state can be torn across threads and crash in game code before backend validation catches anything.
+
+### Coarse per-device lock is the correct first compatibility move
+The frontend now uses a per-device critical section and lock-aware `IDirect3DDevice9` vtbl wrappers, plus guarded resource lock/unlock paths (VB/IB/surface/texture). This mirrors D3D9's coarse `D3DCREATE_MULTITHREADED` semantics and trades performance for correctness.
+
 ## Packet Protocol
 
 ### BEGIN_FRAME is now in the packet stream
@@ -62,6 +73,9 @@ Each `dx9mt_texture` has a `generation` counter incremented on Lock/Unlock, AddD
 
 ### DXT compressed texture support
 D3D9 DXT1/DXT3/DXT5 formats map directly to Metal's BC1_RGBA/BC2_RGBA/BC3_RGBA. Block-compressed pitch is calculated as `((width + 3) / 4) * block_bytes` where block_bytes is 8 for DXT1 and 16 for DXT3/DXT5. The frontend computes this correctly for both surface allocation and upload sizing.
+
+### Block-compressed copies must respect 4x4 block geometry
+For DXT surfaces, copy rects must be block-aligned (except right/bottom edge at full surface size), and scaling is invalid. `ColorFill` is also invalid for block-compressed surfaces. Enforcing these rules in `UpdateSurface`/`StretchRect`/`UpdateTexture` paths prevents silent memory corruption.
 
 ### Render-target texture routing
 Draws can target offscreen render targets (not just the swapchain). The viewer tracks per-draw `render_target_id` and creates separate `MTLTexture` objects for each RT. When a later draw samples a texture whose `texture_id` matches a previous RT's `render_target_texture_id`, the viewer substitutes the RT's Metal texture. This enables render-to-texture effects (e.g., UI compositing).

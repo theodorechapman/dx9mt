@@ -41,7 +41,7 @@ Native Metal Viewer (dx9mt_metal_viewer, ARM64)
 
 The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (mingw, `_WIN32`), the viewer runs natively (`__APPLE__`). They share a 16MB memory-mapped file for frame data. A native backend dylib (`libdx9mt_unixlib.dylib`) is also built but not yet loaded by Wine -- the IPC approach bypasses the need for Wine unix lib integration.
 
-## Current Verified State (2026-02-15)
+## Current Verified State (2026-02-16)
 
 - FNV main menu renders correctly with proper colors, alpha blending, and depth testing
 - ~19 draws/frame across DXT1, DXT3, DXT5, A8R8G8B8 textures
@@ -77,7 +77,18 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 - D3D9 default state initialization (TSS, sampler, render states, depth/stencil, cull=CCW)
 - Mouse interaction audible (game audio works, cursor movement detected)
 - No contract violations in packet stream
-- 10/10 backend contract tests passing
+- Frontend block-compressed surface copy hardening landed:
+  - block-aligned rect validation for DXT1/DXT3/DXT5 copies
+  - scaling disallowed for block-compressed surface copies
+  - `ColorFill` rejected for block-compressed surfaces
+- `D3DCREATE_MULTITHREADED` synchronization hardening landed in frontend:
+  - per-device critical-section guard initialized at device creation
+  - full `IDirect3DDevice9` vtbl now routes through lock-aware wrappers
+  - VB/IB/surface/texture lock/unlock and dirty-marking paths now also honor the same device guard
+  - targets save-load crash path where FNV creates device with `behavior=0x00000054`
+- `test-native` passes:
+  - backend contract tests
+  - frontend Wine regression tests (`frontend_surface_copy_test`)
 
 ## Milestones
 
@@ -93,7 +104,7 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 | RB3 Phase 2C | Done | PS constant c0 tint for pixel shader draws, render-target routing |
 | RB3 Phase 3 | Done | D3D9 SM2/SM3 bytecode -> MSL transpiler, shader cache, PSO cache |
 | RB4 | Done | Depth/stencil state, depth textures, per-draw depth testing |
-| RB5 | Active | In-game rendering: cull mode, flow control, multi-texture done; fog/stencil ops remain |
+| RB5 | Active | In-game rendering + stability: cull/flow/multi-texture done; multithread guard landed; fog/stencil ops remain |
 | RB6 | Pending | Performance: state dedup, buffer recycling, pipeline cache, async compile |
 | RB7 | Pending | Compatibility hardening: missing stubs, edge cases, Wine unix lib |
 
@@ -101,8 +112,9 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 
 ```bash
 make -C dx9mt                # Build frontend DLL + backend dylib + Metal viewer
-make -C dx9mt test-native    # Run 10 contract tests (Metal excluded via DX9MT_NO_METAL)
+make -C dx9mt test-native    # Backend contract + frontend Wine regression tests
 make run                     # Kill old viewer, create IPC file, launch viewer + Wine + FNV
+make run-wine                # Launch FNV with builtin Wine d3d9 (native wined3d sanity path)
 make clear                   # Kill viewer + wineserver, remove IPC file
 make show-logs               # Display runtime logs
 ```
@@ -171,7 +183,7 @@ dx9mt/
     log.h                  Centralized logging
   src/frontend/
     d3d9.c                 IDirect3D9 factory (caps, format checks, device creation)
-    d3d9_device.c          IDirect3DDevice9 + all COM objects (~5700 lines)
+    d3d9_device.c          IDirect3DDevice9 + all COM objects (~7000 lines, includes multithread wrappers)
     d3d9_perf.c            D3DPERF_* stubs + legacy exports
     dllmain.c              DLL entry point
     runtime.c              Singleton init, backend bridge setup, packet sequencing
@@ -189,5 +201,6 @@ dx9mt/
     d3d9_shader_emit_msl.h MSL emitter API
     d3d9_shader_emit_msl.c D3D9 IR -> MSL source emitter (~590 lines, flow control + defi/defb)
   tests/
-    backend_bridge_contract_test.c   10 contract tests
+    backend_bridge_contract_test.c   Backend packet contract suite
+    frontend_surface_copy_test.c     Frontend Wine regression checks for DXT/linear copies
 ```

@@ -1,5 +1,7 @@
 FRONTEND_CC ?= i686-w64-mingw32-gcc
 BACKEND_CC ?= clang
+WINE ?= wine
+DX9MT_SKIP_WINE_TESTS ?= 0
 
 BUILD_DIR := build
 OBJ_DIR := $(BUILD_DIR)/obj
@@ -34,13 +36,16 @@ TEST_SRCS := \
 	src/common/log.c \
 	src/backend/backend_bridge_stub.c
 
+FRONTEND_TEST_SRC := tests/frontend_surface_copy_test.c
+
 FRONTEND_OBJS := $(patsubst %.c,$(OBJ_DIR)/frontend/%.o,$(FRONTEND_SRCS))
 BACKEND_OBJS := $(patsubst %.c,$(OBJ_DIR)/backend/%.o,$(BACKEND_SRCS)) \
                 $(patsubst %.m,$(OBJ_DIR)/backend/%.o,$(BACKEND_OBJC_SRCS))
 TEST_BIN := $(BUILD_DIR)/backend_bridge_contract_test
+FRONTEND_TEST_BIN := $(BUILD_DIR)/frontend_surface_copy_test.exe
 VIEWER_BIN := $(BUILD_DIR)/dx9mt_metal_viewer
 
-.PHONY: all clean test-native
+.PHONY: all clean test-native test-frontend-wine
 
 all: $(BUILD_DIR)/d3d9.dll $(BUILD_DIR)/libdx9mt_unixlib.dylib $(VIEWER_BIN)
 
@@ -56,6 +61,10 @@ $(TEST_BIN): $(TEST_SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(BACKEND_CC) $(TEST_CFLAGS) -o $@ $(TEST_SRCS)
 
+$(FRONTEND_TEST_BIN): $(FRONTEND_TEST_SRC)
+	@mkdir -p $(BUILD_DIR)
+	$(FRONTEND_CC) $(FRONTEND_CFLAGS) -o $@ $< -ld3d9
+
 VIEWER_SRCS := src/tools/metal_viewer.m \
 	src/tools/d3d9_shader_parse.c \
 	src/tools/d3d9_shader_emit_msl.c
@@ -66,6 +75,16 @@ $(VIEWER_BIN): $(VIEWER_SRCS)
 
 test-native: $(TEST_BIN)
 	@"$(TEST_BIN)"
+	@if [ "$(DX9MT_SKIP_WINE_TESTS)" = "1" ]; then \
+		echo "Skipping frontend Wine tests (DX9MT_SKIP_WINE_TESTS=1)"; \
+	elif command -v "$(WINE)" >/dev/null 2>&1 || [ -x "$(WINE)" ]; then \
+		$(MAKE) --no-print-directory test-frontend-wine; \
+	else \
+		echo "Skipping frontend Wine tests (wine not found: $(WINE))"; \
+	fi
+
+test-frontend-wine: $(BUILD_DIR)/d3d9.dll $(FRONTEND_TEST_BIN)
+	@cd "$(BUILD_DIR)" && WINEDLLOVERRIDES="d3d9=n,b" WINEDEBUG=-all "$(WINE)" "./$(notdir $(FRONTEND_TEST_BIN))"
 
 $(OBJ_DIR)/frontend/%.o: %.c
 	@mkdir -p $(dir $@)

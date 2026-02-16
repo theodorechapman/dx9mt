@@ -207,6 +207,8 @@ struct dx9mt_device {
   D3DDEVTYPE device_type;
   HWND focus_window;
   DWORD behavior_flags;
+  WINBOOL multithread_guard_enabled;
+  CRITICAL_SECTION multithread_guard;
 
   D3DPRESENT_PARAMETERS params;
   D3DDEVICE_CREATION_PARAMETERS creation;
@@ -257,6 +259,20 @@ struct dx9mt_device {
 
 static dx9mt_device *dx9mt_device_from_iface(IDirect3DDevice9 *iface) {
   return (dx9mt_device *)iface;
+}
+
+static void dx9mt_device_guard_enter(dx9mt_device *self) {
+  if (!self || !self->multithread_guard_enabled) {
+    return;
+  }
+  EnterCriticalSection(&self->multithread_guard);
+}
+
+static void dx9mt_device_guard_leave(dx9mt_device *self) {
+  if (!self || !self->multithread_guard_enabled) {
+    return;
+  }
+  LeaveCriticalSection(&self->multithread_guard);
 }
 
 static dx9mt_surface *dx9mt_surface_from_iface(IDirect3DSurface9 *iface) {
@@ -909,17 +925,79 @@ static WINBOOL dx9mt_rect_valid_for_surface(const RECT *rect,
   return TRUE;
 }
 
+static UINT dx9mt_div_ceil_u32(UINT value, UINT divisor) {
+  return (value + divisor - 1u) / divisor;
+}
+
+static WINBOOL
+dx9mt_rect_valid_for_block_compressed_copy(const RECT *rect,
+                                           const D3DSURFACE_DESC *desc) {
+  if (!rect || !desc || !dx9mt_format_is_block_compressed(desc->Format)) {
+    return FALSE;
+  }
+  if (!dx9mt_rect_valid_for_surface(rect, desc)) {
+    return FALSE;
+  }
+  if ((((UINT)rect->left) & 3u) != 0 || (((UINT)rect->top) & 3u) != 0) {
+    return FALSE;
+  }
+  if ((((UINT)rect->right) & 3u) != 0 && (UINT)rect->right != desc->Width) {
+    return FALSE;
+  }
+  if ((((UINT)rect->bottom) & 3u) != 0 && (UINT)rect->bottom != desc->Height) {
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static void dx9mt_rect_to_block_bounds(const RECT *rect, UINT *left_block,
+                                       UINT *top_block, UINT *right_block,
+                                       UINT *bottom_block) {
+  if (left_block) {
+    *left_block = (UINT)rect->left / 4u;
+  }
+  if (top_block) {
+    *top_block = (UINT)rect->top / 4u;
+  }
+  if (right_block) {
+    *right_block = dx9mt_div_ceil_u32((UINT)rect->right, 4u);
+  }
+  if (bottom_block) {
+    *bottom_block = dx9mt_div_ceil_u32((UINT)rect->bottom, 4u);
+  }
+}
+
 static HRESULT dx9mt_surface_copy_rect(dx9mt_surface *dst, const RECT *dst_rect,
                                        dx9mt_surface *src, const RECT *src_rect,
                                        WINBOOL allow_scale) {
   RECT src_r;
   RECT dst_r;
+  WINBOOL src_block_compressed;
+  WINBOOL dst_block_compressed;
   UINT src_bpp;
   UINT dst_bpp;
   UINT src_w;
   UINT src_h;
   UINT dst_w;
   UINT dst_h;
+  UINT block_bytes;
+  UINT src_block_left;
+  UINT src_block_top;
+  UINT src_block_right;
+  UINT src_block_bottom;
+  UINT dst_block_left;
+  UINT dst_block_top;
+  UINT dst_block_right;
+  UINT dst_block_bottom;
+  UINT src_block_w;
+  UINT src_block_h;
+  UINT dst_block_w;
+  UINT dst_block_h;
+  SIZE_T src_row_offset;
+  SIZE_T dst_row_offset;
+  SIZE_T src_extent_bytes;
+  SIZE_T dst_extent_bytes;
+  UINT row_bytes;
   HRESULT hr;
   UINT x;
   UINT y;
@@ -928,49 +1006,146 @@ static HRESULT dx9mt_surface_copy_rect(dx9mt_surface *dst, const RECT *dst_rect,
     return D3DERR_INVALIDCALL;
   }
 
-  src_bpp = dx9mt_bytes_per_pixel(src->desc.Format);
-  dst_bpp = dx9mt_bytes_per_pixel(dst->desc.Format);
-  if (src_bpp != dst_bpp) {
+  src_block_compressed = dx9mt_format_is_block_compressed(src->desc.Format);
+  dst_block_compressed = dx9mt_format_is_block_compressed(dst->desc.Format);
+
+  if (src_block_compressed != dst_block_compressed) {
     return D3DERR_INVALIDCALL;
   }
 
+  src_bpp = dx9mt_bytes_per_pixel(src->desc.Format);
+  dst_bpp = dx9mt_bytes_per_pixel(dst->desc.Format);
+
   dx9mt_resolve_rect(&src->desc, src_rect, &src_r);
   dx9mt_resolve_rect(&dst->desc, dst_rect, &dst_r);
+
+  if (src_block_compressed) {
+    static LONG invalid_rect_log_counter = 0;
+    static LONG invalid_scale_log_counter = 0;
+
+    if (src->desc.Format != dst->desc.Format) {
+      return D3DERR_INVALIDCALL;
+    }
+    if (!dx9mt_rect_valid_for_block_compressed_copy(&src_r, &src->desc) ||
+        !dx9mt_rect_valid_for_block_compressed_copy(&dst_r, &dst->desc)) {
+      if (dx9mt_should_log_method_sample(&invalid_rect_log_counter, 4, 256)) {
+        dx9mt_logf("device",
+                   "block-compressed copy rejected (invalid rect): src=[%ld,%ld,%ld,%ld] dst=[%ld,%ld,%ld,%ld] src_fmt=%u dst_fmt=%u",
+                   src_r.left, src_r.top, src_r.right, src_r.bottom, dst_r.left,
+                   dst_r.top, dst_r.right, dst_r.bottom, (unsigned)src->desc.Format,
+                   (unsigned)dst->desc.Format);
+      }
+      return D3DERR_INVALIDCALL;
+    }
+    src_w = (UINT)(src_r.right - src_r.left);
+    src_h = (UINT)(src_r.bottom - src_r.top);
+    dst_w = (UINT)(dst_r.right - dst_r.left);
+    dst_h = (UINT)(dst_r.bottom - dst_r.top);
+    if (src_w != dst_w || src_h != dst_h) {
+      if (dx9mt_should_log_method_sample(&invalid_scale_log_counter, 4, 256)) {
+        dx9mt_logf("device",
+                   "block-compressed copy rejected (scaling): src=%ux%u dst=%ux%u allow_scale=%d fmt=%u",
+                   src_w, src_h, dst_w, dst_h, (int)allow_scale,
+                   (unsigned)src->desc.Format);
+      }
+      return D3DERR_INVALIDCALL;
+    }
+
+    block_bytes = dx9mt_format_block_bytes(src->desc.Format);
+    if (block_bytes == 0) {
+      return D3DERR_INVALIDCALL;
+    }
+
+    dx9mt_rect_to_block_bounds(&src_r, &src_block_left, &src_block_top,
+                               &src_block_right, &src_block_bottom);
+    dx9mt_rect_to_block_bounds(&dst_r, &dst_block_left, &dst_block_top,
+                               &dst_block_right, &dst_block_bottom);
+
+    src_block_w = src_block_right - src_block_left;
+    src_block_h = src_block_bottom - src_block_top;
+    dst_block_w = dst_block_right - dst_block_left;
+    dst_block_h = dst_block_bottom - dst_block_top;
+    if (src_block_w != dst_block_w || src_block_h != dst_block_h) {
+      return D3DERR_INVALIDCALL;
+    }
+
+    row_bytes = src_block_w * block_bytes;
+    src_row_offset = (SIZE_T)src_block_left * block_bytes;
+    dst_row_offset = (SIZE_T)dst_block_left * block_bytes;
+    src_extent_bytes = src_row_offset + row_bytes;
+    dst_extent_bytes = dst_row_offset + row_bytes;
+    if (src_extent_bytes > src->pitch || dst_extent_bytes > dst->pitch) {
+      return D3DERR_INVALIDCALL;
+    }
+
+    hr = dx9mt_surface_ensure_sysmem(src);
+    if (FAILED(hr)) {
+      return hr;
+    }
+    hr = dx9mt_surface_ensure_sysmem(dst);
+    if (FAILED(hr)) {
+      return hr;
+    }
+
+    for (y = 0; y < src_block_h; ++y) {
+      unsigned char *src_row =
+          src->sysmem + (SIZE_T)(src_block_top + y) * src->pitch + src_row_offset;
+      unsigned char *dst_row =
+          dst->sysmem + (SIZE_T)(dst_block_top + y) * dst->pitch + dst_row_offset;
+      memmove(dst_row, src_row, row_bytes);
+    }
+
+    dx9mt_surface_mark_container_dirty(dst);
+    return D3D_OK;
+  }
+
+  if (src_bpp != dst_bpp) {
+    return D3DERR_INVALIDCALL;
+  }
   if (!dx9mt_rect_valid_for_surface(&src_r, &src->desc) ||
       !dx9mt_rect_valid_for_surface(&dst_r, &dst->desc)) {
     return D3DERR_INVALIDCALL;
   }
-
   src_w = (UINT)(src_r.right - src_r.left);
   src_h = (UINT)(src_r.bottom - src_r.top);
   dst_w = (UINT)(dst_r.right - dst_r.left);
   dst_h = (UINT)(dst_r.bottom - dst_r.top);
-
   if (!allow_scale && (src_w != dst_w || src_h != dst_h)) {
     return D3DERR_INVALIDCALL;
   }
-
   hr = dx9mt_surface_ensure_sysmem(src);
   if (FAILED(hr)) {
     return hr;
   }
-
   hr = dx9mt_surface_ensure_sysmem(dst);
   if (FAILED(hr)) {
     return hr;
   }
 
   if (src_w == dst_w && src_h == dst_h) {
-    UINT row_bytes = src_w * src_bpp;
+    row_bytes = src_w * src_bpp;
+    src_row_offset = (SIZE_T)src_r.left * src_bpp;
+    dst_row_offset = (SIZE_T)dst_r.left * dst_bpp;
+    src_extent_bytes = src_row_offset + row_bytes;
+    dst_extent_bytes = dst_row_offset + row_bytes;
+    if (src_extent_bytes > src->pitch || dst_extent_bytes > dst->pitch) {
+      return D3DERR_INVALIDCALL;
+    }
     for (y = 0; y < src_h; ++y) {
-      unsigned char *src_row = src->sysmem + (SIZE_T)(src_r.top + (LONG)y) * src->pitch +
-                               (SIZE_T)src_r.left * src_bpp;
-      unsigned char *dst_row = dst->sysmem + (SIZE_T)(dst_r.top + (LONG)y) * dst->pitch +
-                               (SIZE_T)dst_r.left * dst_bpp;
+      unsigned char *src_row =
+          src->sysmem + (SIZE_T)(src_r.top + (LONG)y) * src->pitch + src_row_offset;
+      unsigned char *dst_row =
+          dst->sysmem + (SIZE_T)(dst_r.top + (LONG)y) * dst->pitch + dst_row_offset;
       memmove(dst_row, src_row, row_bytes);
     }
     dx9mt_surface_mark_container_dirty(dst);
     return D3D_OK;
+  }
+
+  src_extent_bytes = (SIZE_T)src_r.left * src_bpp + (SIZE_T)src_w * src_bpp;
+  dst_extent_bytes = (SIZE_T)dst_r.left * dst_bpp + (SIZE_T)dst_w * dst_bpp;
+  if (src_extent_bytes > src->pitch || dst_extent_bytes > dst->pitch) {
+    return D3DERR_INVALIDCALL;
   }
 
   for (y = 0; y < dst_h; ++y) {
@@ -1049,6 +1224,7 @@ static HRESULT dx9mt_device_publish_present_target(dx9mt_device *self) {
 
 static HRESULT dx9mt_surface_fill_rect(dx9mt_surface *surface, const RECT *rect,
                                        D3DCOLOR color) {
+  static LONG invalid_fill_log_counter = 0;
   RECT fill_rect;
   HRESULT hr;
   UINT bpp;
@@ -1063,6 +1239,15 @@ static HRESULT dx9mt_surface_fill_rect(dx9mt_surface *surface, const RECT *rect,
 
   dx9mt_resolve_rect(&surface->desc, rect, &fill_rect);
   if (!dx9mt_rect_valid_for_surface(&fill_rect, &surface->desc)) {
+    return D3DERR_INVALIDCALL;
+  }
+  if (dx9mt_format_is_block_compressed(surface->desc.Format)) {
+    if (dx9mt_should_log_method_sample(&invalid_fill_log_counter, 4, 256)) {
+      dx9mt_logf("device",
+                 "ColorFill rejected for block-compressed surface fmt=%u rect=[%ld,%ld,%ld,%ld]",
+                 (unsigned)surface->desc.Format, fill_rect.left, fill_rect.top,
+                 fill_rect.right, fill_rect.bottom);
+    }
     return D3DERR_INVALIDCALL;
   }
 
@@ -1458,16 +1643,21 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
                                               DWORD flags) {
   dx9mt_surface *self = dx9mt_surface_from_iface(iface);
   uint32_t size;
+  HRESULT hr = D3D_OK;
 
   (void)rect;
   (void)flags;
 
+  dx9mt_device_guard_enter(self->device);
+
   if (!locked_rect) {
-    return D3DERR_INVALIDCALL;
+    hr = D3DERR_INVALIDCALL;
+    goto done;
   }
 
   if (!self->lockable) {
-    return D3DERR_INVALIDCALL;
+    hr = D3DERR_INVALIDCALL;
+    goto done;
   }
 
   if (!self->sysmem) {
@@ -1475,18 +1665,23 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
     self->sysmem = (unsigned char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                               size);
     if (!self->sysmem) {
-      return E_OUTOFMEMORY;
+      hr = E_OUTOFMEMORY;
+      goto done;
     }
   }
 
   locked_rect->Pitch = (INT)self->pitch;
   locked_rect->pBits = self->sysmem;
-  return D3D_OK;
+done:
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_surface_UnlockRect(IDirect3DSurface9 *iface) {
   dx9mt_surface *self = dx9mt_surface_from_iface(iface);
+  dx9mt_device_guard_enter(self->device);
   dx9mt_surface_mark_container_dirty(self);
+  dx9mt_device_guard_leave(self->device);
   return D3D_OK;
 }
 
@@ -2055,27 +2250,39 @@ static HRESULT WINAPI dx9mt_texture_LockRect(IDirect3DTexture9 *iface,
                                               D3DLOCKED_RECT *locked_rect,
                                               const RECT *rect, DWORD flags) {
   dx9mt_texture *self = dx9mt_texture_from_iface(iface);
+  HRESULT hr;
+  dx9mt_device_guard_enter(self->device);
   if (level >= self->levels) {
+    dx9mt_device_guard_leave(self->device);
     return D3DERR_INVALIDCALL;
   }
-  return IDirect3DSurface9_LockRect(self->surfaces[level], locked_rect, rect,
-                                    flags);
+  hr = IDirect3DSurface9_LockRect(self->surfaces[level], locked_rect, rect,
+                                  flags);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_texture_UnlockRect(IDirect3DTexture9 *iface,
                                                 UINT level) {
   dx9mt_texture *self = dx9mt_texture_from_iface(iface);
+  HRESULT hr;
+  dx9mt_device_guard_enter(self->device);
   if (level >= self->levels) {
+    dx9mt_device_guard_leave(self->device);
     return D3DERR_INVALIDCALL;
   }
-  return IDirect3DSurface9_UnlockRect(self->surfaces[level]);
+  hr = IDirect3DSurface9_UnlockRect(self->surfaces[level]);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_texture_AddDirtyRect(IDirect3DTexture9 *iface,
                                                   const RECT *dirty_rect) {
   dx9mt_texture *self = dx9mt_texture_from_iface(iface);
   (void)dirty_rect;
+  dx9mt_device_guard_enter(self->device);
   dx9mt_texture_mark_dirty(self);
+  dx9mt_device_guard_leave(self->device);
   return D3D_OK;
 }
 
@@ -2418,22 +2625,32 @@ static HRESULT WINAPI dx9mt_cube_texture_LockRect(
     IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type, UINT level,
     D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags) {
   dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  HRESULT hr;
+  dx9mt_device_guard_enter(self->device);
   if (!dx9mt_cube_face_valid(face_type) || level >= self->levels) {
+    dx9mt_device_guard_leave(self->device);
     return D3DERR_INVALIDCALL;
   }
-  return IDirect3DSurface9_LockRect(
+  hr = IDirect3DSurface9_LockRect(
       self->surfaces[dx9mt_cube_surface_index(self->levels, face_type, level)],
       locked_rect, rect, flags);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_cube_texture_UnlockRect(
     IDirect3DCubeTexture9 *iface, D3DCUBEMAP_FACES face_type, UINT level) {
   dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  HRESULT hr;
+  dx9mt_device_guard_enter(self->device);
   if (!dx9mt_cube_face_valid(face_type) || level >= self->levels) {
+    dx9mt_device_guard_leave(self->device);
     return D3DERR_INVALIDCALL;
   }
-  return IDirect3DSurface9_UnlockRect(
+  hr = IDirect3DSurface9_UnlockRect(
       self->surfaces[dx9mt_cube_surface_index(self->levels, face_type, level)]);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_cube_texture_AddDirtyRect(
@@ -2441,10 +2658,13 @@ static HRESULT WINAPI dx9mt_cube_texture_AddDirtyRect(
     const RECT *dirty_rect) {
   dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
   (void)dirty_rect;
+  dx9mt_device_guard_enter(self->device);
   if (!dx9mt_cube_face_valid(face_type)) {
+    dx9mt_device_guard_leave(self->device);
     return D3DERR_INVALIDCALL;
   }
   dx9mt_cube_texture_mark_dirty(self);
+  dx9mt_device_guard_leave(self->device);
   return D3D_OK;
 }
 
@@ -2669,7 +2889,10 @@ static HRESULT WINAPI dx9mt_vb_Lock(IDirect3DVertexBuffer9 *iface,
   dx9mt_vertex_buffer *self = dx9mt_vb_from_iface(iface);
   (void)flags;
 
+  dx9mt_device_guard_enter(self->device);
+
   if (!data || offset_to_lock > self->desc.Size) {
+    dx9mt_device_guard_leave(self->device);
     return D3DERR_INVALIDCALL;
   }
 
@@ -2678,11 +2901,14 @@ static HRESULT WINAPI dx9mt_vb_Lock(IDirect3DVertexBuffer9 *iface,
   }
 
   *data = self->data + offset_to_lock;
+  dx9mt_device_guard_leave(self->device);
   return D3D_OK;
 }
 
 static HRESULT WINAPI dx9mt_vb_Unlock(IDirect3DVertexBuffer9 *iface) {
-  (void)iface;
+  dx9mt_vertex_buffer *self = dx9mt_vb_from_iface(iface);
+  dx9mt_device_guard_enter(self->device);
+  dx9mt_device_guard_leave(self->device);
   return D3D_OK;
 }
 
@@ -2881,7 +3107,10 @@ static HRESULT WINAPI dx9mt_ib_Lock(IDirect3DIndexBuffer9 *iface,
   dx9mt_index_buffer *self = dx9mt_ib_from_iface(iface);
   (void)flags;
 
+  dx9mt_device_guard_enter(self->device);
+
   if (!data || offset_to_lock > self->desc.Size) {
+    dx9mt_device_guard_leave(self->device);
     return D3DERR_INVALIDCALL;
   }
 
@@ -2890,11 +3119,14 @@ static HRESULT WINAPI dx9mt_ib_Lock(IDirect3DIndexBuffer9 *iface,
   }
 
   *data = self->data + offset_to_lock;
+  dx9mt_device_guard_leave(self->device);
   return D3D_OK;
 }
 
 static HRESULT WINAPI dx9mt_ib_Unlock(IDirect3DIndexBuffer9 *iface) {
-  (void)iface;
+  dx9mt_index_buffer *self = dx9mt_ib_from_iface(iface);
+  dx9mt_device_guard_enter(self->device);
+  dx9mt_device_guard_leave(self->device);
   return D3D_OK;
 }
 
@@ -3678,6 +3910,1063 @@ static HRESULT WINAPI dx9mt_device_CreateQuery(IDirect3DDevice9 *iface,
                                                 D3DQUERYTYPE type,
                                                 IDirect3DQuery9 **query);
 
+static IDirect3DDevice9Vtbl g_dx9mt_device_impl_vtbl;
+
+static HRESULT WINAPI dx9mt_device_mt_QueryInterface(IDirect3DDevice9 *iface, REFIID riid, void** ppvObject) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.QueryInterface(iface, riid, ppvObject);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static ULONG WINAPI dx9mt_device_mt_AddRef(IDirect3DDevice9 *iface) {
+  return g_dx9mt_device_impl_vtbl.AddRef(iface);
+}
+
+static ULONG WINAPI dx9mt_device_mt_Release(IDirect3DDevice9 *iface) {
+  return g_dx9mt_device_impl_vtbl.Release(iface);
+}
+
+static HRESULT WINAPI dx9mt_device_mt_TestCooperativeLevel(IDirect3DDevice9 *iface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.TestCooperativeLevel(iface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static UINT WINAPI dx9mt_device_mt_GetAvailableTextureMem(IDirect3DDevice9 *iface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  UINT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetAvailableTextureMem(iface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_EvictManagedResources(IDirect3DDevice9 *iface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.EvictManagedResources(iface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetDirect3D(IDirect3DDevice9 *iface, IDirect3D9** ppD3D9) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetDirect3D(iface, ppD3D9);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetDeviceCaps(IDirect3DDevice9 *iface, D3DCAPS9* pCaps) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetDeviceCaps(iface, pCaps);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetDisplayMode(IDirect3DDevice9 *iface, UINT iSwapChain, D3DDISPLAYMODE* pMode) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetDisplayMode(iface, iSwapChain, pMode);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetCreationParameters(IDirect3DDevice9 *iface, D3DDEVICE_CREATION_PARAMETERS *pParameters) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetCreationParameters(iface, pParameters);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetCursorProperties(IDirect3DDevice9 *iface, UINT XHotSpot, UINT YHotSpot, IDirect3DSurface9* pCursorBitmap) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetCursorProperties(iface, XHotSpot, YHotSpot, pCursorBitmap);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static void WINAPI dx9mt_device_mt_SetCursorPosition(IDirect3DDevice9 *iface, int X, int Y, DWORD Flags) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  dx9mt_device_guard_enter(self);
+  g_dx9mt_device_impl_vtbl.SetCursorPosition(iface, X, Y, Flags);
+  dx9mt_device_guard_leave(self);
+}
+
+static WINBOOL WINAPI dx9mt_device_mt_ShowCursor(IDirect3DDevice9 *iface, WINBOOL bShow) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  WINBOOL result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.ShowCursor(iface, bShow);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateAdditionalSwapChain(IDirect3DDevice9 *iface, D3DPRESENT_PARAMETERS* pPresentationParameters, IDirect3DSwapChain9** pSwapChain) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateAdditionalSwapChain(iface, pPresentationParameters, pSwapChain);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetSwapChain(IDirect3DDevice9 *iface, UINT iSwapChain, IDirect3DSwapChain9** pSwapChain) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetSwapChain(iface, iSwapChain, pSwapChain);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static UINT WINAPI dx9mt_device_mt_GetNumberOfSwapChains(IDirect3DDevice9 *iface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  UINT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetNumberOfSwapChains(iface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_Reset(IDirect3DDevice9 *iface, D3DPRESENT_PARAMETERS* pPresentationParameters) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.Reset(iface, pPresentationParameters);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_Present(IDirect3DDevice9 *iface, const RECT *src_rect, const RECT *dst_rect, HWND dst_window_override, const RGNDATA *dirty_region) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.Present(iface, src_rect, dst_rect, dst_window_override, dirty_region);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetBackBuffer(IDirect3DDevice9 *iface, UINT iSwapChain, UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface9** ppBackBuffer) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetBackBuffer(iface, iSwapChain, iBackBuffer, Type, ppBackBuffer);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetRasterStatus(IDirect3DDevice9 *iface, UINT iSwapChain, D3DRASTER_STATUS* pRasterStatus) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetRasterStatus(iface, iSwapChain, pRasterStatus);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetDialogBoxMode(IDirect3DDevice9 *iface, WINBOOL bEnableDialogs) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetDialogBoxMode(iface, bEnableDialogs);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static void WINAPI dx9mt_device_mt_SetGammaRamp(IDirect3DDevice9 *iface, UINT swapchain_idx, DWORD flags, const D3DGAMMARAMP *ramp) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  dx9mt_device_guard_enter(self);
+  g_dx9mt_device_impl_vtbl.SetGammaRamp(iface, swapchain_idx, flags, ramp);
+  dx9mt_device_guard_leave(self);
+}
+
+static void WINAPI dx9mt_device_mt_GetGammaRamp(IDirect3DDevice9 *iface, UINT iSwapChain, D3DGAMMARAMP* pRamp) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  dx9mt_device_guard_enter(self);
+  g_dx9mt_device_impl_vtbl.GetGammaRamp(iface, iSwapChain, pRamp);
+  dx9mt_device_guard_leave(self);
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateTexture(IDirect3DDevice9 *iface, UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture9** ppTexture, HANDLE* pSharedHandle) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateTexture(iface, Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateVolumeTexture(IDirect3DDevice9 *iface, UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DVolumeTexture9** ppVolumeTexture, HANDLE* pSharedHandle) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateVolumeTexture(iface, Width, Height, Depth, Levels, Usage, Format, Pool, ppVolumeTexture, pSharedHandle);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateCubeTexture(IDirect3DDevice9 *iface, UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture9** ppCubeTexture, HANDLE* pSharedHandle) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateCubeTexture(iface, EdgeLength, Levels, Usage, Format, Pool, ppCubeTexture, pSharedHandle);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateVertexBuffer(IDirect3DDevice9 *iface, UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer9** ppVertexBuffer, HANDLE* pSharedHandle) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateVertexBuffer(iface, Length, Usage, FVF, Pool, ppVertexBuffer, pSharedHandle);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateIndexBuffer(IDirect3DDevice9 *iface, UINT Length, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DIndexBuffer9** ppIndexBuffer, HANDLE* pSharedHandle) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateIndexBuffer(iface, Length, Usage, Format, Pool, ppIndexBuffer, pSharedHandle);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateRenderTarget(IDirect3DDevice9 *iface, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, WINBOOL Lockable, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateRenderTarget(iface, Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateDepthStencilSurface(IDirect3DDevice9 *iface, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, WINBOOL Discard, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateDepthStencilSurface(iface, Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_UpdateSurface(IDirect3DDevice9 *iface, IDirect3DSurface9 *src_surface, const RECT *src_rect, IDirect3DSurface9 *dst_surface, const POINT *dst_point) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.UpdateSurface(iface, src_surface, src_rect, dst_surface, dst_point);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_UpdateTexture(IDirect3DDevice9 *iface, IDirect3DBaseTexture9* pSourceTexture, IDirect3DBaseTexture9* pDestinationTexture) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.UpdateTexture(iface, pSourceTexture, pDestinationTexture);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetRenderTargetData(IDirect3DDevice9 *iface, IDirect3DSurface9* pRenderTarget, IDirect3DSurface9* pDestSurface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetRenderTargetData(iface, pRenderTarget, pDestSurface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetFrontBufferData(IDirect3DDevice9 *iface, UINT iSwapChain, IDirect3DSurface9* pDestSurface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetFrontBufferData(iface, iSwapChain, pDestSurface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_StretchRect(IDirect3DDevice9 *iface, IDirect3DSurface9 *src_surface, const RECT *src_rect, IDirect3DSurface9 *dst_surface, const RECT *dst_rect, D3DTEXTUREFILTERTYPE filter) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.StretchRect(iface, src_surface, src_rect, dst_surface, dst_rect, filter);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_ColorFill(IDirect3DDevice9 *iface, IDirect3DSurface9 *surface, const RECT *rect, D3DCOLOR color) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.ColorFill(iface, surface, rect, color);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateOffscreenPlainSurface(IDirect3DDevice9 *iface, UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateOffscreenPlainSurface(iface, Width, Height, Format, Pool, ppSurface, pSharedHandle);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetRenderTarget(IDirect3DDevice9 *iface, DWORD RenderTargetIndex, IDirect3DSurface9* pRenderTarget) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetRenderTarget(iface, RenderTargetIndex, pRenderTarget);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetRenderTarget(IDirect3DDevice9 *iface, DWORD RenderTargetIndex, IDirect3DSurface9** ppRenderTarget) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetRenderTarget(iface, RenderTargetIndex, ppRenderTarget);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetDepthStencilSurface(IDirect3DDevice9 *iface, IDirect3DSurface9* pNewZStencil) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetDepthStencilSurface(iface, pNewZStencil);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetDepthStencilSurface(IDirect3DDevice9 *iface, IDirect3DSurface9** ppZStencilSurface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetDepthStencilSurface(iface, ppZStencilSurface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_BeginScene(IDirect3DDevice9 *iface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.BeginScene(iface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_EndScene(IDirect3DDevice9 *iface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.EndScene(iface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_Clear(IDirect3DDevice9 *iface, DWORD rect_count, const D3DRECT *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.Clear(iface, rect_count, rects, flags, color, z, stencil);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetTransform(IDirect3DDevice9 *iface, D3DTRANSFORMSTATETYPE state, const D3DMATRIX *matrix) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetTransform(iface, state, matrix);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetTransform(IDirect3DDevice9 *iface, D3DTRANSFORMSTATETYPE State, D3DMATRIX* pMatrix) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetTransform(iface, State, pMatrix);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_MultiplyTransform(IDirect3DDevice9 *iface, D3DTRANSFORMSTATETYPE state, const D3DMATRIX *matrix) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.MultiplyTransform(iface, state, matrix);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetViewport(IDirect3DDevice9 *iface, const D3DVIEWPORT9 *viewport) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetViewport(iface, viewport);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetViewport(IDirect3DDevice9 *iface, D3DVIEWPORT9* pViewport) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetViewport(iface, pViewport);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetMaterial(IDirect3DDevice9 *iface, const D3DMATERIAL9 *material) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetMaterial(iface, material);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetMaterial(IDirect3DDevice9 *iface, D3DMATERIAL9* pMaterial) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetMaterial(iface, pMaterial);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetLight(IDirect3DDevice9 *iface, DWORD index, const D3DLIGHT9 *light) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetLight(iface, index, light);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetLight(IDirect3DDevice9 *iface, DWORD Index, D3DLIGHT9* arg2) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetLight(iface, Index, arg2);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_LightEnable(IDirect3DDevice9 *iface, DWORD Index, WINBOOL Enable) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.LightEnable(iface, Index, Enable);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetLightEnable(IDirect3DDevice9 *iface, DWORD Index, WINBOOL* pEnable) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetLightEnable(iface, Index, pEnable);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetClipPlane(IDirect3DDevice9 *iface, DWORD index, const float *plane) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetClipPlane(iface, index, plane);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetClipPlane(IDirect3DDevice9 *iface, DWORD Index, float* pPlane) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetClipPlane(iface, Index, pPlane);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetRenderState(IDirect3DDevice9 *iface, D3DRENDERSTATETYPE State, DWORD Value) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetRenderState(iface, State, Value);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetRenderState(IDirect3DDevice9 *iface, D3DRENDERSTATETYPE State, DWORD* pValue) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetRenderState(iface, State, pValue);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateStateBlock(IDirect3DDevice9 *iface, D3DSTATEBLOCKTYPE Type, IDirect3DStateBlock9** ppSB) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateStateBlock(iface, Type, ppSB);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_BeginStateBlock(IDirect3DDevice9 *iface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.BeginStateBlock(iface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_EndStateBlock(IDirect3DDevice9 *iface, IDirect3DStateBlock9** ppSB) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.EndStateBlock(iface, ppSB);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetClipStatus(IDirect3DDevice9 *iface, const D3DCLIPSTATUS9 *clip_status) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetClipStatus(iface, clip_status);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetClipStatus(IDirect3DDevice9 *iface, D3DCLIPSTATUS9* pClipStatus) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetClipStatus(iface, pClipStatus);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetTexture(IDirect3DDevice9 *iface, DWORD Stage, IDirect3DBaseTexture9** ppTexture) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetTexture(iface, Stage, ppTexture);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetTexture(IDirect3DDevice9 *iface, DWORD Stage, IDirect3DBaseTexture9* pTexture) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetTexture(iface, Stage, pTexture);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetTextureStageState(IDirect3DDevice9 *iface, DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD* pValue) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetTextureStageState(iface, Stage, Type, pValue);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetTextureStageState(IDirect3DDevice9 *iface, DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD Value) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetTextureStageState(iface, Stage, Type, Value);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetSamplerState(IDirect3DDevice9 *iface, DWORD Sampler, D3DSAMPLERSTATETYPE Type, DWORD* pValue) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetSamplerState(iface, Sampler, Type, pValue);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetSamplerState(IDirect3DDevice9 *iface, DWORD Sampler, D3DSAMPLERSTATETYPE Type, DWORD Value) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetSamplerState(iface, Sampler, Type, Value);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_ValidateDevice(IDirect3DDevice9 *iface, DWORD* pNumPasses) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.ValidateDevice(iface, pNumPasses);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetPaletteEntries(IDirect3DDevice9 *iface, UINT palette_idx, const PALETTEENTRY *entries) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetPaletteEntries(iface, palette_idx, entries);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetPaletteEntries(IDirect3DDevice9 *iface, UINT PaletteNumber, PALETTEENTRY* pEntries) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetPaletteEntries(iface, PaletteNumber, pEntries);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetCurrentTexturePalette(IDirect3DDevice9 *iface, UINT PaletteNumber) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetCurrentTexturePalette(iface, PaletteNumber);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetCurrentTexturePalette(IDirect3DDevice9 *iface, UINT *PaletteNumber) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetCurrentTexturePalette(iface, PaletteNumber);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetScissorRect(IDirect3DDevice9 *iface, const RECT *rect) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetScissorRect(iface, rect);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetScissorRect(IDirect3DDevice9 *iface, RECT* pRect) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetScissorRect(iface, pRect);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetSoftwareVertexProcessing(IDirect3DDevice9 *iface, WINBOOL bSoftware) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetSoftwareVertexProcessing(iface, bSoftware);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static WINBOOL WINAPI dx9mt_device_mt_GetSoftwareVertexProcessing(IDirect3DDevice9 *iface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  WINBOOL result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetSoftwareVertexProcessing(iface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetNPatchMode(IDirect3DDevice9 *iface, float nSegments) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetNPatchMode(iface, nSegments);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static float WINAPI dx9mt_device_mt_GetNPatchMode(IDirect3DDevice9 *iface) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  float result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetNPatchMode(iface);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_DrawPrimitive(IDirect3DDevice9 *iface, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.DrawPrimitive(iface, PrimitiveType, StartVertex, PrimitiveCount);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_DrawIndexedPrimitive(IDirect3DDevice9 *iface, D3DPRIMITIVETYPE arg1, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.DrawIndexedPrimitive(iface, arg1, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_DrawPrimitiveUP(IDirect3DDevice9 *iface, D3DPRIMITIVETYPE primitive_type, UINT primitive_count, const void *data, UINT stride) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.DrawPrimitiveUP(iface, primitive_type, primitive_count, data, stride);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_DrawIndexedPrimitiveUP(IDirect3DDevice9 *iface, D3DPRIMITIVETYPE primitive_type, UINT min_vertex_idx, UINT vertex_count, UINT primitive_count, const void *index_data, D3DFORMAT index_format, const void *data, UINT stride) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.DrawIndexedPrimitiveUP(iface, primitive_type, min_vertex_idx, vertex_count, primitive_count, index_data, index_format, data, stride);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_ProcessVertices(IDirect3DDevice9 *iface, UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer9* pDestBuffer, IDirect3DVertexDeclaration9* pVertexDecl, DWORD Flags) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.ProcessVertices(iface, SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateVertexDeclaration(IDirect3DDevice9 *iface, const D3DVERTEXELEMENT9 *elements, IDirect3DVertexDeclaration9 **declaration) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateVertexDeclaration(iface, elements, declaration);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetVertexDeclaration(IDirect3DDevice9 *iface, IDirect3DVertexDeclaration9* pDecl) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetVertexDeclaration(iface, pDecl);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetVertexDeclaration(IDirect3DDevice9 *iface, IDirect3DVertexDeclaration9** ppDecl) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetVertexDeclaration(iface, ppDecl);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetFVF(IDirect3DDevice9 *iface, DWORD FVF) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetFVF(iface, FVF);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetFVF(IDirect3DDevice9 *iface, DWORD* pFVF) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetFVF(iface, pFVF);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateVertexShader(IDirect3DDevice9 *iface, const DWORD *byte_code, IDirect3DVertexShader9 **shader) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateVertexShader(iface, byte_code, shader);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetVertexShader(IDirect3DDevice9 *iface, IDirect3DVertexShader9* pShader) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetVertexShader(iface, pShader);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetVertexShader(IDirect3DDevice9 *iface, IDirect3DVertexShader9** ppShader) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetVertexShader(iface, ppShader);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetVertexShaderConstantF(IDirect3DDevice9 *iface, UINT reg_idx, const float *data, UINT count) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetVertexShaderConstantF(iface, reg_idx, data, count);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetVertexShaderConstantF(IDirect3DDevice9 *iface, UINT StartRegister, float* pConstantData, UINT Vector4fCount) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetVertexShaderConstantF(iface, StartRegister, pConstantData, Vector4fCount);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetVertexShaderConstantI(IDirect3DDevice9 *iface, UINT reg_idx, const int *data, UINT count) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetVertexShaderConstantI(iface, reg_idx, data, count);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetVertexShaderConstantI(IDirect3DDevice9 *iface, UINT StartRegister, int* pConstantData, UINT Vector4iCount) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetVertexShaderConstantI(iface, StartRegister, pConstantData, Vector4iCount);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetVertexShaderConstantB(IDirect3DDevice9 *iface, UINT reg_idx, const WINBOOL *data, UINT count) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetVertexShaderConstantB(iface, reg_idx, data, count);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetVertexShaderConstantB(IDirect3DDevice9 *iface, UINT StartRegister, WINBOOL* pConstantData, UINT BoolCount) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetVertexShaderConstantB(iface, StartRegister, pConstantData, BoolCount);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetStreamSource(IDirect3DDevice9 *iface, UINT StreamNumber, IDirect3DVertexBuffer9* pStreamData, UINT OffsetInBytes, UINT Stride) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetStreamSource(iface, StreamNumber, pStreamData, OffsetInBytes, Stride);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetStreamSource(IDirect3DDevice9 *iface, UINT StreamNumber, IDirect3DVertexBuffer9** ppStreamData, UINT* OffsetInBytes, UINT* pStride) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetStreamSource(iface, StreamNumber, ppStreamData, OffsetInBytes, pStride);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetStreamSourceFreq(IDirect3DDevice9 *iface, UINT StreamNumber, UINT Divider) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetStreamSourceFreq(iface, StreamNumber, Divider);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetStreamSourceFreq(IDirect3DDevice9 *iface, UINT StreamNumber, UINT* Divider) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetStreamSourceFreq(iface, StreamNumber, Divider);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetIndices(IDirect3DDevice9 *iface, IDirect3DIndexBuffer9* pIndexData) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetIndices(iface, pIndexData);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetIndices(IDirect3DDevice9 *iface, IDirect3DIndexBuffer9** ppIndexData) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetIndices(iface, ppIndexData);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreatePixelShader(IDirect3DDevice9 *iface, const DWORD *byte_code, IDirect3DPixelShader9 **shader) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreatePixelShader(iface, byte_code, shader);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetPixelShader(IDirect3DDevice9 *iface, IDirect3DPixelShader9* pShader) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetPixelShader(iface, pShader);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetPixelShader(IDirect3DDevice9 *iface, IDirect3DPixelShader9** ppShader) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetPixelShader(iface, ppShader);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetPixelShaderConstantF(IDirect3DDevice9 *iface, UINT reg_idx, const float *data, UINT count) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetPixelShaderConstantF(iface, reg_idx, data, count);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetPixelShaderConstantF(IDirect3DDevice9 *iface, UINT StartRegister, float* pConstantData, UINT Vector4fCount) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetPixelShaderConstantF(iface, StartRegister, pConstantData, Vector4fCount);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetPixelShaderConstantI(IDirect3DDevice9 *iface, UINT reg_idx, const int *data, UINT count) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetPixelShaderConstantI(iface, reg_idx, data, count);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetPixelShaderConstantI(IDirect3DDevice9 *iface, UINT StartRegister, int* pConstantData, UINT Vector4iCount) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetPixelShaderConstantI(iface, StartRegister, pConstantData, Vector4iCount);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_SetPixelShaderConstantB(IDirect3DDevice9 *iface, UINT reg_idx, const WINBOOL *data, UINT count) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.SetPixelShaderConstantB(iface, reg_idx, data, count);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_GetPixelShaderConstantB(IDirect3DDevice9 *iface, UINT StartRegister, WINBOOL* pConstantData, UINT BoolCount) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.GetPixelShaderConstantB(iface, StartRegister, pConstantData, BoolCount);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_DrawRectPatch(IDirect3DDevice9 *iface, UINT handle, const float *segment_count, const D3DRECTPATCH_INFO *patch_info) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.DrawRectPatch(iface, handle, segment_count, patch_info);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_DrawTriPatch(IDirect3DDevice9 *iface, UINT handle, const float *segment_count, const D3DTRIPATCH_INFO *patch_info) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.DrawTriPatch(iface, handle, segment_count, patch_info);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_DeletePatch(IDirect3DDevice9 *iface, UINT Handle) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.DeletePatch(iface, Handle);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
+static HRESULT WINAPI dx9mt_device_mt_CreateQuery(IDirect3DDevice9 *iface, D3DQUERYTYPE Type, IDirect3DQuery9** ppQuery) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT result;
+  dx9mt_device_guard_enter(self);
+  result = g_dx9mt_device_impl_vtbl.CreateQuery(iface, Type, ppQuery);
+  dx9mt_device_guard_leave(self);
+  return result;
+}
+
 static IDirect3DDevice9Vtbl g_dx9mt_device_default_vtbl = {
 #define DX9MT_DEVICE_METHOD(ret, name, ...) .name = dx9mt_device_default_##name,
 #include "d3d9_device_methods.inc"
@@ -3701,116 +4990,122 @@ static void dx9mt_device_init_vtbl(void) {
     return;
   }
 
-  g_dx9mt_device_vtbl = g_dx9mt_device_default_vtbl;
+  g_dx9mt_device_impl_vtbl = g_dx9mt_device_default_vtbl;
 
-  g_dx9mt_device_vtbl.QueryInterface = dx9mt_device_QueryInterface;
-  g_dx9mt_device_vtbl.AddRef = dx9mt_device_AddRef;
-  g_dx9mt_device_vtbl.Release = dx9mt_device_Release;
-  g_dx9mt_device_vtbl.TestCooperativeLevel = dx9mt_device_TestCooperativeLevel;
-  g_dx9mt_device_vtbl.GetAvailableTextureMem = dx9mt_device_GetAvailableTextureMem;
-  g_dx9mt_device_vtbl.GetDirect3D = dx9mt_device_GetDirect3D;
-  g_dx9mt_device_vtbl.GetDeviceCaps = dx9mt_device_GetDeviceCaps;
-  g_dx9mt_device_vtbl.GetDisplayMode = dx9mt_device_GetDisplayMode;
-  g_dx9mt_device_vtbl.GetCreationParameters = dx9mt_device_GetCreationParameters;
-  g_dx9mt_device_vtbl.GetSwapChain = dx9mt_device_GetSwapChain;
-  g_dx9mt_device_vtbl.GetNumberOfSwapChains = dx9mt_device_GetNumberOfSwapChains;
-  g_dx9mt_device_vtbl.Reset = dx9mt_device_Reset;
-  g_dx9mt_device_vtbl.Present = dx9mt_device_Present;
-  g_dx9mt_device_vtbl.GetBackBuffer = dx9mt_device_GetBackBuffer;
-  g_dx9mt_device_vtbl.GetRasterStatus = dx9mt_device_GetRasterStatus;
-  g_dx9mt_device_vtbl.SetDialogBoxMode = dx9mt_device_SetDialogBoxMode;
-  g_dx9mt_device_vtbl.SetGammaRamp = dx9mt_device_SetGammaRamp;
-  g_dx9mt_device_vtbl.GetGammaRamp = dx9mt_device_GetGammaRamp;
-  g_dx9mt_device_vtbl.CreateTexture = dx9mt_device_CreateTexture;
-  g_dx9mt_device_vtbl.CreateVolumeTexture = dx9mt_device_CreateVolumeTexture;
-  g_dx9mt_device_vtbl.CreateCubeTexture = dx9mt_device_CreateCubeTexture;
-  g_dx9mt_device_vtbl.CreateVertexBuffer = dx9mt_device_CreateVertexBuffer;
-  g_dx9mt_device_vtbl.CreateIndexBuffer = dx9mt_device_CreateIndexBuffer;
-  g_dx9mt_device_vtbl.CreateRenderTarget = dx9mt_device_CreateRenderTarget;
-  g_dx9mt_device_vtbl.CreateDepthStencilSurface =
+  g_dx9mt_device_impl_vtbl.QueryInterface = dx9mt_device_QueryInterface;
+  g_dx9mt_device_impl_vtbl.AddRef = dx9mt_device_AddRef;
+  g_dx9mt_device_impl_vtbl.Release = dx9mt_device_Release;
+  g_dx9mt_device_impl_vtbl.TestCooperativeLevel = dx9mt_device_TestCooperativeLevel;
+  g_dx9mt_device_impl_vtbl.GetAvailableTextureMem = dx9mt_device_GetAvailableTextureMem;
+  g_dx9mt_device_impl_vtbl.GetDirect3D = dx9mt_device_GetDirect3D;
+  g_dx9mt_device_impl_vtbl.GetDeviceCaps = dx9mt_device_GetDeviceCaps;
+  g_dx9mt_device_impl_vtbl.GetDisplayMode = dx9mt_device_GetDisplayMode;
+  g_dx9mt_device_impl_vtbl.GetCreationParameters = dx9mt_device_GetCreationParameters;
+  g_dx9mt_device_impl_vtbl.GetSwapChain = dx9mt_device_GetSwapChain;
+  g_dx9mt_device_impl_vtbl.GetNumberOfSwapChains = dx9mt_device_GetNumberOfSwapChains;
+  g_dx9mt_device_impl_vtbl.Reset = dx9mt_device_Reset;
+  g_dx9mt_device_impl_vtbl.Present = dx9mt_device_Present;
+  g_dx9mt_device_impl_vtbl.GetBackBuffer = dx9mt_device_GetBackBuffer;
+  g_dx9mt_device_impl_vtbl.GetRasterStatus = dx9mt_device_GetRasterStatus;
+  g_dx9mt_device_impl_vtbl.SetDialogBoxMode = dx9mt_device_SetDialogBoxMode;
+  g_dx9mt_device_impl_vtbl.SetGammaRamp = dx9mt_device_SetGammaRamp;
+  g_dx9mt_device_impl_vtbl.GetGammaRamp = dx9mt_device_GetGammaRamp;
+  g_dx9mt_device_impl_vtbl.CreateTexture = dx9mt_device_CreateTexture;
+  g_dx9mt_device_impl_vtbl.CreateVolumeTexture = dx9mt_device_CreateVolumeTexture;
+  g_dx9mt_device_impl_vtbl.CreateCubeTexture = dx9mt_device_CreateCubeTexture;
+  g_dx9mt_device_impl_vtbl.CreateVertexBuffer = dx9mt_device_CreateVertexBuffer;
+  g_dx9mt_device_impl_vtbl.CreateIndexBuffer = dx9mt_device_CreateIndexBuffer;
+  g_dx9mt_device_impl_vtbl.CreateRenderTarget = dx9mt_device_CreateRenderTarget;
+  g_dx9mt_device_impl_vtbl.CreateDepthStencilSurface =
       dx9mt_device_CreateDepthStencilSurface;
-  g_dx9mt_device_vtbl.CreateOffscreenPlainSurface =
+  g_dx9mt_device_impl_vtbl.CreateOffscreenPlainSurface =
       dx9mt_device_CreateOffscreenPlainSurface;
-  g_dx9mt_device_vtbl.UpdateSurface = dx9mt_device_UpdateSurface;
-  g_dx9mt_device_vtbl.UpdateTexture = dx9mt_device_UpdateTexture;
-  g_dx9mt_device_vtbl.GetRenderTargetData = dx9mt_device_GetRenderTargetData;
-  g_dx9mt_device_vtbl.GetFrontBufferData = dx9mt_device_GetFrontBufferData;
-  g_dx9mt_device_vtbl.StretchRect = dx9mt_device_StretchRect;
-  g_dx9mt_device_vtbl.ColorFill = dx9mt_device_ColorFill;
-  g_dx9mt_device_vtbl.SetRenderTarget = dx9mt_device_SetRenderTarget;
-  g_dx9mt_device_vtbl.GetRenderTarget = dx9mt_device_GetRenderTarget;
-  g_dx9mt_device_vtbl.SetDepthStencilSurface = dx9mt_device_SetDepthStencilSurface;
-  g_dx9mt_device_vtbl.GetDepthStencilSurface = dx9mt_device_GetDepthStencilSurface;
-  g_dx9mt_device_vtbl.BeginScene = dx9mt_device_BeginScene;
-  g_dx9mt_device_vtbl.EndScene = dx9mt_device_EndScene;
-  g_dx9mt_device_vtbl.Clear = dx9mt_device_Clear;
-  g_dx9mt_device_vtbl.SetTransform = dx9mt_device_SetTransform;
-  g_dx9mt_device_vtbl.GetTransform = dx9mt_device_GetTransform;
-  g_dx9mt_device_vtbl.SetViewport = dx9mt_device_SetViewport;
-  g_dx9mt_device_vtbl.GetViewport = dx9mt_device_GetViewport;
-  g_dx9mt_device_vtbl.SetClipPlane = dx9mt_device_SetClipPlane;
-  g_dx9mt_device_vtbl.GetClipPlane = dx9mt_device_GetClipPlane;
-  g_dx9mt_device_vtbl.SetRenderState = dx9mt_device_SetRenderState;
-  g_dx9mt_device_vtbl.GetRenderState = dx9mt_device_GetRenderState;
-  g_dx9mt_device_vtbl.SetTexture = dx9mt_device_SetTexture;
-  g_dx9mt_device_vtbl.GetTexture = dx9mt_device_GetTexture;
-  g_dx9mt_device_vtbl.SetTextureStageState = dx9mt_device_SetTextureStageState;
-  g_dx9mt_device_vtbl.GetTextureStageState = dx9mt_device_GetTextureStageState;
-  g_dx9mt_device_vtbl.SetSamplerState = dx9mt_device_SetSamplerState;
-  g_dx9mt_device_vtbl.GetSamplerState = dx9mt_device_GetSamplerState;
-  g_dx9mt_device_vtbl.SetScissorRect = dx9mt_device_SetScissorRect;
-  g_dx9mt_device_vtbl.GetScissorRect = dx9mt_device_GetScissorRect;
-  g_dx9mt_device_vtbl.SetSoftwareVertexProcessing =
+  g_dx9mt_device_impl_vtbl.UpdateSurface = dx9mt_device_UpdateSurface;
+  g_dx9mt_device_impl_vtbl.UpdateTexture = dx9mt_device_UpdateTexture;
+  g_dx9mt_device_impl_vtbl.GetRenderTargetData = dx9mt_device_GetRenderTargetData;
+  g_dx9mt_device_impl_vtbl.GetFrontBufferData = dx9mt_device_GetFrontBufferData;
+  g_dx9mt_device_impl_vtbl.StretchRect = dx9mt_device_StretchRect;
+  g_dx9mt_device_impl_vtbl.ColorFill = dx9mt_device_ColorFill;
+  g_dx9mt_device_impl_vtbl.SetRenderTarget = dx9mt_device_SetRenderTarget;
+  g_dx9mt_device_impl_vtbl.GetRenderTarget = dx9mt_device_GetRenderTarget;
+  g_dx9mt_device_impl_vtbl.SetDepthStencilSurface = dx9mt_device_SetDepthStencilSurface;
+  g_dx9mt_device_impl_vtbl.GetDepthStencilSurface = dx9mt_device_GetDepthStencilSurface;
+  g_dx9mt_device_impl_vtbl.BeginScene = dx9mt_device_BeginScene;
+  g_dx9mt_device_impl_vtbl.EndScene = dx9mt_device_EndScene;
+  g_dx9mt_device_impl_vtbl.Clear = dx9mt_device_Clear;
+  g_dx9mt_device_impl_vtbl.SetTransform = dx9mt_device_SetTransform;
+  g_dx9mt_device_impl_vtbl.GetTransform = dx9mt_device_GetTransform;
+  g_dx9mt_device_impl_vtbl.SetViewport = dx9mt_device_SetViewport;
+  g_dx9mt_device_impl_vtbl.GetViewport = dx9mt_device_GetViewport;
+  g_dx9mt_device_impl_vtbl.SetClipPlane = dx9mt_device_SetClipPlane;
+  g_dx9mt_device_impl_vtbl.GetClipPlane = dx9mt_device_GetClipPlane;
+  g_dx9mt_device_impl_vtbl.SetRenderState = dx9mt_device_SetRenderState;
+  g_dx9mt_device_impl_vtbl.GetRenderState = dx9mt_device_GetRenderState;
+  g_dx9mt_device_impl_vtbl.SetTexture = dx9mt_device_SetTexture;
+  g_dx9mt_device_impl_vtbl.GetTexture = dx9mt_device_GetTexture;
+  g_dx9mt_device_impl_vtbl.SetTextureStageState = dx9mt_device_SetTextureStageState;
+  g_dx9mt_device_impl_vtbl.GetTextureStageState = dx9mt_device_GetTextureStageState;
+  g_dx9mt_device_impl_vtbl.SetSamplerState = dx9mt_device_SetSamplerState;
+  g_dx9mt_device_impl_vtbl.GetSamplerState = dx9mt_device_GetSamplerState;
+  g_dx9mt_device_impl_vtbl.SetScissorRect = dx9mt_device_SetScissorRect;
+  g_dx9mt_device_impl_vtbl.GetScissorRect = dx9mt_device_GetScissorRect;
+  g_dx9mt_device_impl_vtbl.SetSoftwareVertexProcessing =
       dx9mt_device_SetSoftwareVertexProcessing;
-  g_dx9mt_device_vtbl.GetSoftwareVertexProcessing =
+  g_dx9mt_device_impl_vtbl.GetSoftwareVertexProcessing =
       dx9mt_device_GetSoftwareVertexProcessing;
-  g_dx9mt_device_vtbl.SetNPatchMode = dx9mt_device_SetNPatchMode;
-  g_dx9mt_device_vtbl.GetNPatchMode = dx9mt_device_GetNPatchMode;
-  g_dx9mt_device_vtbl.DrawPrimitive = dx9mt_device_DrawPrimitive;
-  g_dx9mt_device_vtbl.DrawIndexedPrimitive = dx9mt_device_DrawIndexedPrimitive;
-  g_dx9mt_device_vtbl.CreateVertexDeclaration =
+  g_dx9mt_device_impl_vtbl.SetNPatchMode = dx9mt_device_SetNPatchMode;
+  g_dx9mt_device_impl_vtbl.GetNPatchMode = dx9mt_device_GetNPatchMode;
+  g_dx9mt_device_impl_vtbl.DrawPrimitive = dx9mt_device_DrawPrimitive;
+  g_dx9mt_device_impl_vtbl.DrawIndexedPrimitive = dx9mt_device_DrawIndexedPrimitive;
+  g_dx9mt_device_impl_vtbl.CreateVertexDeclaration =
       dx9mt_device_CreateVertexDeclaration;
-  g_dx9mt_device_vtbl.SetVertexDeclaration = dx9mt_device_SetVertexDeclaration;
-  g_dx9mt_device_vtbl.GetVertexDeclaration = dx9mt_device_GetVertexDeclaration;
-  g_dx9mt_device_vtbl.SetFVF = dx9mt_device_SetFVF;
-  g_dx9mt_device_vtbl.GetFVF = dx9mt_device_GetFVF;
-  g_dx9mt_device_vtbl.CreateVertexShader = dx9mt_device_CreateVertexShader;
-  g_dx9mt_device_vtbl.SetVertexShader = dx9mt_device_SetVertexShader;
-  g_dx9mt_device_vtbl.GetVertexShader = dx9mt_device_GetVertexShader;
-  g_dx9mt_device_vtbl.SetVertexShaderConstantF =
+  g_dx9mt_device_impl_vtbl.SetVertexDeclaration = dx9mt_device_SetVertexDeclaration;
+  g_dx9mt_device_impl_vtbl.GetVertexDeclaration = dx9mt_device_GetVertexDeclaration;
+  g_dx9mt_device_impl_vtbl.SetFVF = dx9mt_device_SetFVF;
+  g_dx9mt_device_impl_vtbl.GetFVF = dx9mt_device_GetFVF;
+  g_dx9mt_device_impl_vtbl.CreateVertexShader = dx9mt_device_CreateVertexShader;
+  g_dx9mt_device_impl_vtbl.SetVertexShader = dx9mt_device_SetVertexShader;
+  g_dx9mt_device_impl_vtbl.GetVertexShader = dx9mt_device_GetVertexShader;
+  g_dx9mt_device_impl_vtbl.SetVertexShaderConstantF =
       dx9mt_device_SetVertexShaderConstantF;
-  g_dx9mt_device_vtbl.GetVertexShaderConstantF =
+  g_dx9mt_device_impl_vtbl.GetVertexShaderConstantF =
       dx9mt_device_GetVertexShaderConstantF;
-  g_dx9mt_device_vtbl.SetVertexShaderConstantI =
+  g_dx9mt_device_impl_vtbl.SetVertexShaderConstantI =
       dx9mt_device_SetVertexShaderConstantI;
-  g_dx9mt_device_vtbl.GetVertexShaderConstantI =
+  g_dx9mt_device_impl_vtbl.GetVertexShaderConstantI =
       dx9mt_device_GetVertexShaderConstantI;
-  g_dx9mt_device_vtbl.SetVertexShaderConstantB =
+  g_dx9mt_device_impl_vtbl.SetVertexShaderConstantB =
       dx9mt_device_SetVertexShaderConstantB;
-  g_dx9mt_device_vtbl.GetVertexShaderConstantB =
+  g_dx9mt_device_impl_vtbl.GetVertexShaderConstantB =
       dx9mt_device_GetVertexShaderConstantB;
-  g_dx9mt_device_vtbl.SetStreamSource = dx9mt_device_SetStreamSource;
-  g_dx9mt_device_vtbl.GetStreamSource = dx9mt_device_GetStreamSource;
-  g_dx9mt_device_vtbl.SetStreamSourceFreq = dx9mt_device_SetStreamSourceFreq;
-  g_dx9mt_device_vtbl.GetStreamSourceFreq = dx9mt_device_GetStreamSourceFreq;
-  g_dx9mt_device_vtbl.SetIndices = dx9mt_device_SetIndices;
-  g_dx9mt_device_vtbl.GetIndices = dx9mt_device_GetIndices;
-  g_dx9mt_device_vtbl.CreatePixelShader = dx9mt_device_CreatePixelShader;
-  g_dx9mt_device_vtbl.SetPixelShader = dx9mt_device_SetPixelShader;
-  g_dx9mt_device_vtbl.GetPixelShader = dx9mt_device_GetPixelShader;
-  g_dx9mt_device_vtbl.SetPixelShaderConstantF =
+  g_dx9mt_device_impl_vtbl.SetStreamSource = dx9mt_device_SetStreamSource;
+  g_dx9mt_device_impl_vtbl.GetStreamSource = dx9mt_device_GetStreamSource;
+  g_dx9mt_device_impl_vtbl.SetStreamSourceFreq = dx9mt_device_SetStreamSourceFreq;
+  g_dx9mt_device_impl_vtbl.GetStreamSourceFreq = dx9mt_device_GetStreamSourceFreq;
+  g_dx9mt_device_impl_vtbl.SetIndices = dx9mt_device_SetIndices;
+  g_dx9mt_device_impl_vtbl.GetIndices = dx9mt_device_GetIndices;
+  g_dx9mt_device_impl_vtbl.CreatePixelShader = dx9mt_device_CreatePixelShader;
+  g_dx9mt_device_impl_vtbl.SetPixelShader = dx9mt_device_SetPixelShader;
+  g_dx9mt_device_impl_vtbl.GetPixelShader = dx9mt_device_GetPixelShader;
+  g_dx9mt_device_impl_vtbl.SetPixelShaderConstantF =
       dx9mt_device_SetPixelShaderConstantF;
-  g_dx9mt_device_vtbl.GetPixelShaderConstantF =
+  g_dx9mt_device_impl_vtbl.GetPixelShaderConstantF =
       dx9mt_device_GetPixelShaderConstantF;
-  g_dx9mt_device_vtbl.SetPixelShaderConstantI =
+  g_dx9mt_device_impl_vtbl.SetPixelShaderConstantI =
       dx9mt_device_SetPixelShaderConstantI;
-  g_dx9mt_device_vtbl.GetPixelShaderConstantI =
+  g_dx9mt_device_impl_vtbl.GetPixelShaderConstantI =
       dx9mt_device_GetPixelShaderConstantI;
-  g_dx9mt_device_vtbl.SetPixelShaderConstantB =
+  g_dx9mt_device_impl_vtbl.SetPixelShaderConstantB =
       dx9mt_device_SetPixelShaderConstantB;
-  g_dx9mt_device_vtbl.GetPixelShaderConstantB =
+  g_dx9mt_device_impl_vtbl.GetPixelShaderConstantB =
       dx9mt_device_GetPixelShaderConstantB;
-  g_dx9mt_device_vtbl.CreateQuery = dx9mt_device_CreateQuery;
+  g_dx9mt_device_impl_vtbl.CreateQuery = dx9mt_device_CreateQuery;
+
+  g_dx9mt_device_vtbl = g_dx9mt_device_impl_vtbl;
+#define DX9MT_DEVICE_METHOD(ret, name, ...)                                      \
+  g_dx9mt_device_vtbl.name = dx9mt_device_mt_##name;
+#include "d3d9_device_methods.inc"
+#undef DX9MT_DEVICE_METHOD
 
   InterlockedExchange(&g_dx9mt_device_vtbl_state, 2);
 }
@@ -3981,6 +5276,7 @@ static ULONG WINAPI dx9mt_device_Release(IDirect3DDevice9 *iface) {
     }
 
     dx9mt_safe_release((IUnknown *)self->parent);
+    DeleteCriticalSection(&self->multithread_guard);
     HeapFree(GetProcessHeap(), 0, self);
   }
 
@@ -3988,12 +5284,20 @@ static ULONG WINAPI dx9mt_device_Release(IDirect3DDevice9 *iface) {
 }
 
 static HRESULT WINAPI dx9mt_device_TestCooperativeLevel(IDirect3DDevice9 *iface) {
+  static LONG log_counter = 0;
   (void)iface;
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 4096)) {
+    dx9mt_logf("device", "TestCooperativeLevel -> OK");
+  }
   return D3D_OK;
 }
 
 static UINT WINAPI dx9mt_device_GetAvailableTextureMem(IDirect3DDevice9 *iface) {
+  static LONG log_counter = 0;
   (void)iface;
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 4096)) {
+    dx9mt_logf("device", "GetAvailableTextureMem -> 512MB");
+  }
   return 512u * 1024u * 1024u;
 }
 
@@ -4128,7 +5432,7 @@ static HRESULT WINAPI dx9mt_device_GetRasterStatus(IDirect3DDevice9 *iface,
 static HRESULT WINAPI dx9mt_device_SetDialogBoxMode(IDirect3DDevice9 *iface,
                                                      WINBOOL enable) {
   (void)iface;
-  (void)enable;
+  dx9mt_logf("device", "SetDialogBoxMode enable=%d -> OK", (int)enable);
   return D3D_OK;
 }
 
@@ -4138,6 +5442,7 @@ static void WINAPI dx9mt_device_SetGammaRamp(IDirect3DDevice9 *iface,
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   (void)swapchain_idx;
   (void)flags;
+  dx9mt_logf("device", "SetGammaRamp swapchain=%u flags=0x%08x", swapchain_idx, (unsigned)flags);
   if (ramp) {
     self->gamma_ramp = *ramp;
   }
@@ -4210,16 +5515,24 @@ static HRESULT WINAPI dx9mt_device_CreateVertexBuffer(
     IDirect3DDevice9 *iface, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool,
     IDirect3DVertexBuffer9 **vb, HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)shared_handle;
-  return dx9mt_vb_create(self, length, usage, fvf, pool, vb);
+  hr = dx9mt_vb_create(self, length, usage, fvf, pool, vb);
+  dx9mt_logf("device", "CreateVertexBuffer length=%u usage=0x%08x fvf=0x%08x pool=%u -> hr=0x%08x",
+             length, (unsigned)usage, (unsigned)fvf, (unsigned)pool, (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateIndexBuffer(
     IDirect3DDevice9 *iface, UINT length, DWORD usage, D3DFORMAT format,
     D3DPOOL pool, IDirect3DIndexBuffer9 **ib, HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)shared_handle;
-  return dx9mt_ib_create(self, length, usage, format, pool, ib);
+  hr = dx9mt_ib_create(self, length, usage, format, pool, ib);
+  dx9mt_logf("device", "CreateIndexBuffer length=%u usage=0x%08x fmt=%u pool=%u -> hr=0x%08x",
+             length, (unsigned)usage, (unsigned)format, (unsigned)pool, (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateRenderTarget(
@@ -4227,10 +5540,14 @@ static HRESULT WINAPI dx9mt_device_CreateRenderTarget(
     D3DMULTISAMPLE_TYPE multisample, DWORD quality, WINBOOL lockable,
     IDirect3DSurface9 **surface, HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)shared_handle;
-  return dx9mt_surface_create(self, width, height, format, D3DPOOL_DEFAULT,
-                              D3DUSAGE_RENDERTARGET, multisample, quality,
-                              lockable, NULL, surface);
+  hr = dx9mt_surface_create(self, width, height, format, D3DPOOL_DEFAULT,
+                            D3DUSAGE_RENDERTARGET, multisample, quality,
+                            lockable, NULL, surface);
+  dx9mt_logf("device", "CreateRenderTarget %ux%u fmt=%u ms=%u lockable=%d -> hr=0x%08x",
+             width, height, (unsigned)format, (unsigned)multisample, (int)lockable, (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateDepthStencilSurface(
@@ -4238,20 +5555,28 @@ static HRESULT WINAPI dx9mt_device_CreateDepthStencilSurface(
     D3DMULTISAMPLE_TYPE multisample, DWORD quality, WINBOOL discard,
     IDirect3DSurface9 **surface, HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)discard;
   (void)shared_handle;
-  return dx9mt_surface_create(self, width, height, format, D3DPOOL_DEFAULT,
-                              D3DUSAGE_DEPTHSTENCIL, multisample, quality,
-                              FALSE, NULL, surface);
+  hr = dx9mt_surface_create(self, width, height, format, D3DPOOL_DEFAULT,
+                            D3DUSAGE_DEPTHSTENCIL, multisample, quality,
+                            FALSE, NULL, surface);
+  dx9mt_logf("device", "CreateDepthStencilSurface %ux%u fmt=%u ms=%u -> hr=0x%08x",
+             width, height, (unsigned)format, (unsigned)multisample, (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateOffscreenPlainSurface(
     IDirect3DDevice9 *iface, UINT width, UINT height, D3DFORMAT format,
     D3DPOOL pool, IDirect3DSurface9 **surface, HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)shared_handle;
-  return dx9mt_surface_create(self, width, height, format, pool, 0,
-                              D3DMULTISAMPLE_NONE, 0, TRUE, NULL, surface);
+  hr = dx9mt_surface_create(self, width, height, format, pool, 0,
+                            D3DMULTISAMPLE_NONE, 0, TRUE, NULL, surface);
+  dx9mt_logf("device", "CreateOffscreenPlainSurface %ux%u fmt=%u pool=%u -> hr=0x%08x",
+             width, height, (unsigned)format, (unsigned)pool, (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_UpdateSurface(
@@ -4401,6 +5726,7 @@ static HRESULT WINAPI dx9mt_device_SetRenderTarget(IDirect3DDevice9 *iface,
                                                     DWORD index,
                                                     IDirect3DSurface9 *surface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (index >= DX9MT_MAX_RENDER_TARGETS) {
     return D3DERR_INVALIDCALL;
   }
@@ -4409,6 +5735,9 @@ static HRESULT WINAPI dx9mt_device_SetRenderTarget(IDirect3DDevice9 *iface,
     return D3D_OK;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 4, 256)) {
+    dx9mt_logf("device", "SetRenderTarget index=%u surface=%p", (unsigned)index, (void *)surface);
+  }
   dx9mt_safe_addref((IUnknown *)surface);
   dx9mt_safe_release((IUnknown *)self->render_targets[index]);
   self->render_targets[index] = surface;
@@ -4433,10 +5762,14 @@ static HRESULT WINAPI dx9mt_device_GetRenderTarget(IDirect3DDevice9 *iface,
 static HRESULT WINAPI dx9mt_device_SetDepthStencilSurface(
     IDirect3DDevice9 *iface, IDirect3DSurface9 *surface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (self->depth_stencil == surface) {
     return D3D_OK;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 4, 256)) {
+    dx9mt_logf("device", "SetDepthStencilSurface surface=%p", (void *)surface);
+  }
   dx9mt_safe_addref((IUnknown *)surface);
   dx9mt_safe_release((IUnknown *)self->depth_stencil);
   self->depth_stencil = surface;
@@ -4460,11 +5793,15 @@ static HRESULT WINAPI dx9mt_device_GetDepthStencilSurface(
 static HRESULT WINAPI dx9mt_device_BeginScene(IDirect3DDevice9 *iface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   dx9mt_packet_begin_frame packet;
+  static LONG log_counter = 0;
 
   if (self->in_scene) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 1024)) {
+    dx9mt_logf("device", "BeginScene frame=%u", self->frame_id);
+  }
   self->in_scene = TRUE;
 
   /*
@@ -4489,10 +5826,14 @@ static HRESULT WINAPI dx9mt_device_BeginScene(IDirect3DDevice9 *iface) {
 
 static HRESULT WINAPI dx9mt_device_EndScene(IDirect3DDevice9 *iface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!self->in_scene) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 1024)) {
+    dx9mt_logf("device", "EndScene frame=%u", self->frame_id);
+  }
   self->in_scene = FALSE;
   return D3D_OK;
 }
@@ -4549,10 +5890,14 @@ static HRESULT WINAPI dx9mt_device_SetTransform(IDirect3DDevice9 *iface,
                                                  D3DTRANSFORMSTATETYPE state,
                                                  const D3DMATRIX *matrix) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!matrix || state >= DX9MT_MAX_TRANSFORM_STATES) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 4096)) {
+    dx9mt_logf("device", "SetTransform state=%u", (unsigned)state);
+  }
   self->transforms[state] = *matrix;
   self->transform_set[state] = TRUE;
   return D3D_OK;
@@ -4577,10 +5922,16 @@ static HRESULT WINAPI dx9mt_device_GetTransform(IDirect3DDevice9 *iface,
 static HRESULT WINAPI dx9mt_device_SetViewport(IDirect3DDevice9 *iface,
                                                 const D3DVIEWPORT9 *viewport) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!viewport) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 4096)) {
+    dx9mt_logf("device", "SetViewport %ux%u+%u+%u z=%.2f-%.2f",
+               viewport->Width, viewport->Height, viewport->X, viewport->Y,
+               viewport->MinZ, viewport->MaxZ);
+  }
   self->viewport = *viewport;
   return D3D_OK;
 }
@@ -4623,10 +5974,14 @@ static HRESULT WINAPI dx9mt_device_SetRenderState(IDirect3DDevice9 *iface,
                                                    D3DRENDERSTATETYPE state,
                                                    DWORD value) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if ((unsigned)state >= DX9MT_MAX_RENDER_STATES) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 16384)) {
+    dx9mt_logf("device", "SetRenderState state=%u value=0x%08x", (unsigned)state, (unsigned)value);
+  }
   self->render_states[state] = value;
   return D3D_OK;
 }
@@ -4647,6 +6002,7 @@ static HRESULT WINAPI dx9mt_device_SetTexture(IDirect3DDevice9 *iface,
                                                DWORD stage,
                                                IDirect3DBaseTexture9 *texture) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (stage >= DX9MT_MAX_TEXTURE_STAGES) {
     return D3DERR_INVALIDCALL;
   }
@@ -4655,6 +6011,9 @@ static HRESULT WINAPI dx9mt_device_SetTexture(IDirect3DDevice9 *iface,
     return D3D_OK;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 16384)) {
+    dx9mt_logf("device", "SetTexture stage=%u texture=%p", (unsigned)stage, (void *)texture);
+  }
   dx9mt_safe_addref((IUnknown *)texture);
   dx9mt_safe_release((IUnknown *)self->textures[stage]);
   self->textures[stage] = texture;
@@ -5200,16 +6559,22 @@ static HRESULT WINAPI dx9mt_device_CreateVertexDeclaration(
     IDirect3DDevice9 *iface, const D3DVERTEXELEMENT9 *elements,
     IDirect3DVertexDeclaration9 **declaration) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
-  return dx9mt_vdecl_create(self, elements, declaration);
+  HRESULT hr = dx9mt_vdecl_create(self, elements, declaration);
+  dx9mt_logf("device", "CreateVertexDeclaration -> hr=0x%08x", (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_SetVertexDeclaration(
     IDirect3DDevice9 *iface, IDirect3DVertexDeclaration9 *decl) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (self->vertex_decl == decl) {
     return D3D_OK;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 4096)) {
+    dx9mt_logf("device", "SetVertexDeclaration decl=%p", (void *)decl);
+  }
   dx9mt_safe_addref((IUnknown *)decl);
   dx9mt_safe_release((IUnknown *)self->vertex_decl);
   self->vertex_decl = decl;
@@ -5234,6 +6599,10 @@ static HRESULT WINAPI dx9mt_device_GetVertexDeclaration(
 
 static HRESULT WINAPI dx9mt_device_SetFVF(IDirect3DDevice9 *iface, DWORD fvf) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 4096)) {
+    dx9mt_logf("device", "SetFVF fvf=0x%08x", (unsigned)fvf);
+  }
   self->fvf = fvf;
   /* In real D3D9, SetFVF replaces the active vertex declaration. */
   dx9mt_safe_release((IUnknown *)self->vertex_decl);
@@ -5255,16 +6624,22 @@ static HRESULT WINAPI dx9mt_device_CreateVertexShader(
     IDirect3DDevice9 *iface, const DWORD *byte_code,
     IDirect3DVertexShader9 **shader) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
-  return dx9mt_vshader_create(self, byte_code, shader);
+  HRESULT hr = dx9mt_vshader_create(self, byte_code, shader);
+  dx9mt_logf("device", "CreateVertexShader -> hr=0x%08x", (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_SetVertexShader(IDirect3DDevice9 *iface,
                                                     IDirect3DVertexShader9 *shader) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (self->vertex_shader == shader) {
     return D3D_OK;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 4096)) {
+    dx9mt_logf("device", "SetVertexShader shader=%p", (void *)shader);
+  }
   dx9mt_safe_addref((IUnknown *)shader);
   dx9mt_safe_release((IUnknown *)self->vertex_shader);
   self->vertex_shader = shader;
@@ -5288,10 +6663,14 @@ static HRESULT WINAPI dx9mt_device_GetVertexShader(
 static HRESULT WINAPI dx9mt_device_SetVertexShaderConstantF(
     IDirect3DDevice9 *iface, UINT reg_idx, const float *data, UINT count) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!data || reg_idx + count > DX9MT_MAX_SHADER_FLOAT_CONSTANTS) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 32768)) {
+    dx9mt_logf("device", "SetVertexShaderConstantF reg=%u count=%u", reg_idx, count);
+  }
   memcpy(&self->vs_const_f[reg_idx][0], data, count * sizeof(self->vs_const_f[0]));
   return D3D_OK;
 }
@@ -5310,10 +6689,14 @@ static HRESULT WINAPI dx9mt_device_GetVertexShaderConstantF(
 static HRESULT WINAPI dx9mt_device_SetVertexShaderConstantI(
     IDirect3DDevice9 *iface, UINT reg_idx, const int *data, UINT count) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!data || reg_idx + count > DX9MT_MAX_SHADER_INT_CONSTANTS) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 32768)) {
+    dx9mt_logf("device", "SetVertexShaderConstantI reg=%u count=%u", reg_idx, count);
+  }
   memcpy(&self->vs_const_i[reg_idx][0], data, count * sizeof(self->vs_const_i[0]));
   return D3D_OK;
 }
@@ -5332,10 +6715,14 @@ static HRESULT WINAPI dx9mt_device_GetVertexShaderConstantI(
 static HRESULT WINAPI dx9mt_device_SetVertexShaderConstantB(
     IDirect3DDevice9 *iface, UINT reg_idx, const WINBOOL *data, UINT count) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!data || reg_idx + count > DX9MT_MAX_SHADER_BOOL_CONSTANTS) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 32768)) {
+    dx9mt_logf("device", "SetVertexShaderConstantB reg=%u count=%u", reg_idx, count);
+  }
   memcpy(&self->vs_const_b[reg_idx], data, count * sizeof(WINBOOL));
   return D3D_OK;
 }
@@ -5355,10 +6742,15 @@ static HRESULT WINAPI dx9mt_device_SetStreamSource(
     IDirect3DDevice9 *iface, UINT stream_number,
     IDirect3DVertexBuffer9 *stream_data, UINT offset_in_bytes, UINT stride) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (stream_number >= DX9MT_MAX_STREAMS) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 4096)) {
+    dx9mt_logf("device", "SetStreamSource stream=%u data=%p offset=%u stride=%u",
+               stream_number, (void *)stream_data, offset_in_bytes, stride);
+  }
   if (self->streams[stream_number] != stream_data) {
     dx9mt_safe_addref((IUnknown *)stream_data);
     dx9mt_safe_release((IUnknown *)self->streams[stream_number]);
@@ -5392,10 +6784,15 @@ static HRESULT WINAPI dx9mt_device_SetStreamSourceFreq(IDirect3DDevice9 *iface,
                                                         UINT stream_number,
                                                         UINT divider) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (stream_number >= DX9MT_MAX_STREAMS) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 4, 1024)) {
+    dx9mt_logf("device", "SetStreamSourceFreq stream=%u divider=0x%08x",
+               stream_number, (unsigned)divider);
+  }
   self->stream_freq[stream_number] = divider;
   return D3D_OK;
 }
@@ -5415,10 +6812,14 @@ static HRESULT WINAPI dx9mt_device_GetStreamSourceFreq(IDirect3DDevice9 *iface,
 static HRESULT WINAPI dx9mt_device_SetIndices(IDirect3DDevice9 *iface,
                                                IDirect3DIndexBuffer9 *index_data) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (self->indices == index_data) {
     return D3D_OK;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 4096)) {
+    dx9mt_logf("device", "SetIndices indices=%p", (void *)index_data);
+  }
   dx9mt_safe_addref((IUnknown *)index_data);
   dx9mt_safe_release((IUnknown *)self->indices);
   self->indices = index_data;
@@ -5443,16 +6844,22 @@ static HRESULT WINAPI dx9mt_device_CreatePixelShader(
     IDirect3DDevice9 *iface, const DWORD *byte_code,
     IDirect3DPixelShader9 **shader) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
-  return dx9mt_pshader_create(self, byte_code, shader);
+  HRESULT hr = dx9mt_pshader_create(self, byte_code, shader);
+  dx9mt_logf("device", "CreatePixelShader -> hr=0x%08x", (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_SetPixelShader(IDirect3DDevice9 *iface,
                                                    IDirect3DPixelShader9 *shader) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (self->pixel_shader == shader) {
     return D3D_OK;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 2, 4096)) {
+    dx9mt_logf("device", "SetPixelShader shader=%p", (void *)shader);
+  }
   dx9mt_safe_addref((IUnknown *)shader);
   dx9mt_safe_release((IUnknown *)self->pixel_shader);
   self->pixel_shader = shader;
@@ -5476,10 +6883,14 @@ static HRESULT WINAPI dx9mt_device_GetPixelShader(IDirect3DDevice9 *iface,
 static HRESULT WINAPI dx9mt_device_SetPixelShaderConstantF(
     IDirect3DDevice9 *iface, UINT reg_idx, const float *data, UINT count) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!data || reg_idx + count > DX9MT_MAX_SHADER_FLOAT_CONSTANTS) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 32768)) {
+    dx9mt_logf("device", "SetPixelShaderConstantF reg=%u count=%u", reg_idx, count);
+  }
   memcpy(&self->ps_const_f[reg_idx][0], data, count * sizeof(self->ps_const_f[0]));
   return D3D_OK;
 }
@@ -5498,10 +6909,14 @@ static HRESULT WINAPI dx9mt_device_GetPixelShaderConstantF(
 static HRESULT WINAPI dx9mt_device_SetPixelShaderConstantI(
     IDirect3DDevice9 *iface, UINT reg_idx, const int *data, UINT count) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!data || reg_idx + count > DX9MT_MAX_SHADER_INT_CONSTANTS) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 32768)) {
+    dx9mt_logf("device", "SetPixelShaderConstantI reg=%u count=%u", reg_idx, count);
+  }
   memcpy(&self->ps_const_i[reg_idx][0], data, count * sizeof(self->ps_const_i[0]));
   return D3D_OK;
 }
@@ -5520,10 +6935,14 @@ static HRESULT WINAPI dx9mt_device_GetPixelShaderConstantI(
 static HRESULT WINAPI dx9mt_device_SetPixelShaderConstantB(
     IDirect3DDevice9 *iface, UINT reg_idx, const WINBOOL *data, UINT count) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!data || reg_idx + count > DX9MT_MAX_SHADER_BOOL_CONSTANTS) {
     return D3DERR_INVALIDCALL;
   }
 
+  if (dx9mt_should_log_method_sample(&log_counter, 1, 32768)) {
+    dx9mt_logf("device", "SetPixelShaderConstantB reg=%u count=%u", reg_idx, count);
+  }
   memcpy(&self->ps_const_b[reg_idx], data, count * sizeof(WINBOOL));
   return D3D_OK;
 }
@@ -5602,6 +7021,9 @@ HRESULT dx9mt_device_create(IDirect3D9 *parent, UINT adapter,
   device->device_type = device_type;
   device->focus_window = focus_window;
   device->behavior_flags = behavior_flags;
+  device->multithread_guard_enabled =
+      (behavior_flags & D3DCREATE_MULTITHREADED) != 0;
+  InitializeCriticalSection(&device->multithread_guard);
   device->software_vp = (behavior_flags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) != 0;
   device->frame_id = 1;
   dx9mt_device_init_default_states(device);
@@ -5625,6 +7047,7 @@ HRESULT dx9mt_device_create(IDirect3D9 *parent, UINT adapter,
   hr = dx9mt_device_reset_internal(device, presentation_parameters);
   if (FAILED(hr)) {
     dx9mt_safe_release((IUnknown *)parent);
+    DeleteCriticalSection(&device->multithread_guard);
     HeapFree(GetProcessHeap(), 0, device);
     return hr;
   }

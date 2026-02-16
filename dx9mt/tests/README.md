@@ -12,3 +12,4 @@ Current coverage:
 - monotonic packet sequence enforcement
 - present-target metadata requirement
 - draw packet size and draw-state ID validation
+- frontend D3D9 surface copy regression checks (DXT block-compressed + linear)

@@ -2,39 +2,34 @@
 
 ## Where We Are
 
-RB5 is in progress. The major infrastructure for in-game rendering is now in place:
+RB5 is still in progress, but the focus shifted from feature bring-up to crash hardening after save-load failures.
 
-- **Cull mode** -- D3DRS_CULLMODE transmitted through full pipeline and applied per-draw via `[encoder setCullMode:]`. D3D9 left-handed winding convention mapped correctly (D3DCULL_CW -> MTLCullModeFront, D3DCULL_CCW -> MTLCullModeBack). Default is D3DCULL_CCW.
+- **Block-compressed safety fixes landed** -- DXT copy rect validation, block-size scaling rejection, and `ColorFill` rejection for compressed surfaces.
+- **Multithread runtime guard landed** -- per-device critical section with lock-aware `IDirect3DDevice9` wrappers; VB/IB/surface/texture lock/unlock paths now use the same guard.
+- **Known crash signature** -- save-load crash was a null dereference in game code (`falloutnv+0x757aa9`, `ESI=0`) while device behavior flags included `D3DCREATE_MULTITHREADED` (`0x00000054`).
 
-- **Shader flow control** -- The transpiler now handles if/ifc/else/endif, rep/endrep, break/breakc. Comparison operators (GT/EQ/GE/LT/NE/LE) extracted from instruction token bits 18-20. Integer constant registers from `defi` emitted as `float4 i#` for loop bounds. Boolean constant registers from `defb` emitted as `float4 b#` for predicates. Shaders using these opcodes now translate to MSL instead of falling back to the TSS/c0 path.
-
-- **Multi-texture** -- The entire pipeline was refactored from individual `texture0_*`/`sampler0_*` fields to `[DX9MT_MAX_PS_SAMPLERS]` arrays (8 stages). Frontend captures texture metadata + sampler state for all bound stages. Backend bridge copies all stages through hash/record/IPC. Metal viewer binds all active stages at matching `[[texture(N)]]`/`[[sampler(N)]]` indices. The shader emitter already generated correct multi-texture MSL -- only the data pipeline was blocking. PS sampler index > 0 rejection removed from parser.
-
-The FNV main menu continues to render correctly. The system is ready for in-game testing.
-
-## Immediate Next: Test In-Game Rendering
+## Immediate Next: Re-Validate Save/Load Stability
 
 ### The situation
 
-The infrastructure for 3D rendering is now in place: depth testing, cull mode, flow control, and multi-texture. The next step is to enter FNV gameplay and see what happens.
+The highest-priority question is now binary: does gameplay save/load remain stable with the new multithread guard enabled.
 
 ### Steps
 
-1. **Enter FNV gameplay** -- start a new game or load a save, observe what renders and what breaks
-2. **Fix shader compilation errors** -- stderr will show full MSL source for failures. Most likely causes:
-   - Relative addressing (`c[a0.x + N]`) -- still hard-fails, needed for skinned meshes
-   - Unhandled opcodes -- any SM2/SM3 ops not yet in the emitter
-3. **Add missing render states** as needed:
-   - **Fog** -- outdoor scenes will look wrong without distance fog
-   - **Stencil operations** -- shadow volumes, UI masking (state transmitted, need MTL stencil ops)
-   - **Blend operations** -- SUBTRACT, REVSUBTRACT, MIN, MAX (currently only ADD)
-4. **Validate depth correctness** -- 3D scenes should have proper occlusion
-5. **Check multi-texture binding** -- normal maps, specular maps should now be sampled correctly
+1. **Replay the failing save-load path with dx9mt active** (`make run`), capture whether crash reproduces.
+2. **Hold in gameplay for sustained runtime** (streaming + UI transitions) to catch delayed race fallout.
+3. **If crash persists**, collect:
+   - `backtrace.txt`
+   - `/tmp/dx9mt_runtime.log` around crash time
+   - whether faulting thread is still a worker thread vs render thread
+4. **If crash persists with same signature**, extend locking scope to all child COM vtbls (not only lock/unlock hot paths) and add upload-arena global guarding for multi-device/thread edge cases.
 
 ### Remaining RB5 Items
 
 | Item | Priority | Notes |
 |------|----------|-------|
+| Save/load stability verification | High | Gate before more feature work |
+| Full child-object multithread wrapping (if needed) | High | Fallback if crash still reproduces |
 | Relative addressing (a0) | High | Blocks skinned character rendering |
 | VS/PS linkage validation | Medium | Wrong output but won't crash |
 | Fog state | Medium | Cosmetic, outdoor scenes |
@@ -56,8 +51,8 @@ Replace IPC with in-process `__wine_unix_call` for zero-copy data sharing and sy
 
 ## Priority Order
 
-1. **Test in-game rendering** -- enter gameplay, observe, iterate
-2. **Relative addressing** -- unblock skinned mesh shaders
-3. **Render state coverage** -- fog, stencil ops as needed
-4. **Wine unix lib integration** -- performance, zero-copy, proper architecture
-5. **Performance optimization** -- buffer recycling, state dedup, async compile
+1. **Save/load stability validation with dx9mt**
+2. **Crash hardening follow-up (if still reproducible)**
+3. **Relative addressing and shader completeness**
+4. **Render state coverage** -- fog, stencil ops as needed
+5. **Wine unix lib integration + performance work**

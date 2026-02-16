@@ -5,15 +5,10 @@ WINE_SILENT := WINEDEBUG=-all "$(WINE)"
 
 DX9MT_DIR := $(CURDIR)/dx9mt
 DX9MT_DLL := $(DX9MT_DIR)/build/d3d9.dll
-FNV_DIR := $(WINEPREFIX)/drive_c/Games/Steam/steamapps/common/Fallout New Vegas
+FNV_DIR := $(WINEPREFIX)/drive_c/Games/GOG Fallout New Vegas/Fallout New Vegas
 
-STEAM_WIN_PATH := C:\\Games\\Steam\\steam.exe
-LAUNCHER_WIN_PATH := C:\\Games\\Steam\\steamapps\\common\\Fallout New Vegas\\FalloutNVLauncher.exe
-
-STEAM_STARTUP_WAIT ?= 12
 DX9MT_RUNTIME_LOG ?= /tmp/dx9mt_runtime.log
 DX9MT_LAUNCHER_LOG ?= /tmp/fnv_dx9mt_probe.log
-DX9MT_STEAM_LOG ?= /tmp/steam_probe.log
 DX9MT_ANALYZE_TOP ?= 20
 
 WINEDLLOVERRIDES := dxsetup.exe=d
@@ -22,7 +17,7 @@ export WINEPREFIX
 export WINEDLLOVERRIDES
 
 .DEFAULT_GOAL := run
-.PHONY: run show-logs analyze-logs test clear dx9mt-build dx9mt-test install-dx9mt-fnv configure-fnv-dx9mt-override show-fnv-dx9mt-override wine-restart
+.PHONY: run run-wine show-logs analyze-logs test clear dx9mt-build dx9mt-test install-dx9mt-fnv configure-fnv-dx9mt-override configure-fnv-wine-d3d9 show-fnv-dx9mt-override wine-restart
 
 wine-restart:
 	@echo "Restarting wineserver"; \
@@ -42,12 +37,21 @@ configure-fnv-dx9mt-override: wine-restart
 	@set -e; \
 	for dll in d3d8 d3d9 d3d10 d3d10_1 d3d10core d3d11 d3d12 dxgi; do \
 		$(WINE_SILENT) reg delete "HKCU\Software\Wine\DllOverrides" /v $$dll /f >/dev/null 2>&1 || true; \
-		$(WINE_SILENT) reg delete "HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides" /v $$dll /f >/dev/null 2>&1 || true; \
 		$(WINE_SILENT) reg delete "HKCU\Software\Wine\AppDefaults\FalloutNVLauncher.exe\DllOverrides" /v $$dll /f >/dev/null 2>&1 || true; \
 		$(WINE_SILENT) reg delete "HKCU\Software\Wine\AppDefaults\FalloutNV.exe\DllOverrides" /v $$dll /f >/dev/null 2>&1 || true; \
 	done; \
 	$(WINE_SILENT) reg add "HKCU\Software\Wine\AppDefaults\FalloutNV.exe\DllOverrides" /v d3d9 /d native,builtin /f >/dev/null; \
 	$(WINE_SILENT) reg add "HKCU\Software\Wine\AppDefaults\FalloutNVLauncher.exe\DllOverrides" /v d3d9 /d native,builtin /f >/dev/null
+
+configure-fnv-wine-d3d9: wine-restart
+	@set -e; \
+	for dll in d3d8 d3d9 d3d10 d3d10_1 d3d10core d3d11 d3d12 dxgi; do \
+		$(WINE_SILENT) reg delete "HKCU\Software\Wine\DllOverrides" /v $$dll /f >/dev/null 2>&1 || true; \
+		$(WINE_SILENT) reg delete "HKCU\Software\Wine\AppDefaults\FalloutNVLauncher.exe\DllOverrides" /v $$dll /f >/dev/null 2>&1 || true; \
+		$(WINE_SILENT) reg delete "HKCU\Software\Wine\AppDefaults\FalloutNV.exe\DllOverrides" /v $$dll /f >/dev/null 2>&1 || true; \
+	done; \
+	$(WINE_SILENT) reg add "HKCU\Software\Wine\AppDefaults\FalloutNV.exe\DllOverrides" /v d3d9 /d builtin /f >/dev/null; \
+	$(WINE_SILENT) reg add "HKCU\Software\Wine\AppDefaults\FalloutNVLauncher.exe\DllOverrides" /v d3d9 /d builtin /f >/dev/null
 
 install-dx9mt-fnv: dx9mt-build configure-fnv-dx9mt-override
 	@test -f "$(DX9MT_DLL)" || (echo "missing $(DX9MT_DLL)" && exit 1)
@@ -72,13 +76,26 @@ run: install-dx9mt-fnv
 	else \
 		echo "Metal viewer not found at $(DX9MT_METAL_VIEWER), skipping"; \
 	fi; \
-	echo "Starting Steam"; \
-	DX9MT_LOG_PATH="$(DX9MT_RUNTIME_LOG)" WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" \
-	"$(WINE)" "$(STEAM_WIN_PATH)" >>"$(DX9MT_STEAM_LOG)" 2>&1 & \
 	echo "Launching FNV via NVSE (log: $(DX9MT_RUNTIME_LOG))"; \
 	cd "$(FNV_DIR)" && \
 	DX9MT_LOG_PATH="$(DX9MT_RUNTIME_LOG)" WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" \
-	"$(WINE)" nvse_loader.exe 2>&1 | tee "$(DX9MT_RUNTIME_LOG)"
+	WINEDEBUG=+seh,+tid \
+	"$(WINE)" nvse_loader.exe >/tmp/dx9mt_wine_stdout.log 2>/tmp/dx9mt_wine_stderr.log; \
+	echo "Wine exited $$?"; \
+	echo "=== Wine stderr (crash trace) ==="; \
+	tail -60 /tmp/dx9mt_wine_stderr.log
+
+run-wine: configure-fnv-wine-d3d9
+	@set -e; \
+	pkill -f dx9mt_metal_viewer 2>/dev/null || true; \
+	echo "Launching FNV via NVSE with Wine d3d9 (builtin)"; \
+	cd "$(FNV_DIR)" && \
+	WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" \
+	WINEDEBUG=+seh,+tid \
+	"$(WINE)" nvse_loader.exe >/tmp/fnv_wine_stdout.log 2>/tmp/fnv_wine_stderr.log; \
+	echo "Wine exited $$?"; \
+	echo "=== Wine stderr (crash trace) ==="; \
+	tail -60 /tmp/fnv_wine_stderr.log
 
 show-logs:
 	@echo "== dx9mt runtime log: $(DX9MT_RUNTIME_LOG) =="; \
@@ -100,14 +117,6 @@ show-logs:
 	else \
 		echo "(no launcher log yet)"; \
 	fi; \
-	echo; \
-	echo "== steam signals: $(DX9MT_STEAM_LOG) =="; \
-	if [ -f "$(DX9MT_STEAM_LOG)" ]; then \
-		stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$(DX9MT_STEAM_LOG)"; \
-		rg -n -i "err:|Unhandled exception|c000|steam exited|dx9mt/" "$(DX9MT_STEAM_LOG)" || tail -n 80 "$(DX9MT_STEAM_LOG)"; \
-	else \
-		echo "(no steam log yet)"; \
-	fi
 
 analyze-logs:
 	@if command -v uv >/dev/null 2>&1; then \
@@ -120,8 +129,6 @@ analyze-logs:
 show-fnv-dx9mt-override: wine-restart
 	@echo "Global Wine DllOverrides:"; \
 	"$(WINE)" reg query "HKCU\Software\Wine\DllOverrides" || true; \
-	echo "steam.exe override:"; \
-	"$(WINE)" reg query "HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides" || true; \
 	echo "FalloutNV.exe override:"; \
 	"$(WINE)" reg query "HKCU\Software\Wine\AppDefaults\FalloutNV.exe\DllOverrides" || true; \
 	echo "FalloutNVLauncher.exe override:"; \

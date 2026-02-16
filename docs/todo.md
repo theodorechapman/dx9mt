@@ -54,8 +54,19 @@
 - [x] Static no-depth state for overlay draws (always pass, no write)
 - [x] Depth/stencil state in frame dump
 - [x] Contract test defaults updated with depth/stencil values
-- [x] Clean build, all 10 contract tests passing
+- [x] Clean build, backend contract + frontend surface-copy tests passing
 - [x] FNV main menu still renders correctly (depth state transparent for 2D menu)
+
+## Completed: Crash Hardening (2026-02-16)
+
+- [x] DXT block-compressed copy guardrails:
+  - reject invalid non-block-aligned rects
+  - reject scaling for block-compressed copy paths
+  - reject `ColorFill` on block-compressed surfaces
+- [x] Added frontend Wine regression test coverage for DXT/linear surface copies (`frontend_surface_copy_test`)
+- [x] Implemented per-device `D3DCREATE_MULTITHREADED` synchronization:
+  - lock-aware wrappers for full `IDirect3DDevice9` vtbl dispatch
+  - shared device guard on VB/IB/surface/texture lock/unlock hot paths
 
 ## Current Priority: RB5 -- In-Game Rendering
 
@@ -69,6 +80,10 @@
 - [x] Multi-texture support in translated PS (tex0..tex7 bindings)
 - [ ] Relative addressing (a0 register for dynamic constant indexing)
 - [ ] VS/PS interface linkage validation (match output semantics to input semantics)
+
+### Stability
+- [ ] Re-verify problematic save-load path no longer crashes with dx9mt
+- [ ] Expand lock coverage to all child COM vtbl methods if crash signature persists
 
 ### Render State Coverage
 - [x] Cull mode (D3DRS_CULLMODE -> MTLCullMode)
