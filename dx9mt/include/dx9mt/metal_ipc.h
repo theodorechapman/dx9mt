@@ -8,14 +8,23 @@
 /*
  * Shared memory IPC for PE DLL <-> native Metal viewer.
  *
- * Layout (16MB region):
- *   [0..header_size)            dx9mt_metal_ipc_header
- *   [header_size..draws_end)    dx9mt_metal_ipc_draw[draw_count]
- *   [bulk_data_offset..]        bulk VB/IB bytes referenced by draw entries
+ * Double-buffered layout (16MB region):
+ *   [0..global_header_size)                  dx9mt_metal_ipc_global_header
+ *   [global_header_size..global_header_size + slot_size)   slot 0
+ *   [global_header_size + slot_size..global_header_size + 2*slot_size)  slot 1
  *
- * The PE DLL writes the entire region on present(), then stores the
- * sequence number last with release semantics. The viewer polls the
- * sequence number with acquire semantics.
+ * Each slot contains:
+ *   [0..frame_header_size)          dx9mt_metal_ipc_frame_header
+ *   [frame_header_size..draws_end)  dx9mt_metal_ipc_draw[draw_count]
+ *   [bulk_data_offset..]           bulk VB/IB/tex/shader bytes
+ *
+ * Protocol:
+ *   Writer increments sequence, writes to slot (sequence % 2),
+ *   then stores sequence with release semantics.
+ *   Viewer polls sequence with acquire semantics, reads from
+ *   slot (sequence % 2) -- the slot just completed.
+ *   The writer's next frame goes to the OTHER slot, so reader
+ *   and writer never access the same slot simultaneously.
  */
 
 #define DX9MT_METAL_IPC_MAGIC 0xDEAD9001u
@@ -23,6 +32,21 @@
 #define DX9MT_METAL_IPC_WIN_PATH "Z:\\tmp\\dx9mt_metal_frame.bin"
 #define DX9MT_METAL_IPC_SIZE (16u * 1024u * 1024u)
 #define DX9MT_METAL_IPC_MAX_DRAWS 256u
+
+/*
+ * Global header: lives at offset 0, shared between both slots.
+ * Padded to 64 bytes for cache-line alignment.
+ */
+typedef struct dx9mt_metal_ipc_global_header {
+  uint32_t magic;
+  volatile uint32_t sequence; /* incremented after each frame write */
+  uint32_t slot_size;         /* size of each double-buffer slot in bytes */
+  uint32_t _pad[13];          /* pad to 64 bytes */
+} dx9mt_metal_ipc_global_header;
+
+#define DX9MT_METAL_IPC_GLOBAL_HDR_SIZE 64u
+#define DX9MT_METAL_IPC_SLOT_SIZE \
+  (((DX9MT_METAL_IPC_SIZE) - DX9MT_METAL_IPC_GLOBAL_HDR_SIZE) / 2u)
 
 typedef struct dx9mt_metal_ipc_draw {
   uint32_t primitive_type;
@@ -127,9 +151,11 @@ typedef struct dx9mt_metal_ipc_draw {
   uint32_t rs_cull_mode;
 } dx9mt_metal_ipc_draw;
 
-typedef struct dx9mt_metal_ipc_header {
-  uint32_t magic;
-  volatile uint32_t sequence;
+/*
+ * Per-slot frame header. Lives at the start of each double-buffer slot.
+ * Contains all per-frame metadata (dimensions, clear state, draw count, etc.)
+ */
+typedef struct dx9mt_metal_ipc_frame_header {
   uint32_t width;
   uint32_t height;
   uint32_t clear_color_argb;
@@ -141,11 +167,36 @@ typedef struct dx9mt_metal_ipc_header {
   uint32_t replay_hash;
   uint32_t frame_id;
   uint32_t present_render_target_id;
-  uint32_t bulk_data_offset;
+  uint32_t bulk_data_offset; /* relative to slot start */
   uint32_t bulk_data_used;
-} dx9mt_metal_ipc_header;
+} dx9mt_metal_ipc_frame_header;
 
-/* Back-compat alias for code that only reads the header */
-typedef dx9mt_metal_ipc_header dx9mt_metal_frame_data;
+/*
+ * Convenience: compute slot base pointer from IPC base and sequence number.
+ * slot_index should be (sequence % 2).
+ */
+static inline unsigned char *dx9mt_ipc_slot_base(unsigned char *ipc_base,
+                                                  uint32_t slot_index) {
+  return ipc_base + DX9MT_METAL_IPC_GLOBAL_HDR_SIZE +
+         (slot_index * DX9MT_METAL_IPC_SLOT_SIZE);
+}
+
+static inline const volatile unsigned char *
+dx9mt_ipc_slot_base_const(const volatile unsigned char *ipc_base,
+                          uint32_t slot_index) {
+  return ipc_base + DX9MT_METAL_IPC_GLOBAL_HDR_SIZE +
+         (slot_index * DX9MT_METAL_IPC_SLOT_SIZE);
+}
+
+/*
+ * Legacy aliases.
+ *
+ * dx9mt_metal_ipc_header is kept as an alias for the global header
+ * so that the type name remains recognizable. dx9mt_metal_frame_data
+ * is now an alias for the global header (used by the backend for the
+ * mapped-pointer type).
+ */
+typedef dx9mt_metal_ipc_global_header dx9mt_metal_ipc_header;
+typedef dx9mt_metal_ipc_global_header dx9mt_metal_frame_data;
 
 #endif

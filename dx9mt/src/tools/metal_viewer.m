@@ -18,6 +18,13 @@
 #include "d3d9_shader_parse.h"
 #include "d3d9_shader_emit_msl.h"
 
+/* Fatal: log message with file:line then abort. */
+#define DX9MT_VIEWER_FATAL(fmt, ...) do { \
+    fprintf(stderr, "dx9mt FATAL: " fmt "\n", ##__VA_ARGS__); \
+    fprintf(stderr, "  at %s:%d\n", __FILE__, __LINE__); \
+    abort(); \
+} while (0)
+
 /* D3D9 constants we need to interpret vertex declarations and draw params */
 enum {
   D3DDECLTYPE_FLOAT1 = 0,
@@ -1530,7 +1537,15 @@ static id<MTLFunction> translate_and_compile_vs(
 
   /* Check cache */
   id cached = [s_vs_func_cache objectForKey:key];
-  if (cached) return (cached == (id)[NSNull null]) ? nil : cached;
+  if (cached) {
+    if (cached == (id)[NSNull null]) {
+      static int vs_fail_remind = 0;
+      if ((++vs_fail_remind % 60) == 1)
+        fprintf(stderr, "dx9mt: VS 0x%08x still failing (cached)\n", bc_hash);
+      return nil;
+    }
+    return cached;
+  }
 
   /* Parse */
   dx9mt_sm_program prog;
@@ -1583,7 +1598,15 @@ static id<MTLFunction> translate_and_compile_ps(
   NSNumber *key = @(bc_hash);
 
   id cached = [s_ps_func_cache objectForKey:key];
-  if (cached) return (cached == (id)[NSNull null]) ? nil : cached;
+  if (cached) {
+    if (cached == (id)[NSNull null]) {
+      static int ps_fail_remind = 0;
+      if ((++ps_fail_remind % 60) == 1)
+        fprintf(stderr, "dx9mt: PS 0x%08x still failing (cached)\n", bc_hash);
+      return nil;
+    }
+    return cached;
+  }
 
   dx9mt_sm_program prog;
   if (dx9mt_sm_parse(bytecode, dword_count, &prog) != 0) {
@@ -1664,7 +1687,13 @@ static id<MTLRenderPipelineState> create_translated_pso(
     } else if (elems[e].usage == 2 /* BLENDINDICES */ && elems[e].usage_index == 0) {
       attr_idx = 7;
     } else {
-      continue; /* Skip unmapped semantics */
+      static int unmapped_count = 0;
+      if ((++unmapped_count % 60) == 1) {
+        fprintf(stderr, "dx9mt WARN: unmapped vertex semantic usage=%u "
+                "index=%u -- skipping attribute\n",
+                elems[e].usage, elems[e].usage_index);
+      }
+      continue;
     }
     vd.attributes[attr_idx].format = fmt;
     vd.attributes[attr_idx].offset = elems[e].offset;
@@ -1705,12 +1734,12 @@ static id<MTLRenderPipelineState> create_translated_pso(
   return pso;
 }
 
-static void dump_frame(const volatile unsigned char *ipc_base) {
-  const volatile dx9mt_metal_ipc_header *hdr =
-      (const volatile dx9mt_metal_ipc_header *)ipc_base;
+static void dump_frame(const volatile unsigned char *slot_base) {
+  const volatile dx9mt_metal_ipc_frame_header *hdr =
+      (const volatile dx9mt_metal_ipc_frame_header *)slot_base;
   const volatile dx9mt_metal_ipc_draw *draws =
-      (const volatile dx9mt_metal_ipc_draw *)(ipc_base +
-                                              sizeof(dx9mt_metal_ipc_header));
+      (const volatile dx9mt_metal_ipc_draw *)(slot_base +
+                                              sizeof(dx9mt_metal_ipc_frame_header));
   uint32_t bulk_off = hdr->bulk_data_offset;
   uint32_t draw_count = hdr->draw_count;
 
@@ -1749,7 +1778,7 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
     fprintf(f, "  decl_count=%u", d->decl_count);
     if (d->decl_count > 0 && d->decl_count < 64) {
       const dx9mt_d3d_vertex_element *elems =
-          (const dx9mt_d3d_vertex_element *)(ipc_base + bulk_off +
+          (const dx9mt_d3d_vertex_element *)(slot_base + bulk_off +
                                              d->decl_bulk_offset);
       fprintf(f, ":\n");
       for (uint16_t e = 0; e < d->decl_count; ++e) {
@@ -1814,7 +1843,7 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
             d->vs_bytecode_bulk_offset, d->vs_bytecode_bulk_size,
             d->ps_bytecode_bulk_offset, d->ps_bytecode_bulk_size);
     if (d->vs_bytecode_bulk_size >= 4) {
-      const uint32_t *bc = (const uint32_t *)(ipc_base + bulk_off +
+      const uint32_t *bc = (const uint32_t *)(slot_base + bulk_off +
                                                d->vs_bytecode_bulk_offset);
       uint32_t dw_count = d->vs_bytecode_bulk_size / 4;
       fprintf(f, "    vs_bc[0..3]: %08x %08x %08x %08x (%u dwords, ver=%u.%u)\n",
@@ -1823,7 +1852,7 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
               dw_count, (bc[0] >> 8) & 0xFF, bc[0] & 0xFF);
     }
     if (d->ps_bytecode_bulk_size >= 4) {
-      const uint32_t *bc = (const uint32_t *)(ipc_base + bulk_off +
+      const uint32_t *bc = (const uint32_t *)(slot_base + bulk_off +
                                                d->ps_bytecode_bulk_offset);
       uint32_t dw_count = d->ps_bytecode_bulk_size / 4;
       fprintf(f, "    ps_bc[0..3]: %08x %08x %08x %08x (%u dwords, ver=%u.%u)\n",
@@ -1834,7 +1863,7 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
 
     /* Dump first few vertices (raw hex + interpreted color if COLOR present) */
     if (d->vb_bulk_size > 0 && d->stream0_stride > 0) {
-      const uint8_t *vb = (const uint8_t *)(ipc_base + bulk_off +
+      const uint8_t *vb = (const uint8_t *)(slot_base + bulk_off +
                                              d->vb_bulk_offset);
       uint32_t stride = d->stream0_stride;
       uint32_t vert_count = d->vb_bulk_size / stride;
@@ -1847,7 +1876,7 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
       uint8_t pos_type = 0;
       if (d->decl_count > 0 && d->decl_count < 64) {
         const dx9mt_d3d_vertex_element *elems =
-            (const dx9mt_d3d_vertex_element *)(ipc_base + bulk_off +
+            (const dx9mt_d3d_vertex_element *)(slot_base + bulk_off +
                                                d->decl_bulk_offset);
         for (uint16_t e = 0; e < d->decl_count; ++e) {
           if (elems[e].usage == D3DDECLUSAGE_COLOR && elems[e].usage_index == 0)
@@ -1896,7 +1925,7 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
                  d->tex_id[s], s);
         FILE *tf = fopen(tex_path, "wb");
         if (tf) {
-          const void *tex_data = (const void *)(ipc_base + bulk_off +
+          const void *tex_data = (const void *)(slot_base + bulk_off +
                                                  d->tex_bulk_offset[s]);
           fwrite(tex_data, 1, d->tex_bulk_size[s], tf);
           fclose(tf);
@@ -1915,12 +1944,12 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
                   "/tmp/dx9mt_frame_dump.txt (%u draws)\n", draw_count);
 }
 
-static void render_frame(const volatile unsigned char *ipc_base) {
-  const volatile dx9mt_metal_ipc_header *hdr =
-      (const volatile dx9mt_metal_ipc_header *)ipc_base;
+static void render_frame(const volatile unsigned char *slot_base) {
+  const volatile dx9mt_metal_ipc_frame_header *hdr =
+      (const volatile dx9mt_metal_ipc_frame_header *)slot_base;
   const volatile dx9mt_metal_ipc_draw *draws =
-      (const volatile dx9mt_metal_ipc_draw *)(ipc_base +
-                                              sizeof(dx9mt_metal_ipc_header));
+      (const volatile dx9mt_metal_ipc_draw *)(slot_base +
+                                              sizeof(dx9mt_metal_ipc_frame_header));
   uint32_t bulk_off = hdr->bulk_data_offset;
   uint32_t draw_count = hdr->draw_count;
 
@@ -2071,18 +2100,19 @@ static void render_frame(const volatile unsigned char *ipc_base) {
 
         encoder = [cmd_buf renderCommandEncoderWithDescriptor:pass_desc];
         if (!encoder) {
-          continue;
+          DX9MT_VIEWER_FATAL("renderCommandEncoderWithDescriptor returned nil "
+                             "-- Metal device is broken");
         }
         active_rt_id = draw_rt_id;
         active_target_is_drawable = target_is_drawable;
       }
 
-      draw_texture = texture_for_draw_stage(ipc_base, bulk_off, d, 0);
+      draw_texture = texture_for_draw_stage(slot_base, bulk_off, d, 0);
 
       /* Parse vertex declaration from bulk data to build PSO.
        * Fall back to FVF-derived elements when no declaration is present. */
       if (d->decl_count > 0 && d->decl_count < 64) {
-        elems = (const dx9mt_d3d_vertex_element *)(ipc_base + bulk_off +
+        elems = (const dx9mt_d3d_vertex_element *)(slot_base + bulk_off +
                                                    d->decl_bulk_offset);
         scan_decl_semantics(elems, d->decl_count, NULL, &decl_has_color,
                             &decl_has_texcoord, &decl_has_positiont);
@@ -2097,10 +2127,12 @@ static void render_frame(const volatile unsigned char *ipc_base) {
 
       expects_texture = (d->tex_id[0] != 0 && decl_has_texcoord);
       if (expects_texture && !draw_texture) {
-        /*
-         * Texture content is unavailable (typically render-to-texture path not
-         * captured yet). Skip instead of drawing a solid white fallback quad.
-         */
+        static int tex_skip_count = 0;
+        if ((++tex_skip_count % 60) == 1) {
+          fprintf(stderr, "dx9mt WARN: draw %u/%u skipped -- texture "
+                  "id=0x%08x not available (RT not captured yet?)\n",
+                  i, draw_count, d->tex_id[0]);
+        }
         continue;
       }
 
@@ -2121,7 +2153,8 @@ static void render_frame(const volatile unsigned char *ipc_base) {
 
       geometry_pso = textured ? s_geometry_textured_pso : s_geometry_pso;
       if (!geometry_pso) {
-        continue;
+        DX9MT_VIEWER_FATAL("geometry PSO is nil (textured=%d) -- "
+                           "hardcoded shader compilation failed", textured);
       }
 
       /* RB3 Phase 3: shader translation (mandatory when bytecode present) */
@@ -2131,9 +2164,9 @@ static void render_frame(const volatile unsigned char *ipc_base) {
            !decl_has_positiont);
 
       if (has_shader_bytecode) {
-        const uint32_t *vs_bc = (const uint32_t *)(ipc_base + bulk_off +
+        const uint32_t *vs_bc = (const uint32_t *)(slot_base + bulk_off +
                                                      d->vs_bytecode_bulk_offset);
-        const uint32_t *ps_bc = (const uint32_t *)(ipc_base + bulk_off +
+        const uint32_t *ps_bc = (const uint32_t *)(slot_base + bulk_off +
                                                      d->ps_bytecode_bulk_offset);
         uint32_t vs_dwords = d->vs_bytecode_bulk_size / 4;
         uint32_t ps_dwords = d->ps_bytecode_bulk_size / 4;
@@ -2142,7 +2175,10 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         uint32_t vs_ver = vs_bc[0] & 0xFFFF0000u;
         uint32_t ps_ver = ps_bc[0] & 0xFFFF0000u;
         if (vs_ver != 0xFFFE0000u || ps_ver != 0xFFFF0000u) {
-          continue; /* invalid bytecode — skip draw */
+          fprintf(stderr, "dx9mt ERROR: draw %u/%u invalid shader version "
+                  "tokens vs=0x%08x ps=0x%08x -- SKIPPING draw\n",
+                  i, draw_count, vs_bc[0], ps_bc[0]);
+          continue;
         }
 
         uint32_t vs_hash = dx9mt_sm_bytecode_hash(vs_bc, vs_dwords);
@@ -2151,35 +2187,54 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         id<MTLFunction> vs_func = translate_and_compile_vs(vs_bc, vs_dwords, vs_hash);
         id<MTLFunction> ps_func = translate_and_compile_ps(ps_bc, ps_dwords, ps_hash);
 
-        if (vs_func && ps_func && elems) {
-          uint16_t eff_count = (fvf_elem_count > 0) ? fvf_elem_count
-                                                     : d->decl_count;
-          uint64_t pso_key = ((uint64_t)vs_hash << 32) | ps_hash;
-          pso_key ^= (uint64_t)stride * 0x9E3779B97F4A7C15ULL;
-          pso_key ^= ((uint64_t)d->rs_alpha_blend_enable << 48) |
-                     ((uint64_t)d->rs_src_blend << 40) |
-                     ((uint64_t)d->rs_dest_blend << 32);
-
-          id<MTLRenderPipelineState> translated_pso = create_translated_pso(
-              vs_func, ps_func, elems, eff_count, stride, textured,
-              d->rs_alpha_blend_enable, d->rs_src_blend,
-              d->rs_dest_blend, pso_key);
-          if (translated_pso) {
-            geometry_pso = translated_pso;
-            use_translated = 1;
-          }
+        if (!vs_func || !ps_func) {
+          fprintf(stderr, "dx9mt ERROR: draw %u/%u shader translation failed "
+                  "(vs=0x%08x:%s ps=0x%08x:%s) -- SKIPPING draw\n",
+                  i, draw_count, vs_hash, vs_func ? "OK" : "FAIL",
+                  ps_hash, ps_func ? "OK" : "FAIL");
+          continue;
         }
+
+        if (!elems) {
+          fprintf(stderr, "dx9mt ERROR: draw %u/%u has shaders but no vertex "
+                  "elements -- SKIPPING draw\n", i, draw_count);
+          continue;
+        }
+
+        uint16_t eff_count = (fvf_elem_count > 0) ? fvf_elem_count
+                                                   : d->decl_count;
+        uint64_t pso_key = ((uint64_t)vs_hash << 32) | ps_hash;
+        pso_key ^= (uint64_t)stride * 0x9E3779B97F4A7C15ULL;
+        pso_key ^= ((uint64_t)d->rs_alpha_blend_enable << 48) |
+                   ((uint64_t)d->rs_src_blend << 40) |
+                   ((uint64_t)d->rs_dest_blend << 32);
+
+        id<MTLRenderPipelineState> translated_pso = create_translated_pso(
+            vs_func, ps_func, elems, eff_count, stride, textured,
+            d->rs_alpha_blend_enable, d->rs_src_blend,
+            d->rs_dest_blend, pso_key);
+        if (!translated_pso) {
+          fprintf(stderr, "dx9mt ERROR: draw %u/%u translated PSO creation "
+                  "failed (vs=0x%08x ps=0x%08x) -- SKIPPING draw\n",
+                  i, draw_count, vs_hash, ps_hash);
+          continue;
+        }
+        geometry_pso = translated_pso;
+        use_translated = 1;
       }
 
       /* Create Metal buffers from IPC bulk data */
-      const void *vb_data = (const void *)(ipc_base + bulk_off + d->vb_bulk_offset);
-      const void *ib_data = (const void *)(ipc_base + bulk_off + d->ib_bulk_offset);
+      const void *vb_data = (const void *)(slot_base + bulk_off + d->vb_bulk_offset);
+      const void *ib_data = (const void *)(slot_base + bulk_off + d->ib_bulk_offset);
 
       id<MTLBuffer> vb_buf =
           [s_device newBufferWithBytes:vb_data
                                length:d->vb_bulk_size
                               options:MTLResourceStorageModeShared];
       if (!vb_buf) {
+        fprintf(stderr, "dx9mt ERROR: Metal VB allocation failed "
+                "(size=%u offset=%u) draw %u/%u -- SKIPPING draw\n",
+                d->vb_bulk_size, d->vb_bulk_offset, i, draw_count);
         continue;
       }
 
@@ -2188,6 +2243,9 @@ static void render_frame(const volatile unsigned char *ipc_base) {
                                length:d->ib_bulk_size
                               options:MTLResourceStorageModeShared];
       if (!ib_buf) {
+        fprintf(stderr, "dx9mt ERROR: Metal IB allocation failed "
+                "(size=%u offset=%u) draw %u/%u -- SKIPPING draw\n",
+                d->ib_bulk_size, d->ib_bulk_offset, i, draw_count);
         continue;
       }
 
@@ -2219,7 +2277,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         /* Translated shader path: bind full constant arrays */
         if (d->vs_constants_size > 0) {
           const void *vs_data =
-              (const void *)(ipc_base + bulk_off + d->vs_constants_bulk_offset);
+              (const void *)(slot_base + bulk_off + d->vs_constants_bulk_offset);
           [encoder setVertexBytes:vs_data length:d->vs_constants_size atIndex:1];
         } else {
           static const float zero[4] = {0, 0, 0, 0};
@@ -2227,7 +2285,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         }
         if (d->ps_constants_size > 0) {
           const void *ps_data =
-              (const void *)(ipc_base + bulk_off + d->ps_constants_bulk_offset);
+              (const void *)(slot_base + bulk_off + d->ps_constants_bulk_offset);
           [encoder setFragmentBytes:ps_data length:d->ps_constants_size atIndex:0];
         } else {
           static const float zero[4] = {0, 0, 0, 0};
@@ -2237,7 +2295,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
           if (d->tex_id[s] == 0) continue;
           id<MTLTexture> stage_tex =
-              texture_for_draw_stage(ipc_base, bulk_off, d, s);
+              texture_for_draw_stage(slot_base, bulk_off, d, s);
           if (stage_tex) {
             [encoder setFragmentTexture:stage_tex atIndex:s];
             [encoder setFragmentSamplerState:sampler_state_for_draw_stage(d, s)
@@ -2303,7 +2361,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         frag_params.ps_c0[2] = 1.0f;
         frag_params.ps_c0[3] = 1.0f;
         if (d->pixel_shader_id != 0 && d->ps_constants_size >= 16) {
-          const float *ps_data = (const float *)(ipc_base + bulk_off +
+          const float *ps_data = (const float *)(slot_base + bulk_off +
                                                   d->ps_constants_bulk_offset);
           frag_params.ps_c0[0] = ps_data[0];
           frag_params.ps_c0[1] = ps_data[1];
@@ -2339,7 +2397,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
           [encoder setVertexBytes:pt_matrix length:sizeof(pt_matrix) atIndex:1];
         } else if (d->vs_constants_size >= 64) {
           const void *vs_data =
-              (const void *)(ipc_base + bulk_off + d->vs_constants_bulk_offset);
+              (const void *)(slot_base + bulk_off + d->vs_constants_bulk_offset);
           [encoder setVertexBytes:vs_data length:d->vs_constants_size atIndex:1];
         } else {
           static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
@@ -2500,26 +2558,33 @@ static void render_frame(const volatile unsigned char *ipc_base) {
 }
 
 - (void)pollAndRender {
-  const volatile dx9mt_metal_ipc_header *hdr =
-      (const volatile dx9mt_metal_ipc_header *)_ipc_base;
-  uint32_t seq = __atomic_load_n(&hdr->sequence, __ATOMIC_ACQUIRE);
+  const volatile dx9mt_metal_ipc_global_header *ghdr =
+      (const volatile dx9mt_metal_ipc_global_header *)_ipc_base;
+  uint32_t seq = __atomic_load_n(&ghdr->sequence, __ATOMIC_ACQUIRE);
   if (seq == _last_seq || seq == 0) {
     return;
   }
   _last_seq = seq;
 
-  uint32_t w = hdr->width;
-  uint32_t h = hdr->height;
+  /* Read from the slot that was just completed (sequence % 2). */
+  uint32_t slot_idx = seq % 2u;
+  const volatile unsigned char *slot_base =
+      dx9mt_ipc_slot_base_const(_ipc_base, slot_idx);
+  const volatile dx9mt_metal_ipc_frame_header *fhdr =
+      (const volatile dx9mt_metal_ipc_frame_header *)slot_base;
+
+  uint32_t w = fhdr->width;
+  uint32_t h = fhdr->height;
   if (w > 0 && h > 0 && (w != s_width || h != s_height)) {
     create_window(w, h);
   }
 
   if (s_dump_next_frame) {
     s_dump_next_frame = 0;
-    dump_frame(_ipc_base);
+    dump_frame(slot_base);
   }
 
-  render_frame(_ipc_base);
+  render_frame(slot_base);
 }
 
 

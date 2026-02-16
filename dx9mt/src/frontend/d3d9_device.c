@@ -3418,16 +3418,16 @@ static const IDirect3DQuery9Vtbl g_dx9mt_query_vtbl = {
 #define DX9MT_RETVAL_HRESULT do { return D3DERR_NOTAVAILABLE; } while (0)
 #define DX9MT_RETVAL_ULONG do { return 1; } while (0)
 #define DX9MT_RETVAL_UINT do { return 0; } while (0)
-#define DX9MT_RETVAL_WINBOOL do { return TRUE; } while (0)
+#define DX9MT_RETVAL_WINBOOL do { return FALSE; } while (0)
 #define DX9MT_RETVAL_float do { return 0.0f; } while (0)
 #define DX9MT_RETVAL_void do { return; } while (0)
 
 #define DX9MT_DEVICE_METHOD(ret, name, ...)                                      \
   static ret WINAPI dx9mt_device_default_##name(IDirect3DDevice9 *iface,         \
                                                  ##__VA_ARGS__) {                 \
-    static LONG logged_once = 0;                                                  \
-    if (InterlockedCompareExchange(&logged_once, 1, 0) == 0) {                   \
-      dx9mt_logf("device", "default stub: %s", #name);                           \
+    static LONG stub_counter_##name = 0;                                          \
+    if (dx9mt_should_log_method_sample(&stub_counter_##name, 1, 256)) {          \
+      dx9mt_logf("STUB", "%s (return=" #ret ")", #name);                          \
     }                                                                             \
     (void)iface;                                                                  \
     DX9MT_RETVAL_##ret;                                                           \
@@ -4774,15 +4774,11 @@ static float WINAPI dx9mt_device_GetNPatchMode(IDirect3DDevice9 *iface) {
 }
 
 /*
- * DrawPrimitive: stub -- returns D3D_OK without emitting a packet.
+ * DrawPrimitive: NOT IMPLEMENTED -- returns E_NOTIMPL.
  *
- * FNV exclusively uses DrawIndexedPrimitive, so this no-op doesn't affect
- * the primary target. Returning D3D_OK (rather than E_NOTIMPL) prevents
- * games from falling back to software vertex processing or aborting.
- *
- * When a game that relies on non-indexed draws is targeted, this needs a
- * DRAW_NON_INDEXED packet type and corresponding backend handling. Track
- * via sampled logging to detect if any game actually calls this path.
+ * FNV exclusively uses DrawIndexedPrimitive. When a game that relies on
+ * non-indexed draws is targeted, this needs a DRAW_NON_INDEXED packet type
+ * and corresponding backend handling.
  */
 static HRESULT WINAPI dx9mt_device_DrawPrimitive(IDirect3DDevice9 *iface,
                                                   D3DPRIMITIVETYPE primitive_type,
@@ -4792,11 +4788,12 @@ static HRESULT WINAPI dx9mt_device_DrawPrimitive(IDirect3DDevice9 *iface,
   (void)iface;
 
   if (dx9mt_should_log_method_sample(&log_counter, 4, 256)) {
-    dx9mt_logf("device",
-               "DrawPrimitive stub primitive_type=%u start_vertex=%u primitive_count=%u",
+    dx9mt_logf("ERROR",
+               "DrawPrimitive NOT IMPLEMENTED -- draw discarded "
+               "type=%u start=%u count=%u",
                (unsigned)primitive_type, start_vertex, primitive_count);
   }
-  return D3D_OK;
+  return E_NOTIMPL;
 }
 
 /*

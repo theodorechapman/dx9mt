@@ -642,7 +642,12 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
     if (d->reg_type != DX9MT_SM_REG_INPUT) continue;
 
     int attr_idx = usage_to_attr_idx(d->usage, d->usage_index);
-    if (attr_idx < 0) continue; /* skip unmapped semantics */
+    if (attr_idx < 0) {
+      fprintf(stderr, "dx9mt WARN: VS 0x%08x has unmapped input semantic "
+              "usage=%u index=%u -- skipping\n",
+              bytecode_hash, d->usage, d->usage_index);
+      continue;
+    }
 
     const char *type = "float4";
     int mc = mask_count(d->write_mask);

@@ -760,7 +760,7 @@ int dx9mt_backend_bridge_init(const dx9mt_backend_init_desc *desc) {
     if (dx9mt_metal_init() == 0) {
       dx9mt_logf("backend", "metal presenter initialized");
     } else {
-      dx9mt_logf("backend", "metal presenter init failed, falling back to no-op");
+      dx9mt_fatal("backend", "metal presenter init failed -- cannot continue");
     }
   }
 #endif
@@ -785,10 +785,13 @@ int dx9mt_backend_bridge_init(const dx9mt_backend_init_desc *desc) {
           g_metal_ipc_mapping, FILE_MAP_ALL_ACCESS, 0, 0,
           DX9MT_METAL_IPC_SIZE);
       if (g_metal_ipc_ptr) {
-        memset((void *)g_metal_ipc_ptr, 0, sizeof(dx9mt_metal_ipc_header));
+        memset((void *)g_metal_ipc_ptr, 0,
+               sizeof(dx9mt_metal_ipc_global_header));
         g_metal_ipc_ptr->magic = DX9MT_METAL_IPC_MAGIC;
-        dx9mt_logf("backend", "metal IPC mapped at %s",
-                   DX9MT_METAL_IPC_WIN_PATH);
+        g_metal_ipc_ptr->slot_size = DX9MT_METAL_IPC_SLOT_SIZE;
+        dx9mt_logf("backend",
+                   "metal IPC mapped at %s (double-buffered, slot_size=%u)",
+                   DX9MT_METAL_IPC_WIN_PATH, DX9MT_METAL_IPC_SLOT_SIZE);
       }
     }
     if (!g_metal_ipc_ptr) {
@@ -801,9 +804,16 @@ int dx9mt_backend_bridge_init(const dx9mt_backend_init_desc *desc) {
       g_metal_ipc_file = INVALID_HANDLE_VALUE;
     }
   } else {
-    dx9mt_logf("backend",
-               "metal IPC file not found (viewer not running?): %s",
-               DX9MT_METAL_IPC_WIN_PATH);
+    dx9mt_logf("WARNING",
+               "===============================================");
+    dx9mt_logf("WARNING",
+               "Metal IPC file not found -- viewer not running?");
+    dx9mt_logf("WARNING",
+               "All frame data will be DISCARDED until viewer starts.");
+    dx9mt_logf("WARNING",
+               "Path: %s", DX9MT_METAL_IPC_WIN_PATH);
+    dx9mt_logf("WARNING",
+               "===============================================");
   }
 #endif
 
@@ -1095,24 +1105,30 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
 
 #ifdef _WIN32
   if (g_metal_ipc_ptr) {
-    unsigned char *ipc_base = (unsigned char *)g_metal_ipc_ptr;
+    unsigned char *ipc_region = (unsigned char *)g_metal_ipc_ptr;
     uint32_t draw_count = g_frame_replay_state.draw_stored;
     uint32_t bulk_offset;
     uint32_t bulk_used = 0;
     dx9mt_metal_ipc_draw *ipc_draws;
+    dx9mt_metal_ipc_frame_header *frame_hdr;
     uint32_t i;
+    uint32_t next_seq = g_metal_ipc_sequence + 1;
+    uint32_t slot_idx = next_seq % 2u;
+    unsigned char *slot_base = dx9mt_ipc_slot_base(ipc_region, slot_idx);
 
     if (draw_count > DX9MT_METAL_IPC_MAX_DRAWS) {
       draw_count = DX9MT_METAL_IPC_MAX_DRAWS;
     }
 
-    bulk_offset = (uint32_t)(sizeof(dx9mt_metal_ipc_header) +
+    bulk_offset = (uint32_t)(sizeof(dx9mt_metal_ipc_frame_header) +
                              draw_count * sizeof(dx9mt_metal_ipc_draw));
     /* Align bulk data to 16 bytes */
     bulk_offset = (bulk_offset + 15u) & ~15u;
 
+    frame_hdr = (dx9mt_metal_ipc_frame_header *)slot_base;
     ipc_draws =
-        (dx9mt_metal_ipc_draw *)(ipc_base + sizeof(dx9mt_metal_ipc_header));
+        (dx9mt_metal_ipc_draw *)(slot_base +
+                                 sizeof(dx9mt_metal_ipc_frame_header));
 
     for (i = 0; i < draw_count; ++i) {
       const dx9mt_backend_draw_command *cmd = &g_frame_replay_state.draws[i];
@@ -1187,10 +1203,11 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       data = dx9mt_frontend_upload_resolve(&cmd->vertex_data);
       if (data && cmd->vertex_data_size > 0 &&
           bulk_offset + bulk_used + cmd->vertex_data_size <=
-              DX9MT_METAL_IPC_SIZE) {
+              DX9MT_METAL_IPC_SLOT_SIZE) {
         d->vb_bulk_offset = bulk_used;
         d->vb_bulk_size = cmd->vertex_data_size;
-        memcpy(ipc_base + bulk_offset + bulk_used, data, cmd->vertex_data_size);
+        memcpy(slot_base + bulk_offset + bulk_used, data,
+               cmd->vertex_data_size);
         bulk_used += (cmd->vertex_data_size + 15u) & ~15u;
       }
 
@@ -1198,10 +1215,11 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       data = dx9mt_frontend_upload_resolve(&cmd->index_data);
       if (data && cmd->index_data_size > 0 &&
           bulk_offset + bulk_used + cmd->index_data_size <=
-              DX9MT_METAL_IPC_SIZE) {
+              DX9MT_METAL_IPC_SLOT_SIZE) {
         d->ib_bulk_offset = bulk_used;
         d->ib_bulk_size = cmd->index_data_size;
-        memcpy(ipc_base + bulk_offset + bulk_used, data, cmd->index_data_size);
+        memcpy(slot_base + bulk_offset + bulk_used, data,
+               cmd->index_data_size);
         bulk_used += (cmd->index_data_size + 15u) & ~15u;
       }
 
@@ -1209,10 +1227,11 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       data = dx9mt_frontend_upload_resolve(&cmd->vertex_decl_data);
       if (data && cmd->vertex_decl_count > 0) {
         uint32_t decl_bytes = cmd->vertex_decl_count * 8u;
-        if (bulk_offset + bulk_used + decl_bytes <= DX9MT_METAL_IPC_SIZE) {
+        if (bulk_offset + bulk_used + decl_bytes <=
+            DX9MT_METAL_IPC_SLOT_SIZE) {
           d->decl_bulk_offset = bulk_used;
           d->decl_count = cmd->vertex_decl_count;
-          memcpy(ipc_base + bulk_offset + bulk_used, data, decl_bytes);
+          memcpy(slot_base + bulk_offset + bulk_used, data, decl_bytes);
           bulk_used += (decl_bytes + 15u) & ~15u;
         }
       }
@@ -1221,10 +1240,10 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       data = dx9mt_frontend_upload_resolve(&cmd->constants_vs);
       if (data && cmd->constants_vs.size > 0 &&
           bulk_offset + bulk_used + cmd->constants_vs.size <=
-              DX9MT_METAL_IPC_SIZE) {
+              DX9MT_METAL_IPC_SLOT_SIZE) {
         d->vs_constants_bulk_offset = bulk_used;
         d->vs_constants_size = cmd->constants_vs.size;
-        memcpy(ipc_base + bulk_offset + bulk_used, data,
+        memcpy(slot_base + bulk_offset + bulk_used, data,
                cmd->constants_vs.size);
         bulk_used += (cmd->constants_vs.size + 15u) & ~15u;
       }
@@ -1233,10 +1252,10 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       data = dx9mt_frontend_upload_resolve(&cmd->constants_ps);
       if (data && cmd->constants_ps.size > 0 &&
           bulk_offset + bulk_used + cmd->constants_ps.size <=
-              DX9MT_METAL_IPC_SIZE) {
+              DX9MT_METAL_IPC_SLOT_SIZE) {
         d->ps_constants_bulk_offset = bulk_used;
         d->ps_constants_size = cmd->constants_ps.size;
-        memcpy(ipc_base + bulk_offset + bulk_used, data,
+        memcpy(slot_base + bulk_offset + bulk_used, data,
                cmd->constants_ps.size);
         bulk_used += (cmd->constants_ps.size + 15u) & ~15u;
       }
@@ -1246,10 +1265,10 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
         data = dx9mt_frontend_upload_resolve(&cmd->tex_data[s]);
         if (data && cmd->tex_data[s].size > 0 &&
             bulk_offset + bulk_used + cmd->tex_data[s].size <=
-                DX9MT_METAL_IPC_SIZE) {
+                DX9MT_METAL_IPC_SLOT_SIZE) {
           d->tex_bulk_offset[s] = bulk_used;
           d->tex_bulk_size[s] = cmd->tex_data[s].size;
-          memcpy(ipc_base + bulk_offset + bulk_used, data,
+          memcpy(slot_base + bulk_offset + bulk_used, data,
                  cmd->tex_data[s].size);
           bulk_used += (cmd->tex_data[s].size + 15u) & ~15u;
         }
@@ -1260,41 +1279,46 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       data = dx9mt_frontend_upload_resolve(&cmd->vs_bytecode);
       if (data && cmd->vs_bytecode.size > 0 &&
           bulk_offset + bulk_used + cmd->vs_bytecode.size <=
-              DX9MT_METAL_IPC_SIZE) {
+              DX9MT_METAL_IPC_SLOT_SIZE) {
         d->vs_bytecode_bulk_offset = bulk_used;
         d->vs_bytecode_bulk_size = cmd->vs_bytecode.size;
-        memcpy(ipc_base + bulk_offset + bulk_used, data,
+        memcpy(slot_base + bulk_offset + bulk_used, data,
                cmd->vs_bytecode.size);
         bulk_used += (cmd->vs_bytecode.size + 15u) & ~15u;
       }
       data = dx9mt_frontend_upload_resolve(&cmd->ps_bytecode);
       if (data && cmd->ps_bytecode.size > 0 &&
           bulk_offset + bulk_used + cmd->ps_bytecode.size <=
-              DX9MT_METAL_IPC_SIZE) {
+              DX9MT_METAL_IPC_SLOT_SIZE) {
         d->ps_bytecode_bulk_offset = bulk_used;
         d->ps_bytecode_bulk_size = cmd->ps_bytecode.size;
-        memcpy(ipc_base + bulk_offset + bulk_used, data,
+        memcpy(slot_base + bulk_offset + bulk_used, data,
                cmd->ps_bytecode.size);
         bulk_used += (cmd->ps_bytecode.size + 15u) & ~15u;
       }
     }
 
-    g_metal_ipc_ptr->width = g_present_target.width;
-    g_metal_ipc_ptr->height = g_present_target.height;
-    g_metal_ipc_ptr->have_clear = g_frame_replay_state.have_clear;
-    g_metal_ipc_ptr->clear_color_argb = snapshot.last_clear_color;
-    g_metal_ipc_ptr->clear_flags = snapshot.last_clear_flags;
-    g_metal_ipc_ptr->clear_z = snapshot.last_clear_z;
-    g_metal_ipc_ptr->clear_stencil = snapshot.last_clear_stencil;
-    g_metal_ipc_ptr->draw_count = draw_count;
-    g_metal_ipc_ptr->replay_hash = snapshot.replay_hash;
-    g_metal_ipc_ptr->frame_id = frame_id;
-    g_metal_ipc_ptr->present_render_target_id =
+    frame_hdr->width = g_present_target.width;
+    frame_hdr->height = g_present_target.height;
+    frame_hdr->have_clear = g_frame_replay_state.have_clear;
+    frame_hdr->clear_color_argb = snapshot.last_clear_color;
+    frame_hdr->clear_flags = snapshot.last_clear_flags;
+    frame_hdr->clear_z = snapshot.last_clear_z;
+    frame_hdr->clear_stencil = snapshot.last_clear_stencil;
+    frame_hdr->draw_count = draw_count;
+    frame_hdr->replay_hash = snapshot.replay_hash;
+    frame_hdr->frame_id = frame_id;
+    frame_hdr->present_render_target_id =
         g_frame_replay_state.present_render_target_id;
-    g_metal_ipc_ptr->bulk_data_offset = bulk_offset;
-    g_metal_ipc_ptr->bulk_data_used = bulk_used;
-    /* Write sequence last -- the viewer polls this field. */
-    __atomic_store_n(&g_metal_ipc_ptr->sequence, ++g_metal_ipc_sequence,
+    frame_hdr->bulk_data_offset = bulk_offset;
+    frame_hdr->bulk_data_used = bulk_used;
+    /*
+     * Write sequence last -- the viewer polls this field.
+     * The viewer reads from slot (sequence % 2), which is the slot
+     * we just finished writing. Our NEXT frame will go to the other slot.
+     */
+    g_metal_ipc_sequence = next_seq;
+    __atomic_store_n(&g_metal_ipc_ptr->sequence, next_seq,
                      __ATOMIC_RELEASE);
     present_mode = "metal-ipc";
   }
