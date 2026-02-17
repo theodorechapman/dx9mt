@@ -13,7 +13,7 @@ from typing import Iterable, Optional
 
 
 LOG_LINE_RE = re.compile(
-    r"^\[(?P<time>\d\d:\d\d:\d\d)\]\s+dx9mt/(?P<tag>[^:]+):\s+(?P<msg>.*)$"
+    r"^\[(?P<time>\d\d:\d\d:\d\d)\](?:\s+\[tid=[0-9a-fA-F]+\])?\s+dx9mt/(?P<tag>[^:]+):\s+(?P<msg>.*)$"
 )
 CALL_RE = re.compile(r"^(?P<name>[A-Za-z0-9_]+)(?:\s+(?P<args>.*))?$")
 ARG_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -198,8 +198,8 @@ def main() -> int:
     parser.add_argument(
         "log",
         nargs="?",
-        default="/tmp/dx9mt_runtime.log",
-        help="Path to runtime log (default: /tmp/dx9mt_runtime.log)",
+        default=str(Path.cwd() / "dx9mt-output" / "dx9mt_runtime.log"),
+        help="Path to runtime log (default: ./dx9mt-output/dx9mt_runtime.log)",
     )
     parser.add_argument(
         "--top",

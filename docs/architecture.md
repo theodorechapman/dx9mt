@@ -143,11 +143,11 @@ Native process (ARM64 dx9mt_metal_viewer)
 ## 7) Fast Debug Checklist
 
 1. Confirm frame progression:
-   - `rg "present frame=" /tmp/dx9mt_runtime.log | tail`
+   - `rg "present frame=" dx9mt-output/dx9mt_runtime.log | tail`
 2. Check for data loss:
-   - `rg "slot overflow|draw packet missing constants" /tmp/dx9mt_runtime.log`
+   - `rg "slot overflow|draw packet missing constants" dx9mt-output/dx9mt_runtime.log`
 3. Dump a problematic frame:
-   - press `D` in viewer, inspect `/tmp/dx9mt_frame_dump.txt`.
+   - press `D` in viewer, inspect `dx9mt-output/dx9mt_frame_dump.txt`.
 4. Verify active RT and draw count:
    - frame dump header (`draws`, `present_rt`) and per-draw `rt_id`.
 5. Check translated shader failures:

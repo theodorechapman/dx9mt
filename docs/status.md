@@ -41,7 +41,7 @@
 
 ## Concrete Runtime Evidence
 
-From `/tmp/dx9mt_runtime.log` in the latest run:
+From `dx9mt-output/dx9mt_runtime.log` in the latest run:
 
 - IPC present is active:
   - `present frame=3360 ... (metal-ipc) ... draws=1476`
@@ -52,7 +52,8 @@ From `/tmp/dx9mt_runtime.log` in the latest run:
 - Clear color in failing range is blue-ish:
   - `last_clear=0x0096a8be`
 
-From `/tmp/dx9mt_frame_dump_0480.txt` and `/tmp/dx9mt_frame_dump_0481.txt`:
+From `dx9mt-output/dx9mt_frame_dump_0480.txt` and
+`dx9mt-output/dx9mt_frame_dump_0481.txt`:
 
 - non-zero draw frames are captured (`draws: 57`) with valid RT metadata.
 - intermittent zero-draw frame dumps also occur nearby (`draws: 0`).

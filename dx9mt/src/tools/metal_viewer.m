@@ -9,7 +9,11 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -190,6 +194,9 @@ static CAMetalLayer *s_metal_layer;
 static NSWindow *s_window;
 static uint32_t s_width = 1280;
 static uint32_t s_height = 720;
+static char s_output_dir[PATH_MAX];
+static int s_output_dir_ready = 0;
+static int s_output_dir_warned = 0;
 
 /* RB3 Phase 3: shader translation caches */
 static NSMutableDictionary *s_vs_func_cache;  /* bytecode_hash -> id<MTLFunction> or NSNull */
@@ -203,6 +210,73 @@ static uint32_t s_drawable_depth_w;
 static uint32_t s_drawable_depth_h;
 static NSMutableDictionary *s_depth_stencil_cache;  /* key -> id<MTLDepthStencilState> */
 static id<MTLDepthStencilState> s_no_depth_state;   /* always-pass, no write (overlay) */
+
+static const char *dx9mt_output_dir(void) {
+  const char *env;
+
+  if (s_output_dir_ready) {
+    return s_output_dir;
+  }
+
+  env = getenv("DX9MT_OUTPUT_DIR");
+  if (env && env[0] != '\0') {
+    snprintf(s_output_dir, sizeof(s_output_dir), "%s", env);
+  } else if (!getcwd(s_output_dir, sizeof(s_output_dir))) {
+    snprintf(s_output_dir, sizeof(s_output_dir), ".");
+  }
+
+  if (!env || env[0] == '\0') {
+    size_t len = strlen(s_output_dir);
+    const char *suffix = "/dx9mt-output";
+    if (len + strlen(suffix) + 1 < sizeof(s_output_dir)) {
+      snprintf(s_output_dir + len, sizeof(s_output_dir) - len, "%s", suffix);
+    }
+  }
+
+  s_output_dir_ready = 1;
+  return s_output_dir;
+}
+
+static void ensure_output_dir(void) {
+  static int attempted = 0;
+  NSString *dir_path;
+  NSError *err = nil;
+  BOOL ok;
+
+  if (attempted) {
+    return;
+  }
+  attempted = 1;
+
+  dir_path = [NSString stringWithUTF8String:dx9mt_output_dir()];
+  if (!dir_path) {
+    return;
+  }
+
+  ok = [[NSFileManager defaultManager] createDirectoryAtPath:dir_path
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:&err];
+  if (!ok && !s_output_dir_warned) {
+    fprintf(stderr, "dx9mt_metal_viewer: failed to create output dir %s (%s)\n",
+            dx9mt_output_dir(),
+            err ? [[err localizedDescription] UTF8String] : "unknown error");
+    s_output_dir_warned = 1;
+  }
+}
+
+static void build_output_path(char *out, size_t out_size, const char *name) {
+  int n;
+
+  if (!out || out_size == 0) {
+    return;
+  }
+
+  n = snprintf(out, out_size, "%s/%s", dx9mt_output_dir(), name);
+  if (n < 0 || (size_t)n >= out_size) {
+    snprintf(out, out_size, "%s", name);
+  }
+}
 
 static NSString *const s_shader_source =
     @"#include <metal_stdlib>\n"
@@ -1809,6 +1883,8 @@ static void dump_frame_to(const volatile unsigned char *ipc_base,
   uint32_t bulk_off = hdr->bulk_data_offset;
   uint32_t draw_count = hdr->draw_count;
 
+  ensure_output_dir();
+
   FILE *f = fopen(path, "w");
   if (!f) {
     fprintf(stderr, "dx9mt_metal_viewer: cannot open dump file %s\n", path);
@@ -1986,9 +2062,11 @@ static void dump_frame_to(const volatile unsigned char *ipc_base,
     /* Save texture data to file */
     for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
       if (d->tex_bulk_size[s] > 0 && d->tex_id[s] != 0) {
-        char tex_path[256];
-        snprintf(tex_path, sizeof(tex_path), "/tmp/dx9mt_tex_%u_s%u.raw",
+        char tex_name[64];
+        char tex_path[PATH_MAX];
+        snprintf(tex_name, sizeof(tex_name), "dx9mt_tex_%u_s%u.raw",
                  d->tex_id[s], s);
+        build_output_path(tex_path, sizeof(tex_path), tex_name);
         FILE *tf = fopen(tex_path, "wb");
         if (tf) {
           const void *tex_data = (const void *)(ipc_base + bulk_off +
@@ -2011,7 +2089,9 @@ static void dump_frame_to(const volatile unsigned char *ipc_base,
 }
 
 static void dump_frame(const volatile unsigned char *ipc_base) {
-  dump_frame_to(ipc_base, "/tmp/dx9mt_frame_dump.txt");
+  char path[PATH_MAX];
+  build_output_path(path, sizeof(path), "dx9mt_frame_dump.txt");
+  dump_frame_to(ipc_base, path);
 }
 
 static void render_frame(const volatile unsigned char *ipc_base) {
@@ -2641,7 +2721,8 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         s_dump_continuous = 1;
         fprintf(stderr,
                 "dx9mt_metal_viewer: continuous dump ON "
-                "(writing to /tmp/dx9mt_frame_dump_NNNN.txt)\n");
+                "(writing to %s/dx9mt_frame_dump_NNNN.txt)\n",
+                dx9mt_output_dir());
       }
     }
     return event;
@@ -2668,8 +2749,10 @@ static void render_frame(const volatile unsigned char *ipc_base) {
     dump_frame(_ipc_base);
   }
   if (s_dump_continuous) {
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/dx9mt_frame_dump_%04u.txt", s_dump_seq++);
+    char name[64];
+    char path[PATH_MAX];
+    snprintf(name, sizeof(name), "dx9mt_frame_dump_%04u.txt", s_dump_seq++);
+    build_output_path(path, sizeof(path), name);
     dump_frame_to(_ipc_base, path);
   }
 

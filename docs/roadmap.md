@@ -79,8 +79,8 @@ Reduce hitching and improve iteration speed.
 1. `make clear && make run`
 2. Reproduce menu -> load save -> in-game transition.
 3. Collect:
-   - `/tmp/dx9mt_runtime.log`
-   - `/tmp/dx9mt_frame_dump.txt` (or numbered dumps)
+   - `dx9mt-output/dx9mt_runtime.log`
+   - `dx9mt-output/dx9mt_frame_dump.txt` (or numbered dumps)
 4. Record:
    - first frame where viewport turns blue
    - overflow/missing-constants counts
