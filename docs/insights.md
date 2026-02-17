@@ -27,6 +27,44 @@ Stale wineserver state masks override changes. Always `wineserver --kill` before
 ### Win32 file paths through Wine
 The PE DLL accesses Unix paths via the Z: drive. `CreateFileA("Z:\\tmp\\foo")` maps to `/tmp/foo`. This is the standard Wine path mapping and is used for the IPC shared memory file.
 
+## Adapter Identity & Caps (Critical for FNV)
+
+### FNV uses adapter name matching, not just caps
+The game calls `GetAdapterIdentifier` and matches the Description string against an internal GPU table to select the shader package number. **Unknown adapters get fallback behavior** that can break shader initialization. We must report as a known NVIDIA GPU.
+
+Current identity: NVIDIA GeForce GTX 280 (VendorId 0x10DE, DeviceId 0x0611, Driver "nvd3dum.dll"). This was previously Apple VendorId 0x106B with description "dx9mt Step1 Stub Adapter", which caused the BSShader type 29 (SHADER_LIGHTING30) to never be initialized, leading to a deterministic crash on save loading.
+
+### D3DCAPS9 must match DXVK reference closely
+Caps audited against DXVK's d3d9_caps.h and Microsoft SM3.0 requirements. Key mistakes caught:
+- `MaxSimultaneousTextures=16` was wrong (D3D9 FFP max is 8)
+- `MaxVShaderInstructionsExecuted=65535` was too low (should be 0xFFFFFFFF)
+- Missing `PS20Caps` flags (`NODEPENDENTREADLIMIT`, `NOTEXINSTRUCTIONLIMIT`)
+- Missing `PrimitiveMiscCaps` flags (`CLIPTLVERTS`, `PERSTAGECONSTANT`, `FOGINFVF`)
+- Missing `TextureAddressCaps` (`INDEPENDENTUV`, `MIRRORONCE`)
+- `ZBUFFERLESSHSR` in RasterCaps was wrong (T&L-only hardware flag)
+- Missing fog modes (`WFOG`, `ZFOG`) in RasterCaps
+
+### Shader package selection depends on adapter identity
+FNV loads compiled shader bytecode from `Data\Shaders\shaderpackageNNN.sdp` files. The package number (1-19) is selected based on GPU detection. Package 19 is the SM3.0 NVIDIA package. If the adapter name doesn't match any known GPU, the game may select a minimal package, skip shader types, or use fallback code paths.
+
+## BSShader System (FNV/Gamebryo)
+
+### BSShaderType enum is sparse
+The shader type table has 35 entries but only ~8 defined types: 0=TallGrass, 1=Default(ShadowLight), 10=Sky, 14=Skin, 17=Water, 29=Lighting30, 32=Tile, 33=NoLighting. Most entries are NULL gaps in the enum.
+
+### Lighting30Shader (type 29) requires SM3.0 + INI setting
+SHADER_LIGHTING30 is the SM3.0 upgrade path for BSShaderPPLightingProperty. It requires both `bAllow30Shaders=1` in the INI AND the GPU reporting SM3.0. NIFs reference this shader type unconditionally, so if it's not initialized but a NIF requests it, the factory tries lazy creation via TLS and fails on IO threads.
+
+### TLS slot 0 is only initialized on the main rendering thread
+The NiDX9Renderer per-thread context in TLS slot 0 is set up during device creation on the main thread. Background IO threads never initialize it. The BSShader factory's lazy-creation path reads TLS data at `[tls_slot + 0x2B4]`, which faults when the slot is NULL. The factory's SEH catches this and returns NULL, but the caller doesn't null-check.
+
+### VEH patches are a safety net, not the fix
+The VEH crash handler in dllmain.c patches two crash sites:
+1. Primary: EIP=0xB57AA9, ESI=0 -> skip to 0xB57AD2, ESP+=4, EAX=0
+2. Fallback: Any `mov eax,[esi]` (8b 06) with ESI=0 in 0xB57A00-0xB57C00 -> scan forward to `call edx`, skip past
+
+The **actual fix** was changing the adapter identity to NVIDIA, which causes proper shader package selection and BSShader initialization at startup.
+
 ## Packet Protocol
 
 ### BEGIN_FRAME is now in the packet stream
@@ -149,13 +187,38 @@ FNV's main menu draws 2D quads (POSITIONT) with default depth state (zenable=1, 
 ### Stencil state fields are transmitted but not yet consumed
 The 5 stencil fields (enable, func, ref, mask, writemask) are transmitted through the full pipeline and visible in frame dumps, but the Metal viewer doesn't create stencil textures or configure stencil operations on the MTLDepthStencilDescriptor yet. This is deferred to when FNV gameplay actually uses stencil (shadow volumes, UI masking).
 
+## Crash Investigation & VEH (RB5)
+
+### BSShader factory crash root cause
+Deterministic crash loading a save game. Root cause: adapter identity reported as Apple (VendorId 0x106B), which FNV didn't recognize, causing the game to skip initializing BSShader type 29 (SHADER_LIGHTING30). When a NIF mesh referenced this shader type during save loading, the factory returned NULL, and the caller crashed on vtable dereference.
+
+### VEH crash handler as diagnostic tool
+The VEH handler in dllmain.c was extended incrementally to diagnose the crash:
+- Thread ID logging (distinguish main vs IO thread)
+- Extended code byte dumps around crash EIP
+- Factory function code dump and disassembly
+- Shader type table dump (individual reads, not loops -- loops cause recursive VEH)
+- TLS index and slot value dump
+- Stack frame walk
+
+### VEH handler pitfalls
+- **For-loops inside VEH cause recursive VEH**: Reading memory in a loop can fault, triggering the VEH recursively and hanging. Use individual explicit reads.
+- **IsBadReadPtr is unreliable on Wine**: Some regions pass IsBadReadPtr but still fault. Use VirtualQuery for reliable checks.
+- **Sampled logging hides multi-thread activity**: The main thread consumed "first N" log slots, making IO thread calls invisible. Always use unconditional logging when diagnosing multi-thread issues.
+
+### Fixes attempted that didn't help
+- Heap-allocating BSS buffers (reduced 31MB BSS to 1.5KB) -- crash was in game code, not our BSS
+- Adding CheckDeviceFormat whitelist -- game didn't check these before the crash path
+- Adding PrimitiveMiscCaps (MASKZ, SEPARATEALPHABLEND, etc.) -- not the gating condition for shader init
+- Adding TextureCaps (VOLUMEMAP, etc.) -- not the gating condition
+
 ## Debugging
 
 ### Frame dump for per-draw diagnosis
 The Metal viewer can dump per-draw state to `/tmp/dx9mt_frame_dump.txt`. Each draw shows: primitive type/count, vertex format, per-stage texture info (id, generation, format, size, upload status for all active stages 0-7), per-stage sampler state, TSS state, blend state, depth state, cull mode, viewport, and vertex data samples. Key field: `upload=0` means the texture is in the viewer's cache (no upload needed this frame), NOT that data is missing.
 
 ### Sampled logging prevents log flooding
-High-frequency calls (GetDeviceCaps, CheckDeviceFormat, DebugSetMute) use `dx9mt_should_log_method_sample(&counter, first_n, every_n)`. First N calls logged in full, then every Nth call. Backend frames log on frames 0-9 then every 120th.
+High-frequency calls (GetDeviceCaps, CheckDeviceFormat, DebugSetMute) use `dx9mt_should_log_method_sample(&counter, first_n, every_n)`. First N calls logged in full, then every Nth call. Backend frames log on frames 0-9 then every 120th. Note: Create* methods and STUB macro now log unconditionally for diagnostic visibility.
 
 ### Kind-tagged object IDs
 Object IDs encode the type: `(kind << 24) | serial`. Kind values: 1=device, 2=swapchain, 3=buffer, 4=texture, 5=surface, 6=VS, 7=PS, 8=state_block, 9=query, 10=vertex_decl. Log line `target=33554433` = `0x02000001` = swapchain serial 1.

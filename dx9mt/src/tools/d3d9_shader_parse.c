@@ -518,7 +518,7 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
       uint32_t dst_token = bytecode[pos++];
       inst->dst = decode_dst(dst_token);
 
-      /* Skip relative addressing token if present */
+      /* Parse relative addressing token if present */
       if ((dst_token >> 13) & 0x1u) {
         if (pos >= dword_count) {
           snprintf(out->error_msg, sizeof(out->error_msg),
@@ -526,13 +526,9 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
           out->has_error = 1;
           return -1;
         }
-        pos++;
+        uint32_t rel_token = bytecode[pos++];
         inst->dst.has_relative = 1;
-        snprintf(out->error_msg, sizeof(out->error_msg),
-                 "relative addressing not supported (dst %u)",
-                 inst->dst.number);
-        out->has_error = 1;
-        return -1;
+        inst->dst.relative_component = (uint8_t)((rel_token >> 16) & 0x3u);
       }
 
       track_register_usage(out, &inst->dst, 1);
@@ -554,7 +550,7 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
     for (int s = 0; s < src_count; ++s) {
       uint32_t src_token = bytecode[pos++];
       inst->src[s] = decode_src(src_token);
-      /* Skip relative addressing token if present */
+      /* Parse relative addressing token if present */
       if (inst->src[s].has_relative) {
         if (pos >= dword_count) {
           snprintf(out->error_msg, sizeof(out->error_msg),
@@ -562,12 +558,8 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
           out->has_error = 1;
           return -1;
         }
-        pos++;
-        snprintf(out->error_msg, sizeof(out->error_msg),
-                 "relative addressing not supported (src %u)",
-                 inst->src[s].number);
-        out->has_error = 1;
-        return -1;
+        uint32_t rel_token = bytecode[pos++];
+        inst->src[s].relative_component = (uint8_t)((rel_token >> 16) & 0x3u);
       }
 
       track_register_usage(out, &inst->src[s], 0);

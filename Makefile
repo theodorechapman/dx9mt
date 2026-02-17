@@ -68,7 +68,7 @@ run: install-dx9mt-fnv
 	fi; \
 	echo "Launching FNV via NVSE (log: $(DX9MT_RUNTIME_LOG))"; \
 	cd "$(FNV_DIR)" && \
-	DX9MT_LOG_PATH="$(DX9MT_RUNTIME_LOG)" WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" \
+	MVK_CONFIG_LOG_LEVEL=0 DX9MT_LOG_PATH="$(DX9MT_RUNTIME_LOG)" WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" \
 	"$(WINE)" nvse_loader.exe 2>&1 | tee "$(DX9MT_RUNTIME_LOG)"
 
 show-logs:

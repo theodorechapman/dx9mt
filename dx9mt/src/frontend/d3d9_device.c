@@ -58,7 +58,20 @@ typedef struct dx9mt_frontend_upload_state {
   unsigned char slots[DX9MT_UPLOAD_ARENA_SLOTS][DX9MT_UPLOAD_BYTES_PER_SLOT];
 } dx9mt_frontend_upload_state;
 
-static dx9mt_frontend_upload_state g_frontend_upload_state;
+static dx9mt_frontend_upload_state *g_frontend_upload_state;
+
+static dx9mt_frontend_upload_state *dx9mt_frontend_upload_ensure(void) {
+  if (!g_frontend_upload_state) {
+    g_frontend_upload_state = (dx9mt_frontend_upload_state *)VirtualAlloc(
+        NULL, sizeof(dx9mt_frontend_upload_state), MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE);
+    if (!g_frontend_upload_state) {
+      dx9mt_logf("upload", "FATAL: VirtualAlloc failed for upload state (%u bytes)",
+                 (unsigned)sizeof(dx9mt_frontend_upload_state));
+    }
+  }
+  return g_frontend_upload_state;
+}
 
 const void *dx9mt_frontend_upload_resolve(const dx9mt_upload_ref *ref) {
   if (!ref || ref->size == 0) {
@@ -70,7 +83,10 @@ const void *dx9mt_frontend_upload_resolve(const dx9mt_upload_ref *ref) {
   if (ref->offset + ref->size > DX9MT_UPLOAD_BYTES_PER_SLOT) {
     return NULL;
   }
-  return g_frontend_upload_state.slots[ref->arena_index] + ref->offset;
+  if (!g_frontend_upload_state) {
+    return NULL;
+  }
+  return g_frontend_upload_state->slots[ref->arena_index] + ref->offset;
 }
 
 typedef struct dx9mt_device dx9mt_device;
@@ -422,14 +438,18 @@ static uint32_t dx9mt_align_up_u32(uint32_t value, uint32_t alignment) {
 }
 
 static void dx9mt_frontend_upload_begin_frame(uint32_t frame_id) {
-  if (g_frontend_upload_state.frame_id == frame_id) {
+  dx9mt_frontend_upload_ensure();
+  if (!g_frontend_upload_state) {
+    return;
+  }
+  if (g_frontend_upload_state->frame_id == frame_id) {
     return;
   }
 
-  g_frontend_upload_state.frame_id = frame_id;
-  g_frontend_upload_state.slot_index =
+  g_frontend_upload_state->frame_id = frame_id;
+  g_frontend_upload_state->slot_index =
       (uint16_t)(frame_id % DX9MT_UPLOAD_ARENA_SLOTS);
-  g_frontend_upload_state.next_offset = 0;
+  g_frontend_upload_state->next_offset = 0;
 }
 
 static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
@@ -462,25 +482,25 @@ static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
    * validates upload refs and will reject draws with zero-size refs, so this
    * surfaces cleanly in logs rather than producing silent visual corruption.
    */
-  if (g_frontend_upload_state.next_offset >
+  if (g_frontend_upload_state->next_offset >
       DX9MT_UPLOAD_BYTES_PER_SLOT - aligned_size) {
     static LONG overflow_counter = 0;
     if (dx9mt_should_log_method_sample(&overflow_counter, 4, 256)) {
       dx9mt_logf("upload",
                  "slot overflow: frame=%u slot=%u offset=%u need=%u capacity=%u",
-                 frame_id, (unsigned)g_frontend_upload_state.slot_index,
-                 g_frontend_upload_state.next_offset, aligned_size,
+                 frame_id, (unsigned)g_frontend_upload_state->slot_index,
+                 g_frontend_upload_state->next_offset, aligned_size,
                  DX9MT_UPLOAD_BYTES_PER_SLOT);
     }
     return ref;
   }
 
-  slot_base = g_frontend_upload_state.slots[g_frontend_upload_state.slot_index];
-  memcpy(slot_base + g_frontend_upload_state.next_offset, data, size);
-  ref.arena_index = g_frontend_upload_state.slot_index;
-  ref.offset = g_frontend_upload_state.next_offset;
+  slot_base = g_frontend_upload_state->slots[g_frontend_upload_state->slot_index];
+  memcpy(slot_base + g_frontend_upload_state->next_offset, data, size);
+  ref.arena_index = g_frontend_upload_state->slot_index;
+  ref.offset = g_frontend_upload_state->next_offset;
   ref.size = size;
-  g_frontend_upload_state.next_offset += aligned_size;
+  g_frontend_upload_state->next_offset += aligned_size;
   return ref;
 }
 
@@ -637,6 +657,14 @@ dx9mt_hash_draw_state(const dx9mt_packet_draw_indexed *packet) {
   hash = dx9mt_hash_u32(hash, packet->rs_stencilmask);
   hash = dx9mt_hash_u32(hash, packet->rs_stencilwritemask);
   hash = dx9mt_hash_u32(hash, packet->rs_cull_mode);
+  hash = dx9mt_hash_u32(hash, packet->rs_scissortestenable);
+  hash = dx9mt_hash_u32(hash, packet->rs_blendop);
+  hash = dx9mt_hash_u32(hash, packet->rs_colorwriteenable);
+  hash = dx9mt_hash_u32(hash, packet->rs_stencilpass);
+  hash = dx9mt_hash_u32(hash, packet->rs_stencilfail);
+  hash = dx9mt_hash_u32(hash, packet->rs_stencilzfail);
+  hash = dx9mt_hash_u32(hash, packet->rs_fogenable);
+  hash = dx9mt_hash_u32(hash, packet->rs_fogcolor);
   return hash;
 }
 
@@ -3425,10 +3453,7 @@ static const IDirect3DQuery9Vtbl g_dx9mt_query_vtbl = {
 #define DX9MT_DEVICE_METHOD(ret, name, ...)                                      \
   static ret WINAPI dx9mt_device_default_##name(IDirect3DDevice9 *iface,         \
                                                  ##__VA_ARGS__) {                 \
-    static LONG logged_once = 0;                                                  \
-    if (InterlockedCompareExchange(&logged_once, 1, 0) == 0) {                   \
-      dx9mt_logf("device", "default stub: %s", #name);                           \
-    }                                                                             \
+    dx9mt_logf("STUB", "%s (default stub hit)", #name);                          \
     (void)iface;                                                                  \
     DX9MT_RETVAL_##ret;                                                           \
   }
@@ -3863,6 +3888,17 @@ static void dx9mt_device_init_default_states(dx9mt_device *self) {
   self->render_states[D3DRS_STENCILMASK] = 0xFFFFFFFFu;
   self->render_states[D3DRS_STENCILWRITEMASK] = 0xFFFFFFFFu;
   self->render_states[D3DRS_CULLMODE] = D3DCULL_CCW;
+  self->render_states[D3DRS_SCISSORTESTENABLE] = FALSE;
+  self->render_states[D3DRS_COLORWRITEENABLE] = 0xF; /* all channels */
+  self->render_states[D3DRS_STENCILPASS] = 1; /* D3DSTENCILOP_KEEP */
+  self->render_states[D3DRS_STENCILFAIL] = 1; /* D3DSTENCILOP_KEEP */
+  self->render_states[D3DRS_STENCILZFAIL] = 1; /* D3DSTENCILOP_KEEP */
+  self->render_states[D3DRS_FOGENABLE] = FALSE;
+  self->render_states[D3DRS_FOGCOLOR] = 0;
+  *(float *)&self->render_states[D3DRS_FOGSTART] = 0.0f;
+  *(float *)&self->render_states[D3DRS_FOGEND] = 1.0f;
+  *(float *)&self->render_states[D3DRS_FOGDENSITY] = 1.0f;
+  self->render_states[D3DRS_FOGTABLEMODE] = 0; /* D3DFOG_NONE */
 }
 
 static void dx9mt_device_release_bindings(dx9mt_device *self) {
@@ -4158,9 +4194,15 @@ static HRESULT WINAPI dx9mt_device_CreateTexture(
     D3DFORMAT format, D3DPOOL pool, IDirect3DTexture9 **texture,
     HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)shared_handle;
-  return dx9mt_texture_create(self, width, height, levels, usage, format, pool,
-                              texture);
+  hr = dx9mt_texture_create(self, width, height, levels, usage, format, pool,
+                            texture);
+  dx9mt_logf("device",
+             "CreateTexture %ux%u levels=%u usage=0x%08x fmt=%u pool=%u -> hr=0x%08x",
+             width, height, levels, (unsigned)usage, (unsigned)format,
+             (unsigned)pool, (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateVolumeTexture(
@@ -4210,16 +4252,28 @@ static HRESULT WINAPI dx9mt_device_CreateVertexBuffer(
     IDirect3DDevice9 *iface, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool,
     IDirect3DVertexBuffer9 **vb, HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)shared_handle;
-  return dx9mt_vb_create(self, length, usage, fvf, pool, vb);
+  hr = dx9mt_vb_create(self, length, usage, fvf, pool, vb);
+  dx9mt_logf("device",
+             "CreateVertexBuffer len=%u usage=0x%08x fvf=0x%08x pool=%u -> hr=0x%08x",
+             length, (unsigned)usage, (unsigned)fvf, (unsigned)pool,
+             (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateIndexBuffer(
     IDirect3DDevice9 *iface, UINT length, DWORD usage, D3DFORMAT format,
     D3DPOOL pool, IDirect3DIndexBuffer9 **ib, HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)shared_handle;
-  return dx9mt_ib_create(self, length, usage, format, pool, ib);
+  hr = dx9mt_ib_create(self, length, usage, format, pool, ib);
+  dx9mt_logf("device",
+             "CreateIndexBuffer len=%u usage=0x%08x fmt=%u pool=%u -> hr=0x%08x",
+             length, (unsigned)usage, (unsigned)format, (unsigned)pool,
+             (unsigned)hr);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateRenderTarget(
@@ -4986,6 +5040,20 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
   packet->rs_stencilmask = self->render_states[D3DRS_STENCILMASK];
   packet->rs_stencilwritemask = self->render_states[D3DRS_STENCILWRITEMASK];
   packet->rs_cull_mode = self->render_states[D3DRS_CULLMODE];
+  packet->rs_scissortestenable = self->render_states[D3DRS_SCISSORTESTENABLE];
+  packet->rs_blendop = self->render_states[D3DRS_BLENDOP];
+  packet->rs_colorwriteenable = self->render_states[D3DRS_COLORWRITEENABLE];
+  packet->rs_stencilpass = self->render_states[D3DRS_STENCILPASS];
+  packet->rs_stencilfail = self->render_states[D3DRS_STENCILFAIL];
+  packet->rs_stencilzfail = self->render_states[D3DRS_STENCILZFAIL];
+  packet->rs_fogenable = self->render_states[D3DRS_FOGENABLE];
+  packet->rs_fogcolor = self->render_states[D3DRS_FOGCOLOR];
+  memcpy(&packet->rs_fogstart, &self->render_states[D3DRS_FOGSTART],
+         sizeof(float));
+  memcpy(&packet->rs_fogend, &self->render_states[D3DRS_FOGEND], sizeof(float));
+  memcpy(&packet->rs_fogdensity, &self->render_states[D3DRS_FOGDENSITY],
+         sizeof(float));
+  packet->rs_fogtablemode = self->render_states[D3DRS_FOGTABLEMODE];
 
   /* Per-stage texture and sampler data */
   for (stage = 0; stage < DX9MT_MAX_PS_SAMPLERS; ++stage) {
@@ -5258,7 +5326,11 @@ static HRESULT WINAPI dx9mt_device_CreateVertexShader(
     IDirect3DDevice9 *iface, const DWORD *byte_code,
     IDirect3DVertexShader9 **shader) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
-  return dx9mt_vshader_create(self, byte_code, shader);
+  HRESULT hr = dx9mt_vshader_create(self, byte_code, shader);
+  dx9mt_logf("device", "CreateVertexShader bytecode=%p -> hr=0x%08x shader=%p",
+             (const void *)byte_code, (unsigned)hr,
+             (shader && *shader) ? (void *)*shader : NULL);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_SetVertexShader(IDirect3DDevice9 *iface,
@@ -5446,7 +5518,11 @@ static HRESULT WINAPI dx9mt_device_CreatePixelShader(
     IDirect3DDevice9 *iface, const DWORD *byte_code,
     IDirect3DPixelShader9 **shader) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
-  return dx9mt_pshader_create(self, byte_code, shader);
+  HRESULT hr = dx9mt_pshader_create(self, byte_code, shader);
+  dx9mt_logf("device", "CreatePixelShader bytecode=%p -> hr=0x%08x shader=%p",
+             (const void *)byte_code, (unsigned)hr,
+             (shader && *shader) ? (void *)*shader : NULL);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_SetPixelShader(IDirect3DDevice9 *iface,

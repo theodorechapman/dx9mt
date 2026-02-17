@@ -283,9 +283,29 @@ static NSString *const s_shader_source =
      "  uint alpha_arg2;\n"
      "  uint texture_factor_argb;\n"
      "  uint has_pixel_shader;\n"
-     "  uint _pad0;\n"
+     "  uint fog_enable;\n"
      "  float4 ps_c0;\n"
+     "  uint fog_mode;\n"
+     "  float fog_start;\n"
+     "  float fog_end;\n"
+     "  float fog_density;\n"
+     "  float4 fog_color;\n"
      "};\n"
+     "static inline float4 apply_fog(float4 color, float depth,\n"
+     "    uint fog_enable, uint fog_mode, float fog_start, float fog_end,\n"
+     "    float fog_density, float4 fog_color) {\n"
+     "  if (fog_enable == 0u) return color;\n"
+     "  float f = 1.0;\n"
+     "  if (fog_mode == 3u) {\n"
+     "    f = saturate((fog_end - depth) / (fog_end - fog_start));\n"
+     "  } else if (fog_mode == 1u) {\n"
+     "    f = exp(-fog_density * depth);\n"
+     "  } else if (fog_mode == 2u) {\n"
+     "    f = exp(-(fog_density * depth) * (fog_density * depth));\n"
+     "  }\n"
+     "  color.rgb = mix(fog_color.rgb, color.rgb, f);\n"
+     "  return color;\n"
+     "}\n"
      "static inline float4 d3d_decode_tfactor(uint argb) {\n"
      "  float a = float((argb >> 24) & 0xFFu) / 255.0;\n"
      "  float r = float((argb >> 16) & 0xFFu) / 255.0;\n"
@@ -481,6 +501,9 @@ static NSString *const s_shader_source =
      "      !d3d_alpha_test_pass(out_color.a, p.alpha_ref, p.alpha_func)) {\n"
      "    discard_fragment();\n"
      "  }\n"
+     "  out_color = apply_fog(out_color, in.position.z,\n"
+     "    p.fog_enable, p.fog_mode, p.fog_start, p.fog_end,\n"
+     "    p.fog_density, p.fog_color);\n"
      "  return out_color;\n"
      "}\n"
      "fragment float4 geo_fragment_textured(\n"
@@ -515,6 +538,9 @@ static NSString *const s_shader_source =
      "      !d3d_alpha_test_pass(out_color.a, p.alpha_ref, p.alpha_func)) {\n"
      "    discard_fragment();\n"
      "  }\n"
+     "  out_color = apply_fog(out_color, in.position.z,\n"
+     "    p.fog_enable, p.fog_mode, p.fog_start, p.fog_end,\n"
+     "    p.fog_density, p.fog_color);\n"
      "  return out_color;\n"
      "}\n";
 
@@ -621,7 +647,8 @@ static uint64_t hash_decl_key(uint32_t stride,
                               const dx9mt_d3d_vertex_element *elems,
                               uint16_t elem_count, int textured,
                               uint32_t blend_enable, uint32_t src_blend,
-                              uint32_t dst_blend) {
+                              uint32_t dst_blend, uint32_t blend_op,
+                              uint32_t color_write_mask) {
   uint64_t hash = 1469598103934665603ull;
 
   hash ^= (uint64_t)stride;
@@ -635,6 +662,10 @@ static uint64_t hash_decl_key(uint32_t stride,
   hash ^= (uint64_t)src_blend;
   hash *= 1099511628211ull;
   hash ^= (uint64_t)dst_blend;
+  hash *= 1099511628211ull;
+  hash ^= (uint64_t)blend_op;
+  hash *= 1099511628211ull;
+  hash ^= (uint64_t)color_write_mask;
   hash *= 1099511628211ull;
 
   if (!elems || elem_count == 0) {
@@ -917,13 +948,56 @@ static MTLCullMode d3d_cull_to_mtl(uint32_t cull_mode) {
   }
 }
 
+static MTLBlendOperation d3d_blendop_to_mtl(uint32_t op) {
+  switch (op) {
+  case 1:  return MTLBlendOperationAdd;            /* D3DBLENDOP_ADD */
+  case 2:  return MTLBlendOperationSubtract;       /* D3DBLENDOP_SUBTRACT */
+  case 3:  return MTLBlendOperationReverseSubtract;/* D3DBLENDOP_REVSUBTRACT */
+  case 4:  return MTLBlendOperationMin;            /* D3DBLENDOP_MIN */
+  case 5:  return MTLBlendOperationMax;            /* D3DBLENDOP_MAX */
+  default: return MTLBlendOperationAdd;
+  }
+}
+
+static MTLColorWriteMask d3d_writemask_to_mtl(uint32_t mask) {
+  MTLColorWriteMask m = MTLColorWriteMaskNone;
+  if (mask & 0x1) m |= MTLColorWriteMaskRed;
+  if (mask & 0x2) m |= MTLColorWriteMaskGreen;
+  if (mask & 0x4) m |= MTLColorWriteMaskBlue;
+  if (mask & 0x8) m |= MTLColorWriteMaskAlpha;
+  return m;
+}
+
+static MTLStencilOperation d3d_stencilop_to_mtl(uint32_t op) {
+  switch (op) {
+  case 1:  return MTLStencilOperationKeep;
+  case 2:  return MTLStencilOperationZero;
+  case 3:  return MTLStencilOperationReplace;
+  case 4:  return MTLStencilOperationIncrementClamp;
+  case 5:  return MTLStencilOperationDecrementClamp;
+  case 6:  return MTLStencilOperationInvert;
+  case 7:  return MTLStencilOperationIncrementWrap;
+  case 8:  return MTLStencilOperationDecrementWrap;
+  default: return MTLStencilOperationKeep;
+  }
+}
+
 static id<MTLDepthStencilState>
 depth_stencil_state_for_draw(const volatile dx9mt_metal_ipc_draw *d) {
   uint32_t zenable = d->rs_zenable;
   uint32_t zwrite = d->rs_zwriteenable;
   uint32_t zfunc = d->rs_zfunc;
+  uint32_t stencil_en = d->rs_stencilenable;
   uint64_t key_val = (uint64_t)zenable | ((uint64_t)zwrite << 8) |
                      ((uint64_t)zfunc << 16);
+  if (stencil_en) {
+    key_val ^= ((uint64_t)d->rs_stencilfunc << 24) |
+               ((uint64_t)d->rs_stencilpass << 28) |
+               ((uint64_t)d->rs_stencilfail << 32) |
+               ((uint64_t)d->rs_stencilzfail << 36) |
+               ((uint64_t)d->rs_stencilmask << 40) |
+               ((uint64_t)(d->rs_stencilwritemask & 0xFF) << 48);
+  }
   NSNumber *key = @(key_val);
   id<MTLDepthStencilState> cached = [s_depth_stencil_cache objectForKey:key];
   if (cached) {
@@ -936,6 +1010,17 @@ depth_stencil_state_for_draw(const volatile dx9mt_metal_ipc_draw *d) {
   } else {
     desc.depthCompareFunction = MTLCompareFunctionAlways;
     desc.depthWriteEnabled = NO;
+  }
+  if (stencil_en) {
+    MTLStencilDescriptor *sd = [[MTLStencilDescriptor alloc] init];
+    sd.stencilCompareFunction = d3d_cmp_to_mtl(d->rs_stencilfunc);
+    sd.stencilFailureOperation = d3d_stencilop_to_mtl(d->rs_stencilfail);
+    sd.depthFailureOperation = d3d_stencilop_to_mtl(d->rs_stencilzfail);
+    sd.depthStencilPassOperation = d3d_stencilop_to_mtl(d->rs_stencilpass);
+    sd.readMask = d->rs_stencilmask;
+    sd.writeMask = d->rs_stencilwritemask;
+    desc.frontFaceStencil = sd;
+    desc.backFaceStencil = sd;
   }
   id<MTLDepthStencilState> state =
       [s_device newDepthStencilStateWithDescriptor:desc];
@@ -1161,7 +1246,8 @@ static void ensure_geometry_pso(uint32_t stride,
                                 const dx9mt_d3d_vertex_element *elems,
                                 uint16_t elem_count, int textured,
                                 uint32_t blend_enable, uint32_t src_blend,
-                                uint32_t dst_blend) {
+                                uint32_t dst_blend, uint32_t blend_op,
+                                uint32_t color_write_mask) {
   NSError *error = nil;
   MTLVertexDescriptor *vd;
   MTLRenderPipelineDescriptor *desc;
@@ -1182,7 +1268,8 @@ static void ensure_geometry_pso(uint32_t stride,
   }
 
   draw_key = hash_decl_key(stride, elems, elem_count, textured, blend_enable,
-                           eff_src_blend, eff_dst_blend);
+                           eff_src_blend, eff_dst_blend, blend_op,
+                           color_write_mask);
   key_slot = textured ? &s_geometry_textured_pso_key : &s_geometry_pso_key;
   if (textured) {
     if (s_geometry_textured_pso && s_geometry_textured_pso_stride == stride &&
@@ -1257,11 +1344,14 @@ static void ensure_geometry_pso(uint32_t stride,
     desc.colorAttachments[0].blendingEnabled = YES;
     desc.colorAttachments[0].sourceRGBBlendFactor = src;
     desc.colorAttachments[0].destinationRGBBlendFactor = dst;
+    desc.colorAttachments[0].rgbBlendOperation = d3d_blendop_to_mtl(blend_op);
     desc.colorAttachments[0].sourceAlphaBlendFactor = src;
     desc.colorAttachments[0].destinationAlphaBlendFactor = dst;
+    desc.colorAttachments[0].alphaBlendOperation = d3d_blendop_to_mtl(blend_op);
   } else {
     desc.colorAttachments[0].blendingEnabled = NO;
   }
+  desc.colorAttachments[0].writeMask = d3d_writemask_to_mtl(color_write_mask);
 
   if (textured) {
     s_geometry_textured_pso =
@@ -1633,6 +1723,7 @@ static id<MTLRenderPipelineState> create_translated_pso(
     const dx9mt_d3d_vertex_element *elems, uint16_t elem_count,
     uint32_t stride, int textured,
     uint32_t blend_enable, uint32_t src_blend, uint32_t dst_blend,
+    uint32_t blend_op, uint32_t color_write_mask,
     uint64_t pso_key) {
   NSNumber *key = @(pso_key);
   id cached = [s_translated_pso_cache objectForKey:key];
@@ -1685,11 +1776,12 @@ static id<MTLRenderPipelineState> create_translated_pso(
     desc.colorAttachments[0].blendingEnabled = YES;
     desc.colorAttachments[0].sourceRGBBlendFactor = d3d_blend_to_mtl(src_blend, 1);
     desc.colorAttachments[0].destinationRGBBlendFactor = d3d_blend_to_mtl(dst_blend, 0);
-    desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    desc.colorAttachments[0].rgbBlendOperation = d3d_blendop_to_mtl(blend_op);
     desc.colorAttachments[0].sourceAlphaBlendFactor = d3d_blend_to_mtl(src_blend, 1);
     desc.colorAttachments[0].destinationAlphaBlendFactor = d3d_blend_to_mtl(dst_blend, 0);
-    desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    desc.colorAttachments[0].alphaBlendOperation = d3d_blendop_to_mtl(blend_op);
   }
+  desc.colorAttachments[0].writeMask = d3d_writemask_to_mtl(color_write_mask);
 
   NSError *err = nil;
   id<MTLRenderPipelineState> pso =
@@ -2116,7 +2208,8 @@ static void render_frame(const volatile unsigned char *ipc_base) {
                                                    : d->decl_count;
         ensure_geometry_pso(stride, elems, eff_count, textured,
                             d->rs_alpha_blend_enable, d->rs_src_blend,
-                            d->rs_dest_blend);
+                            d->rs_dest_blend, d->rs_blendop,
+                            d->rs_colorwriteenable);
       }
 
       geometry_pso = textured ? s_geometry_textured_pso : s_geometry_pso;
@@ -2159,11 +2252,14 @@ static void render_frame(const volatile unsigned char *ipc_base) {
           pso_key ^= ((uint64_t)d->rs_alpha_blend_enable << 48) |
                      ((uint64_t)d->rs_src_blend << 40) |
                      ((uint64_t)d->rs_dest_blend << 32);
+          pso_key ^= ((uint64_t)d->rs_blendop << 24) |
+                     ((uint64_t)d->rs_colorwriteenable << 16);
 
           id<MTLRenderPipelineState> translated_pso = create_translated_pso(
               vs_func, ps_func, elems, eff_count, stride, textured,
               d->rs_alpha_blend_enable, d->rs_src_blend,
-              d->rs_dest_blend, pso_key);
+              d->rs_dest_blend, d->rs_blendop,
+              d->rs_colorwriteenable, pso_key);
           if (translated_pso) {
             geometry_pso = translated_pso;
             use_translated = 1;
@@ -2201,6 +2297,22 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         vp.znear = d->viewport_min_z;
         vp.zfar = d->viewport_max_z;
         [encoder setViewport:vp];
+      }
+
+      /* Scissor rect */
+      if (d->rs_scissortestenable &&
+          d->scissor_right > d->scissor_left &&
+          d->scissor_bottom > d->scissor_top) {
+        uint32_t rt_w = target_is_drawable ? s_width : d->render_target_width;
+        uint32_t rt_h = target_is_drawable ? s_height : d->render_target_height;
+        MTLScissorRect sr;
+        sr.x = (NSUInteger)d->scissor_left;
+        sr.y = (NSUInteger)d->scissor_top;
+        sr.width = (NSUInteger)(d->scissor_right - d->scissor_left);
+        sr.height = (NSUInteger)(d->scissor_bottom - d->scissor_top);
+        if (sr.x + sr.width > rt_w) sr.width = rt_w - sr.x;
+        if (sr.y + sr.height > rt_h) sr.height = rt_h - sr.y;
+        [encoder setScissorRect:sr];
       }
 
       /* Index type */
@@ -2274,8 +2386,13 @@ static void render_frame(const volatile unsigned char *ipc_base) {
           uint32_t alpha_arg2;
           uint32_t texture_factor_argb;
           uint32_t has_pixel_shader;
-          uint32_t _pad0;
+          uint32_t fog_enable;
           float ps_c0[4];
+          uint32_t fog_mode;
+          float fog_start;
+          float fog_end;
+          float fog_density;
+          float fog_color[4];
         } frag_params;
         memset(&frag_params, 0, sizeof(frag_params));
         frag_params.use_vertex_color = (uint32_t)(decl_has_color ? 1 : 0);
@@ -2298,6 +2415,15 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         frag_params.texture_factor_argb = d->rs_texture_factor;
         frag_params.has_pixel_shader =
             (uint32_t)(d->pixel_shader_id != 0 ? 1 : 0);
+        frag_params.fog_enable = d->rs_fogenable;
+        frag_params.fog_mode = d->rs_fogtablemode;
+        frag_params.fog_start = d->rs_fogstart;
+        frag_params.fog_end = d->rs_fogend;
+        frag_params.fog_density = d->rs_fogdensity;
+        frag_params.fog_color[0] = (float)((d->rs_fogcolor >> 16) & 0xFFu) / 255.0f;
+        frag_params.fog_color[1] = (float)((d->rs_fogcolor >> 8) & 0xFFu) / 255.0f;
+        frag_params.fog_color[2] = (float)(d->rs_fogcolor & 0xFFu) / 255.0f;
+        frag_params.fog_color[3] = (float)((d->rs_fogcolor >> 24) & 0xFFu) / 255.0f;
         frag_params.ps_c0[0] = 1.0f;
         frag_params.ps_c0[1] = 1.0f;
         frag_params.ps_c0[2] = 1.0f;
@@ -2353,6 +2479,9 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         id<MTLDepthStencilState> ds_state = depth_stencil_state_for_draw(d);
         if (ds_state) {
           [encoder setDepthStencilState:ds_state];
+        }
+        if (d->rs_stencilenable) {
+          [encoder setStencilReferenceValue:d->rs_stencilref];
         }
       }
 

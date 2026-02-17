@@ -9,9 +9,12 @@ D3D9-to-Metal translation layer for Wine WoW64 on Apple Silicon. Target: Fallout
 ```
 PE32 Frontend (d3d9.dll, i686-mingw32)
   Implements D3D9 COM interfaces
+  Reports as NVIDIA GeForce GTX 280 (VendorId 0x10DE)
+  SM3.0 D3DCAPS9 matching DXVK reference values
   Captures all API state + draw calls as packets
   Copies VB/IB/decl/constant/texture(x8)/shader bytecode to upload arena
   Writes per-frame data to shared memory IPC file
+  VEH crash handler with BSShader factory NULL-return patches
       |
       | memory-mapped file (/tmp/dx9mt_metal_frame.bin, 16MB)
       | per-draw: viewport, scissor, VB bytes, IB bytes,
@@ -41,43 +44,37 @@ Native Metal Viewer (dx9mt_metal_viewer, ARM64)
 
 The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (mingw, `_WIN32`), the viewer runs natively (`__APPLE__`). They share a 16MB memory-mapped file for frame data. A native backend dylib (`libdx9mt_unixlib.dylib`) is also built but not yet loaded by Wine -- the IPC approach bypasses the need for Wine unix lib integration.
 
-## Current Verified State (2026-02-15)
+## Current Verified State (2026-02-17)
 
-- FNV main menu renders correctly with proper colors, alpha blending, and depth testing
-- ~19 draws/frame across DXT1, DXT3, DXT5, A8R8G8B8 textures
+### Working
+- **Main menu**: renders correctly with proper colors, alpha blending, depth testing
+- **Save game loading**: no crash (previously crashed on BSShader factory NULL return)
+- **In-game entry**: can enter gameplay, ESC overlay texture visible
+- ~19 draws/frame on menu across DXT1, DXT3, DXT5, A8R8G8B8 textures
 - Texture caching by (object_id, generation) with periodic 60-frame refresh
 - Full D3D9 fixed-function TSS combiner evaluation in Metal fragment shader
-- **D3D9 SM2.0/SM3.0 shader bytecode -> MSL transpiler**:
-  - Bytecode parser: dcl, def, defi, defb, arithmetic, texture, matrix multiply instructions
-  - Flow control: if/ifc/else/endif, rep/endrep, break/breakc with comparison operators
-  - Multi-texture: arbitrary PS sampler indices (s0..s7) with per-stage texture/sampler binding
-  - MSL emitter: register mapping, swizzle, write mask, source modifiers, _sat
-  - Integer constant registers (defi -> float4 i#) for rep loop counts
-  - Boolean constant registers (defb -> float4 b#) for if predicates
-  - Shader function cache (bytecode hash -> MTLFunction) with sticky failure
-  - Translated PSO cache (combined key -> MTLRenderPipelineState)
-  - Automatic fallback to TSS/c0 hardcoded path on parse/compile failure
-  - POSITIONT draws skip translation (use synthetic screen-to-NDC matrix)
-  - `DX9MT_SHADER_TRANSLATE=0` env var disables for A/B comparison
-- **Multi-texture support** (8 stages):
-  - Array-based texture/sampler pipeline (tex_id[8], sampler_*[8]) across all layers
-  - Per-stage texture data upload in IPC bulk region
-  - Per-stage texture caching and Metal texture creation
-  - Translated shaders bind all active texture stages at matching [[texture(N)]]/[[sampler(N)]]
-  - Fixed-function TSS fallback remains stage-0-only
-- **Depth/stencil support**:
-  - Depth/stencil render state transmission through full pipeline
-  - Per-render-target Depth32Float texture cache
-  - MTLDepthStencilState cache keyed by (zenable, zwriteenable, zfunc)
-  - Stencil state fields transmitted for future use
-- **Cull mode**: D3DRS_CULLMODE plumbed through full pipeline, D3DCULL_CW/CCW/NONE -> MTLCullMode
-- Render-target texture routing: draws to offscreen RTs available as shader inputs
+- **D3D9 SM2.0/SM3.0 shader bytecode -> MSL transpiler** with caching
+- **Adapter identity**: NVIDIA GeForce GTX 280 (VendorId 0x10DE, DeviceId 0x0611)
+  - Critical for FNV shader package selection (game matches adapter name to GPU table)
+- **D3DCAPS9**: comprehensive SM3.0 caps audited against DXVK reference
+- **Multi-texture support** (8 stages): array-based pipeline, per-stage upload/cache
+- **Depth/stencil support**: per-RT Depth32Float, MTLDepthStencilState cache
+- **Cull mode**: D3DCULL_CW/CCW/NONE -> MTLCullMode per-draw
+- Render-target texture routing (offscreen RT -> shader-readable)
 - FVF-to-vertex-declaration conversion for legacy FVF draws
-- Alpha blending (SRCALPHA/INVSRCALPHA) and alpha test with configurable function
-- D3D9 default state initialization (TSS, sampler, render states, depth/stencil, cull=CCW)
+- Alpha blending and alpha test with configurable function
+- D3D9 default state initialization
+- VEH crash handler with BSShader factory patches (safety net)
 - Mouse interaction audible (game audio works, cursor movement detected)
 - No contract violations in packet stream
 - 10/10 backend contract tests passing
+
+### Known Issues
+- **Black viewport in-game**: ESC overlay renders but 3D world is black
+- **Loading screen hang**: loading bar doesn't animate, requires Cmd+Tab to continue
+- **Cursor clipping**: cursor disappears when not hovering main menu buttons
+- **Save thumbnail**: preview image not shown when hovering over save files
+- **STUB logging unconditional**: all stub methods now log every call (was sampled)
 
 ## Milestones
 
@@ -93,7 +90,7 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 | RB3 Phase 2C | Done | PS constant c0 tint for pixel shader draws, render-target routing |
 | RB3 Phase 3 | Done | D3D9 SM2/SM3 bytecode -> MSL transpiler, shader cache, PSO cache |
 | RB4 | Done | Depth/stencil state, depth textures, per-draw depth testing |
-| RB5 | Active | In-game rendering: cull mode, flow control, multi-texture done; fog/stencil ops remain |
+| RB5 | Active | In-game rendering: save loading fixed, viewport black, loading hang |
 | RB6 | Pending | Performance: state dedup, buffer recycling, pipeline cache, async compile |
 | RB7 | Pending | Compatibility hardening: missing stubs, edge cases, Wine unix lib |
 
@@ -118,8 +115,14 @@ grep "present frame=" /tmp/dx9mt_runtime.log | head
 # Metal IPC status
 grep "metal IPC" /tmp/dx9mt_runtime.log
 
+# VEH patches (BSShader factory NULL skip)
+grep "PATCH" /tmp/dx9mt_runtime.log
+
 # Contract errors (should be empty)
 grep -E "packet parse error|sequence out of order|draw packet missing" /tmp/dx9mt_runtime.log
+
+# Stub methods hit
+grep "STUB" /tmp/dx9mt_runtime.log | sort | uniq -c | sort -rn
 ```
 
 Present frames show `(metal-ipc)` when the IPC path is active.
@@ -170,10 +173,10 @@ dx9mt/
     runtime.h              Frontend runtime init + packet sequencing
     log.h                  Centralized logging
   src/frontend/
-    d3d9.c                 IDirect3D9 factory (caps, format checks, device creation)
+    d3d9.c                 IDirect3D9 factory (caps, format checks, adapter ID, device creation)
     d3d9_device.c          IDirect3DDevice9 + all COM objects (~5700 lines)
     d3d9_perf.c            D3DPERF_* stubs + legacy exports
-    dllmain.c              DLL entry point
+    dllmain.c              DLL entry point, VEH crash handler + BSShader patches
     runtime.c              Singleton init, backend bridge setup, packet sequencing
     d3d9.def               DLL export definitions
   src/backend/

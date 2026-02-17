@@ -140,6 +140,20 @@ typedef struct dx9mt_packet_draw_indexed {
 
   /* RB5: rasterizer state */
   uint32_t rs_cull_mode;
+
+  /* RB6: in-game rendering states */
+  uint32_t rs_scissortestenable;
+  uint32_t rs_blendop;
+  uint32_t rs_colorwriteenable;
+  uint32_t rs_stencilpass;
+  uint32_t rs_stencilfail;
+  uint32_t rs_stencilzfail;
+  uint32_t rs_fogenable;
+  uint32_t rs_fogcolor;
+  float rs_fogstart;
+  float rs_fogend;
+  float rs_fogdensity;
+  uint32_t rs_fogtablemode;
 } dx9mt_packet_draw_indexed;
 
 typedef struct dx9mt_packet_present {

@@ -157,6 +157,7 @@ typedef struct dx9mt_sm_register {
   uint8_t  src_modifier;  /* dx9mt_sm_src_mod */
   uint8_t  result_modifier; /* dx9mt_sm_result_mod */
   uint8_t  has_relative;
+  uint8_t  relative_component; /* 0=x, 1=y, 2=z, 3=w (from relative token) */
 } dx9mt_sm_register;
 
 typedef struct dx9mt_sm_instruction {

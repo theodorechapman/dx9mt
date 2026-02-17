@@ -46,7 +46,13 @@ static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
     snprintf(out, out_sz, "in.v%u", r->number);
     break;
   case DX9MT_SM_REG_CONST:
-    snprintf(out, out_sz, "c[%u]", r->number);
+    if (r->has_relative) {
+      const char *rc = "xyzw";
+      snprintf(out, out_sz, "c[clamp(int(a0.%c) + %u, 0, 255)]",
+               rc[r->relative_component], r->number);
+    } else {
+      snprintf(out, out_sz, "c[%u]", r->number);
+    }
     break;
   case DX9MT_SM_REG_ADDR:
     /* VS: a0 (address register).  PS: t# (texture coordinate input). */
@@ -523,6 +529,11 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
          s0e, comparison_op_str(inst->comparison), s1e);
     return;
   }
+
+  case DX9MT_SM_OP_SGN:
+    /* sgn dst, src0, src1(scratch), src2(scratch) -- only src0 matters */
+    snprintf(rhs, sizeof(rhs), "sign(%s)", s0);
+    break;
 
   default:
     emit(ctx, "  // unsupported opcode %u\n", inst->opcode);

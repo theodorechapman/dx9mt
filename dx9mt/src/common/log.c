@@ -70,6 +70,11 @@ void dx9mt_logf(const char *tag, const char *fmt, ...) {
   char linebuf[1200];
   va_list ap;
   time_t now;
+#if defined(_WIN32)
+  DWORD tid = GetCurrentThreadId();
+#else
+  unsigned long tid = 0;
+#endif
 
   if (!g_log_ready) {
     dx9mt_log_init();
@@ -84,7 +89,7 @@ void dx9mt_logf(const char *tag, const char *fmt, ...) {
   vsnprintf(msgbuf, sizeof(msgbuf), fmt, ap);
   va_end(ap);
 
-  snprintf(linebuf, sizeof(linebuf), "[%s] dx9mt/%s: %s", timebuf,
-           tag ? tag : "core", msgbuf);
+  snprintf(linebuf, sizeof(linebuf), "[%s] [tid=%04lx] dx9mt/%s: %s", timebuf,
+           (unsigned long)tid, tag ? tag : "core", msgbuf);
   dx9mt_log_write_line(linebuf);
 }

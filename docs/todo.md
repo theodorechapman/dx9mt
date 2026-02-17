@@ -57,7 +57,30 @@
 - [x] Clean build, all 10 contract tests passing
 - [x] FNV main menu still renders correctly (depth state transparent for 2D menu)
 
-## Current Priority: RB5 -- In-Game Rendering
+## Completed: RB5a -- Save Loading Crash Fix
+
+- [x] VEH crash handler with thread ID, register dump, stack walk, code byte dump
+- [x] Root cause analysis: BSShader factory NULL return due to adapter identity mismatch
+- [x] Adapter identity: NVIDIA GeForce GTX 280 (VendorId 0x10DE, DeviceId 0x0611)
+- [x] D3DCAPS9 comprehensive audit against DXVK reference (16+ fixes)
+- [x] VEH BSShader NULL-skip patches as safety net
+- [x] Unconditional logging for Create* methods and STUB macro
+- [x] Save game loading works without crash
+
+## Current Priority: RB5b -- In-Game Rendering
+
+### Critical: Black Viewport
+- [ ] Diagnose why 3D world renders as black (ESC overlay is visible)
+  - Likely: render target not being presented, or draws going to wrong RT
+  - Check if gameplay draws are being received via IPC
+  - Check if shader translation is failing for all gameplay shaders
+  - Check if viewport/scissor is wrong for gameplay frames
+
+### Critical: Loading Screen Hang
+- [ ] Diagnose loading screen hang (requires Cmd+Tab to proceed)
+  - Likely: Present not being called, or IPC writer stalling
+  - Check if frames are being written during loading
+  - May be a blocking call in a stub method
 
 ### Shader Translation Hardening
 - [x] Hard-fail on malformed streams and unsupported flow-control opcodes
@@ -84,13 +107,24 @@
 - [x] Per-stage texture upload in IPC bulk region
 - [x] PS sampler index > 0 rejection removed from parser
 
+### Known Bugs
+- [ ] Cursor clipping: cursor disappears when not hovering main menu buttons
+- [ ] Save thumbnail preview: image not shown when hovering save files
+  - Likely GetRenderTargetData or StretchRect path not implemented
+
+## Cleanup Needed
+
+- [ ] Remove VEH diagnostic dumps from dllmain.c (factory dump, shader table dump, TLS dump, EDI object dump) -- debugging aids no longer needed
+- [ ] Gate VEH BSShader NULL-skip patches behind env var or remove if adapter fix is sufficient
+- [ ] Consider restoring sampled logging for STUB macro (currently unconditional, may flood logs)
+- [ ] Verify caps changes don't regress main menu rendering
+
 ## Later
 
 - [ ] Wine unix lib integration (__wine_unix_call, zero-copy)
 - [ ] Buffer ring allocator (replace per-draw newBufferWithBytes)
 - [ ] PSO cache persistence (serialize to disk)
 - [ ] Async shader compilation
-- [ ] In-game rendering validation (gameplay, save/load)
-- [ ] Skinned mesh support (blend weights/indices)
+- [ ] Skinned mesh support (blend weights/indices, relative addressing a0)
 - [ ] Multiple render target (MRT) support
 - [ ] Shadow pass rendering

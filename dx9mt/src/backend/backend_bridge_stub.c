@@ -165,6 +165,20 @@ typedef struct dx9mt_backend_draw_command {
 
   /* RB5: rasterizer state */
   uint32_t rs_cull_mode;
+
+  /* RB6: in-game rendering states */
+  uint32_t rs_scissortestenable;
+  uint32_t rs_blendop;
+  uint32_t rs_colorwriteenable;
+  uint32_t rs_stencilpass;
+  uint32_t rs_stencilfail;
+  uint32_t rs_stencilzfail;
+  uint32_t rs_fogenable;
+  uint32_t rs_fogcolor;
+  float rs_fogstart;
+  float rs_fogend;
+  float rs_fogdensity;
+  uint32_t rs_fogtablemode;
 } dx9mt_backend_draw_command;
 
 #define DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME 8192u
@@ -185,7 +199,25 @@ typedef struct dx9mt_backend_frame_replay_state {
 
 static dx9mt_backend_frame_snapshot g_current_frame_snapshot;
 static dx9mt_backend_frame_snapshot g_last_presented_snapshot;
-static dx9mt_backend_frame_replay_state g_frame_replay_state;
+static dx9mt_backend_frame_replay_state *g_frame_replay_state;
+
+static dx9mt_backend_frame_replay_state *dx9mt_backend_replay_ensure(void) {
+  if (!g_frame_replay_state) {
+#if defined(_WIN32)
+    g_frame_replay_state = (dx9mt_backend_frame_replay_state *)VirtualAlloc(
+        NULL, sizeof(dx9mt_backend_frame_replay_state), MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE);
+#else
+    g_frame_replay_state = (dx9mt_backend_frame_replay_state *)calloc(
+        1, sizeof(dx9mt_backend_frame_replay_state));
+#endif
+    if (!g_frame_replay_state) {
+      dx9mt_logf("backend", "FATAL: alloc failed for replay state (%u bytes)",
+                 (unsigned)sizeof(dx9mt_backend_frame_replay_state));
+    }
+  }
+  return g_frame_replay_state;
+}
 
 static const char *dx9mt_packet_type_name(uint16_t type) {
   switch (type) {
@@ -295,6 +327,18 @@ dx9mt_backend_draw_command_hash(const dx9mt_backend_draw_command *command) {
   hash = dx9mt_backend_hash_u32(hash, command->rs_stencilmask);
   hash = dx9mt_backend_hash_u32(hash, command->rs_stencilwritemask);
   hash = dx9mt_backend_hash_u32(hash, command->rs_cull_mode);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_scissortestenable);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_blendop);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_colorwriteenable);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_stencilpass);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_stencilfail);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_stencilzfail);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_fogenable);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_fogcolor);
+  hash = dx9mt_backend_hash_u32(hash, *(const uint32_t *)&command->rs_fogstart);
+  hash = dx9mt_backend_hash_u32(hash, *(const uint32_t *)&command->rs_fogend);
+  hash = dx9mt_backend_hash_u32(hash, *(const uint32_t *)&command->rs_fogdensity);
+  hash = dx9mt_backend_hash_u32(hash, command->rs_fogtablemode);
   hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_vs);
   hash = dx9mt_backend_hash_upload_ref(hash, &command->constants_ps);
   return hash;
@@ -402,7 +446,7 @@ static void dx9mt_backend_soft_present_draw_replay_preview(
     return;
   }
 
-  draw_count = g_frame_replay_state.draw_stored;
+  draw_count = g_frame_replay_state->draw_stored;
   if (draw_count == 0) {
     return;
   }
@@ -417,7 +461,7 @@ static void dx9mt_backend_soft_present_draw_replay_preview(
     uint32_t row = i / cells_per_row;
     uint32_t col = i % cells_per_row;
     uint32_t draw_hash =
-        dx9mt_backend_draw_command_hash(&g_frame_replay_state.draws[i]);
+        dx9mt_backend_draw_command_hash(&g_frame_replay_state->draws[i]);
     COLORREF color = RGB((draw_hash >> 16) & 0xffu, (draw_hash >> 8) & 0xffu,
                          (draw_hash ^ frame_id) & 0xffu);
     HBRUSH brush;
@@ -599,7 +643,7 @@ dx9mt_backend_capture_frame_snapshot(uint32_t frame_id) {
   memset(&snapshot, 0, sizeof(snapshot));
   snapshot.frame_id = frame_id;
   snapshot.packet_count = g_frame_packet_count;
-  snapshot.draw_count = g_frame_replay_state.draw_total;
+  snapshot.draw_count = g_frame_replay_state->draw_total;
   snapshot.clear_count = g_frame_clear_count;
   snapshot.last_clear_color = g_last_clear_color;
   snapshot.last_clear_flags = g_last_clear_flags;
@@ -609,14 +653,18 @@ dx9mt_backend_capture_frame_snapshot(uint32_t frame_id) {
   snapshot.last_draw_primitive_type = g_last_draw_primitive_type;
   snapshot.last_draw_primitive_count = g_last_draw_primitive_count;
   snapshot.replay_hash =
-      dx9mt_backend_compute_frame_replay_hash(&g_frame_replay_state);
-  snapshot.replay_draw_count = g_frame_replay_state.draw_stored;
+      dx9mt_backend_compute_frame_replay_hash(g_frame_replay_state);
+  snapshot.replay_draw_count = g_frame_replay_state->draw_stored;
   return snapshot;
 }
 
 static void dx9mt_backend_reset_frame_replay_state(uint32_t frame_id) {
-  memset(&g_frame_replay_state, 0, sizeof(g_frame_replay_state));
-  g_frame_replay_state.frame_id = frame_id;
+  dx9mt_backend_replay_ensure();
+  if (!g_frame_replay_state) {
+    return;
+  }
+  memset(g_frame_replay_state, 0, sizeof(*g_frame_replay_state));
+  g_frame_replay_state->frame_id = frame_id;
 }
 
 static void
@@ -627,21 +675,21 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
     return;
   }
 
-  ++g_frame_replay_state.draw_total;
-  if (g_frame_replay_state.draw_stored >=
+  ++g_frame_replay_state->draw_total;
+  if (g_frame_replay_state->draw_stored >=
       DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME) {
-    ++g_frame_replay_state.draw_dropped;
-    if (g_frame_replay_state.draw_dropped == 1 ||
-        (g_frame_replay_state.draw_dropped % 256u) == 0u) {
+    ++g_frame_replay_state->draw_dropped;
+    if (g_frame_replay_state->draw_dropped == 1 ||
+        (g_frame_replay_state->draw_dropped % 256u) == 0u) {
       dx9mt_logf("backend",
                  "draw command capture overflow frame=%u total=%u dropped=%u",
-                 g_frame_replay_state.frame_id, g_frame_replay_state.draw_total,
-                 g_frame_replay_state.draw_dropped);
+                 g_frame_replay_state->frame_id, g_frame_replay_state->draw_total,
+                 g_frame_replay_state->draw_dropped);
     }
     return;
   }
 
-  command = &g_frame_replay_state.draws[g_frame_replay_state.draw_stored++];
+  command = &g_frame_replay_state->draws[g_frame_replay_state->draw_stored++];
   memset(command, 0, sizeof(*command));
   command->state_block_hash = draw_packet->state_block_hash;
   command->primitive_type = draw_packet->primitive_type;
@@ -706,6 +754,18 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
   command->rs_stencilmask = draw_packet->rs_stencilmask;
   command->rs_stencilwritemask = draw_packet->rs_stencilwritemask;
   command->rs_cull_mode = draw_packet->rs_cull_mode;
+  command->rs_scissortestenable = draw_packet->rs_scissortestenable;
+  command->rs_blendop = draw_packet->rs_blendop;
+  command->rs_colorwriteenable = draw_packet->rs_colorwriteenable;
+  command->rs_stencilpass = draw_packet->rs_stencilpass;
+  command->rs_stencilfail = draw_packet->rs_stencilfail;
+  command->rs_stencilzfail = draw_packet->rs_stencilzfail;
+  command->rs_fogenable = draw_packet->rs_fogenable;
+  command->rs_fogcolor = draw_packet->rs_fogcolor;
+  command->rs_fogstart = draw_packet->rs_fogstart;
+  command->rs_fogend = draw_packet->rs_fogend;
+  command->rs_fogdensity = draw_packet->rs_fogdensity;
+  command->rs_fogtablemode = draw_packet->rs_fogtablemode;
   command->constants_vs = draw_packet->constants_vs;
   command->constants_ps = draw_packet->constants_ps;
   command->viewport_x = draw_packet->viewport_x;
@@ -950,8 +1010,8 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
       g_last_clear_flags = clear_packet->flags;
       g_last_clear_z = clear_packet->z;
       g_last_clear_stencil = clear_packet->stencil;
-      g_frame_replay_state.have_clear = 1;
-      g_frame_replay_state.last_clear_packet = *clear_packet;
+      g_frame_replay_state->have_clear = 1;
+      g_frame_replay_state->last_clear_packet = *clear_packet;
     } else if (header->type == DX9MT_PACKET_BEGIN_FRAME) {
       /*
        * BEGIN_FRAME now arrives through the packet stream (not as a
@@ -977,9 +1037,9 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
                    header->size, (unsigned)sizeof(*present_packet));
         return -1;
       }
-      g_frame_replay_state.have_present_packet = 1;
-      g_frame_replay_state.present_packet_frame_id = present_packet->frame_id;
-      g_frame_replay_state.present_render_target_id =
+      g_frame_replay_state->have_present_packet = 1;
+      g_frame_replay_state->present_packet_frame_id = present_packet->frame_id;
+      g_frame_replay_state->present_render_target_id =
           present_packet->render_target_id;
     }
 
@@ -1040,23 +1100,23 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
   if (!g_frame_open) {
     dx9mt_logf("backend", "present frame=%u without begin_frame", frame_id);
   }
-  if (g_frame_replay_state.frame_id != 0 &&
-      g_frame_replay_state.frame_id != frame_id) {
+  if (g_frame_replay_state->frame_id != 0 &&
+      g_frame_replay_state->frame_id != frame_id) {
     dx9mt_logf("backend",
                "present frame mismatch: incoming=%u replay_state=%u",
-               frame_id, g_frame_replay_state.frame_id);
+               frame_id, g_frame_replay_state->frame_id);
   }
-  if (g_frame_replay_state.have_present_packet &&
-      g_frame_replay_state.present_packet_frame_id != frame_id) {
+  if (g_frame_replay_state->have_present_packet &&
+      g_frame_replay_state->present_packet_frame_id != frame_id) {
     dx9mt_logf("backend",
                "present packet frame mismatch: packet=%u present=%u",
-               g_frame_replay_state.present_packet_frame_id, frame_id);
+               g_frame_replay_state->present_packet_frame_id, frame_id);
     return -1;
   }
-  if (g_frame_draw_indexed_count != g_frame_replay_state.draw_total) {
+  if (g_frame_draw_indexed_count != g_frame_replay_state->draw_total) {
     dx9mt_logf("backend",
                "draw count mismatch: counter=%u replay_total=%u frame=%u",
-               g_frame_draw_indexed_count, g_frame_replay_state.draw_total,
+               g_frame_draw_indexed_count, g_frame_replay_state->draw_total,
                frame_id);
   }
 
@@ -1071,12 +1131,12 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
   if (dx9mt_metal_is_available()) {
     dx9mt_metal_present_desc metal_desc;
     memset(&metal_desc, 0, sizeof(metal_desc));
-    metal_desc.have_clear = g_frame_replay_state.have_clear;
+    metal_desc.have_clear = g_frame_replay_state->have_clear;
     metal_desc.clear_color_argb = snapshot.last_clear_color;
     metal_desc.clear_flags = snapshot.last_clear_flags;
     metal_desc.clear_z = snapshot.last_clear_z;
     metal_desc.clear_stencil = snapshot.last_clear_stencil;
-    metal_desc.draw_count = g_frame_replay_state.draw_stored;
+    metal_desc.draw_count = g_frame_replay_state->draw_stored;
     metal_desc.replay_hash = snapshot.replay_hash;
     metal_desc.frame_id = frame_id;
     if (dx9mt_metal_present(&metal_desc) == 0) {
@@ -1096,7 +1156,7 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
 #ifdef _WIN32
   if (g_metal_ipc_ptr) {
     unsigned char *ipc_base = (unsigned char *)g_metal_ipc_ptr;
-    uint32_t draw_count = g_frame_replay_state.draw_stored;
+    uint32_t draw_count = g_frame_replay_state->draw_stored;
     uint32_t bulk_offset;
     uint32_t bulk_used = 0;
     dx9mt_metal_ipc_draw *ipc_draws;
@@ -1115,7 +1175,7 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
         (dx9mt_metal_ipc_draw *)(ipc_base + sizeof(dx9mt_metal_ipc_header));
 
     for (i = 0; i < draw_count; ++i) {
-      const dx9mt_backend_draw_command *cmd = &g_frame_replay_state.draws[i];
+      const dx9mt_backend_draw_command *cmd = &g_frame_replay_state->draws[i];
       dx9mt_metal_ipc_draw *d = &ipc_draws[i];
       const void *data;
 
@@ -1182,6 +1242,18 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       d->rs_stencilmask = cmd->rs_stencilmask;
       d->rs_stencilwritemask = cmd->rs_stencilwritemask;
       d->rs_cull_mode = cmd->rs_cull_mode;
+      d->rs_scissortestenable = cmd->rs_scissortestenable;
+      d->rs_blendop = cmd->rs_blendop;
+      d->rs_colorwriteenable = cmd->rs_colorwriteenable;
+      d->rs_stencilpass = cmd->rs_stencilpass;
+      d->rs_stencilfail = cmd->rs_stencilfail;
+      d->rs_stencilzfail = cmd->rs_stencilzfail;
+      d->rs_fogenable = cmd->rs_fogenable;
+      d->rs_fogcolor = cmd->rs_fogcolor;
+      d->rs_fogstart = cmd->rs_fogstart;
+      d->rs_fogend = cmd->rs_fogend;
+      d->rs_fogdensity = cmd->rs_fogdensity;
+      d->rs_fogtablemode = cmd->rs_fogtablemode;
 
       /* Copy VB data into bulk region */
       data = dx9mt_frontend_upload_resolve(&cmd->vertex_data);
@@ -1281,7 +1353,7 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
 
     g_metal_ipc_ptr->width = g_present_target.width;
     g_metal_ipc_ptr->height = g_present_target.height;
-    g_metal_ipc_ptr->have_clear = g_frame_replay_state.have_clear;
+    g_metal_ipc_ptr->have_clear = g_frame_replay_state->have_clear;
     g_metal_ipc_ptr->clear_color_argb = snapshot.last_clear_color;
     g_metal_ipc_ptr->clear_flags = snapshot.last_clear_flags;
     g_metal_ipc_ptr->clear_z = snapshot.last_clear_z;
@@ -1290,7 +1362,7 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
     g_metal_ipc_ptr->replay_hash = snapshot.replay_hash;
     g_metal_ipc_ptr->frame_id = frame_id;
     g_metal_ipc_ptr->present_render_target_id =
-        g_frame_replay_state.present_render_target_id;
+        g_frame_replay_state->present_render_target_id;
     g_metal_ipc_ptr->bulk_data_offset = bulk_offset;
     g_metal_ipc_ptr->bulk_data_used = bulk_used;
     /* Write sequence last -- the viewer polls this field. */
@@ -1310,9 +1382,9 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
         snapshot.last_clear_flags, (double)snapshot.last_clear_z,
         snapshot.last_clear_stencil, snapshot.last_draw_state_hash,
         snapshot.replay_hash,
-        g_frame_replay_state.draw_stored, g_frame_replay_state.draw_dropped);
+        g_frame_replay_state->draw_stored, g_frame_replay_state->draw_dropped);
   }
-  g_frame_replay_state.have_present_packet = 0;
+  g_frame_replay_state->have_present_packet = 0;
   return 0;
 }
 

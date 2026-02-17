@@ -69,6 +69,19 @@ static dx9mt_packet_draw_indexed make_valid_draw_packet(uint32_t sequence) {
   packet.rs_stencilmask = 0xFFFFFFFFu;
   packet.rs_stencilwritemask = 0xFFFFFFFFu;
   packet.rs_cull_mode = 2;          /* D3DCULL_CCW */
+  /* RB6: in-game rendering defaults */
+  packet.rs_scissortestenable = 0;  /* FALSE */
+  packet.rs_blendop = 1;            /* D3DBLENDOP_ADD */
+  packet.rs_colorwriteenable = 0xF; /* all channels */
+  packet.rs_stencilpass = 1;        /* D3DSTENCILOP_KEEP */
+  packet.rs_stencilfail = 1;        /* D3DSTENCILOP_KEEP */
+  packet.rs_stencilzfail = 1;       /* D3DSTENCILOP_KEEP */
+  packet.rs_fogenable = 0;          /* FALSE */
+  packet.rs_fogcolor = 0;
+  packet.rs_fogstart = 0.0f;
+  packet.rs_fogend = 1.0f;
+  packet.rs_fogdensity = 1.0f;
+  packet.rs_fogtablemode = 0;       /* D3DFOG_NONE */
   return packet;
 }
 

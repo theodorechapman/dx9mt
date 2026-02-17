@@ -171,6 +171,49 @@ static WINBOOL dx9mt_is_depth_format(D3DFORMAT format) {
   }
 }
 
+static WINBOOL dx9mt_is_texture_format(D3DFORMAT format) {
+  switch (format) {
+  /* standard color */
+  case D3DFMT_A8R8G8B8:
+  case D3DFMT_X8R8G8B8:
+  case D3DFMT_R5G6B5:
+  case D3DFMT_X1R5G5B5:
+  case D3DFMT_A1R5G5B5:
+  case D3DFMT_A4R4G4B4:
+  case D3DFMT_A8:
+  case D3DFMT_A2B10G10R10:
+  case D3DFMT_A8B8G8R8:
+  case D3DFMT_X8B8G8R8:
+  case D3DFMT_G16R16:
+  case D3DFMT_A2R10G10B10:
+  case D3DFMT_A16B16G16R16:
+  /* luminance */
+  case 50: /* D3DFMT_L8 */
+  case 51: /* D3DFMT_A8L8 */
+  case 62: /* D3DFMT_L16 */
+  /* bump map */
+  case 60: /* D3DFMT_V8U8 */
+  case 63: /* D3DFMT_Q8W8V8U8 */
+  case 64: /* D3DFMT_V16U16 */
+  case 110: /* D3DFMT_Q16W16V16U16 */
+  case 117: /* D3DFMT_CxV8U8 */
+  /* float */
+  case D3DFMT_R16F:
+  case D3DFMT_G16R16F:
+  case D3DFMT_A16B16G16R16F:
+  case D3DFMT_R32F:
+  case D3DFMT_G32R32F:
+  case D3DFMT_A32B32G32R32F:
+  /* DXT compressed */
+  case (D3DFORMAT)MAKEFOURCC('D','X','T','1'):
+  case (D3DFORMAT)MAKEFOURCC('D','X','T','3'):
+  case (D3DFORMAT)MAKEFOURCC('D','X','T','5'):
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+
 static dx9mt_d3d9 *dx9mt_d3d9_create(UINT sdk_version) {
   dx9mt_d3d9 *object =
       (dx9mt_d3d9 *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -245,16 +288,15 @@ static HRESULT WINAPI dx9mt_d3d9_GetAdapterIdentifier(
   }
 
   memset(identifier, 0, sizeof(*identifier));
-  lstrcpynA(identifier->Driver, "dx9mt", sizeof(identifier->Driver));
-  lstrcpynA(identifier->Description, "dx9mt Step1 Stub Adapter",
+  lstrcpynA(identifier->Driver, "nvd3dum.dll", sizeof(identifier->Driver));
+  lstrcpynA(identifier->Description, "NVIDIA GeForce GTX 280",
             sizeof(identifier->Description));
-  lstrcpynA(identifier->DeviceName, "dx9mt0", sizeof(identifier->DeviceName));
-  identifier->VendorId = 0x106B;
-  identifier->DeviceId = 0x0001;
-  identifier->SubSysId = 0;
-  identifier->Revision = 1;
-  identifier->DeviceIdentifier = IID_IDirect3D9;
-  identifier->WHQLLevel = 0;
+  lstrcpynA(identifier->DeviceName, "\\\\.\\DISPLAY1", sizeof(identifier->DeviceName));
+  identifier->VendorId = 0x10DE;   /* NVIDIA */
+  identifier->DeviceId = 0x0611;   /* GeForce GTX 280 */
+  identifier->SubSysId = 0x065210DE;
+  identifier->Revision = 0xA2;
+  identifier->WHQLLevel = 1;
 
   dx9mt_logf("d3d9",
              "GetAdapterIdentifier adapter=%u flags=0x%08x -> ok vendor=0x%04x device=0x%04x",
@@ -363,6 +405,10 @@ static HRESULT WINAPI dx9mt_d3d9_CheckDeviceFormat(
     }
   } else if ((usage & D3DUSAGE_RENDERTARGET) != 0) {
     if (!dx9mt_is_render_target_format(check_format)) {
+      hr = D3DERR_NOTAVAILABLE;
+    }
+  } else {
+    if (!dx9mt_is_texture_format(check_format)) {
       hr = D3DERR_NOTAVAILABLE;
     }
   }
@@ -506,7 +552,8 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
   caps->Caps2 = D3DCAPS2_CANAUTOGENMIPMAP | D3DCAPS2_FULLSCREENGAMMA |
                 D3DCAPS2_DYNAMICTEXTURES;
   caps->Caps3 = D3DCAPS3_ALPHA_FULLSCREEN_FLIP_OR_DISCARD |
-                D3DCAPS3_COPY_TO_VIDMEM | D3DCAPS3_COPY_TO_SYSTEMMEM;
+                D3DCAPS3_COPY_TO_VIDMEM | D3DCAPS3_COPY_TO_SYSTEMMEM |
+                D3DCAPS3_LINEAR_TO_SRGB_PRESENTATION;
   caps->PresentationIntervals = D3DPRESENT_INTERVAL_IMMEDIATE |
                                 D3DPRESENT_INTERVAL_ONE |
                                 D3DPRESENT_INTERVAL_TWO |
@@ -517,24 +564,31 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
                   D3DDEVCAPS_EXECUTEVIDEOMEMORY |
                   D3DDEVCAPS_TLVERTEXSYSTEMMEMORY |
                   D3DDEVCAPS_TLVERTEXVIDEOMEMORY |
-                  D3DDEVCAPS_TEXTURESYSTEMMEMORY |
                   D3DDEVCAPS_TEXTUREVIDEOMEMORY |
                   D3DDEVCAPS_DRAWPRIMTLVERTEX |
                   D3DDEVCAPS_CANRENDERAFTERFLIP |
                   D3DDEVCAPS_TEXTURENONLOCALVIDMEM |
-                  D3DDEVCAPS_DRAWPRIMITIVES2 |
+                  D3DDEVCAPS_CANBLTSYSTONONLOCAL |
                   D3DDEVCAPS_DRAWPRIMITIVES2EX |
                   D3DDEVCAPS_HWTRANSFORMANDLIGHT |
                   D3DDEVCAPS_PUREDEVICE | D3DDEVCAPS_HWRASTERIZATION;
-  caps->PrimitiveMiscCaps = D3DPMISCCAPS_CULLNONE | D3DPMISCCAPS_CULLCW |
-                            D3DPMISCCAPS_CULLCCW |
+  caps->PrimitiveMiscCaps = D3DPMISCCAPS_MASKZ | D3DPMISCCAPS_CULLNONE |
+                            D3DPMISCCAPS_CULLCW | D3DPMISCCAPS_CULLCCW |
                             D3DPMISCCAPS_COLORWRITEENABLE |
+                            D3DPMISCCAPS_CLIPTLVERTS |
                             D3DPMISCCAPS_CLIPPLANESCALEDPOINTS |
-                            D3DPMISCCAPS_BLENDOP | D3DPMISCCAPS_TSSARGTEMP;
+                            D3DPMISCCAPS_BLENDOP | D3DPMISCCAPS_TSSARGTEMP |
+                            D3DPMISCCAPS_PERSTAGECONSTANT |
+                            D3DPMISCCAPS_INDEPENDENTWRITEMASKS |
+                            0x00002000 /* D3DPMISCCAPS_FOGINFVF */ |
+                            D3DPMISCCAPS_FOGANDSPECULARALPHA |
+                            D3DPMISCCAPS_SEPARATEALPHABLEND |
+                            D3DPMISCCAPS_MRTINDEPENDENTBITDEPTHS |
+                            D3DPMISCCAPS_MRTPOSTPIXELSHADERBLENDING;
   caps->RasterCaps = D3DPRASTERCAPS_DITHER | D3DPRASTERCAPS_ZTEST |
                      D3DPRASTERCAPS_FOGVERTEX | D3DPRASTERCAPS_FOGTABLE |
-                     D3DPRASTERCAPS_MIPMAPLODBIAS |
-                     D3DPRASTERCAPS_ZBUFFERLESSHSR | D3DPRASTERCAPS_FOGRANGE |
+                     D3DPRASTERCAPS_MIPMAPLODBIAS | D3DPRASTERCAPS_FOGRANGE |
+                     D3DPRASTERCAPS_WFOG | D3DPRASTERCAPS_ZFOG |
                      D3DPRASTERCAPS_ANISOTROPY | D3DPRASTERCAPS_COLORPERSPECTIVE |
                      D3DPRASTERCAPS_SCISSORTEST | D3DPRASTERCAPS_SLOPESCALEDEPTHBIAS |
                      D3DPRASTERCAPS_DEPTHBIAS;
@@ -562,7 +616,9 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
   caps->TextureCaps = D3DPTEXTURECAPS_ALPHA | D3DPTEXTURECAPS_PERSPECTIVE |
                       D3DPTEXTURECAPS_PROJECTED |
                       D3DPTEXTURECAPS_TEXREPEATNOTSCALEDBYSIZE |
-                      D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_MIPMAP;
+                      D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_VOLUMEMAP |
+                      D3DPTEXTURECAPS_MIPMAP | D3DPTEXTURECAPS_MIPVOLUMEMAP |
+                      D3DPTEXTURECAPS_MIPCUBEMAP;
   caps->TextureFilterCaps = D3DPTFILTERCAPS_MINFPOINT |
                             D3DPTFILTERCAPS_MINFLINEAR |
                             D3DPTFILTERCAPS_MINFANISOTROPIC |
@@ -579,7 +635,9 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
                                   D3DPTFILTERCAPS_MAGFPOINT |
                                   D3DPTFILTERCAPS_MAGFLINEAR;
   caps->TextureAddressCaps = D3DPTADDRESSCAPS_WRAP | D3DPTADDRESSCAPS_MIRROR |
-                             D3DPTADDRESSCAPS_CLAMP | D3DPTADDRESSCAPS_BORDER;
+                             D3DPTADDRESSCAPS_CLAMP | D3DPTADDRESSCAPS_BORDER |
+                             D3DPTADDRESSCAPS_INDEPENDENTUV |
+                             D3DPTADDRESSCAPS_MIRRORONCE;
   caps->VolumeTextureAddressCaps = caps->TextureAddressCaps;
   caps->LineCaps = D3DLINECAPS_TEXTURE | D3DLINECAPS_ZTEST |
                    D3DLINECAPS_BLEND | D3DLINECAPS_ALPHACMP |
@@ -601,7 +659,7 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
                       D3DSTENCILCAPS_DECRSAT | D3DSTENCILCAPS_INVERT |
                       D3DSTENCILCAPS_INCR | D3DSTENCILCAPS_DECR |
                       D3DSTENCILCAPS_TWOSIDED;
-  caps->FVFCaps = D3DFVFCAPS_DONOTSTRIPELEMENTS | (8u << 16);
+  caps->FVFCaps = D3DFVFCAPS_PSIZE | (8u << 16);
   caps->TextureOpCaps = D3DTEXOPCAPS_DISABLE | D3DTEXOPCAPS_SELECTARG1 |
                         D3DTEXOPCAPS_SELECTARG2 | D3DTEXOPCAPS_MODULATE |
                         D3DTEXOPCAPS_MODULATE2X | D3DTEXOPCAPS_MODULATE4X |
@@ -622,7 +680,7 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
                         D3DTEXOPCAPS_DOTPRODUCT3 | D3DTEXOPCAPS_MULTIPLYADD |
                         D3DTEXOPCAPS_LERP;
   caps->MaxTextureBlendStages = 8;
-  caps->MaxSimultaneousTextures = 16;
+  caps->MaxSimultaneousTextures = 8;
   caps->VertexProcessingCaps = D3DVTXPCAPS_TEXGEN |
                                D3DVTXPCAPS_MATERIALSOURCE7 |
                                D3DVTXPCAPS_DIRECTIONALLIGHTS |
@@ -632,19 +690,20 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
   caps->MaxActiveLights = 8;
   caps->MaxUserClipPlanes = 6;
   caps->MaxVertexBlendMatrices = 4;
-  caps->MaxVertexBlendMatrixIndex = 255;
+  caps->MaxVertexBlendMatrixIndex = 0;
   caps->MaxPointSize = 256.0f;
   caps->MaxPrimitiveCount = 0x00ffffffu;
   caps->MaxVertexIndex = 0x00ffffffu;
   caps->MaxStreams = 16;
-  caps->MaxStreamStride = 255;
+  caps->MaxStreamStride = 508;
   caps->VertexShaderVersion = D3DVS_VERSION(3, 0);
   caps->MaxVertexShaderConst = 256;
   caps->PixelShaderVersion = D3DPS_VERSION(3, 0);
   caps->PixelShader1xMaxValue = 3.402823466e+38f;
   caps->DevCaps2 = D3DDEVCAPS2_STREAMOFFSET |
+                   D3DDEVCAPS2_CAN_STRETCHRECT_FROM_TEXTURES |
                    D3DDEVCAPS2_VERTEXELEMENTSCANSHARESTREAMOFFSET;
-  caps->MaxNpatchTessellationLevel = 1.0f;
+  caps->MaxNpatchTessellationLevel = 0.0f;
   caps->MasterAdapterOrdinal = adapter;
   caps->AdapterOrdinalInGroup = 0;
   caps->NumberOfAdaptersInGroup = 1;
@@ -664,7 +723,9 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
   caps->VS20Caps.StaticFlowControlDepth = 4;
   caps->PS20Caps.Caps = D3DPS20CAPS_ARBITRARYSWIZZLE |
                         D3DPS20CAPS_GRADIENTINSTRUCTIONS |
-                        D3DPS20CAPS_PREDICATION;
+                        D3DPS20CAPS_PREDICATION |
+                        D3DPS20CAPS_NODEPENDENTREADLIMIT |
+                        D3DPS20CAPS_NOTEXINSTRUCTIONLIMIT;
   caps->PS20Caps.DynamicFlowControlDepth = 24;
   caps->PS20Caps.NumTemps = 32;
   caps->PS20Caps.StaticFlowControlDepth = 4;
@@ -673,8 +734,8 @@ static HRESULT WINAPI dx9mt_d3d9_GetDeviceCaps(IDirect3D9 *iface, UINT adapter,
                                   D3DPTFILTERCAPS_MINFLINEAR |
                                   D3DPTFILTERCAPS_MAGFPOINT |
                                   D3DPTFILTERCAPS_MAGFLINEAR;
-  caps->MaxVShaderInstructionsExecuted = 65535;
-  caps->MaxPShaderInstructionsExecuted = 65535;
+  caps->MaxVShaderInstructionsExecuted = 0xFFFFFFFFu;
+  caps->MaxPShaderInstructionsExecuted = 0xFFFFFFFFu;
   caps->MaxVertexShader30InstructionSlots = 32768;
   caps->MaxPixelShader30InstructionSlots = 32768;
   if (dx9mt_should_log_probe(&log_counter, 32, 256)) {
