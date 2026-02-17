@@ -1,230 +1,50 @@
 # dx9mt Technical Insights
 
-Hard-won lessons from bringing up the D3D9-to-Metal translation layer.
+## 1) The active architecture is IPC-first
 
-## Architecture
+- The PE32 `d3d9.dll` does not execute Metal directly in Wine.
+- Runtime rendering path is shared-memory IPC (`/tmp/dx9mt_metal_frame.bin`) to the native viewer.
+- `libdx9mt_unixlib.dylib` is built but not yet the active path.
 
-### PE DLL cannot run Metal code
-The d3d9.dll is compiled with `i686-w64-mingw32-gcc` where `__APPLE__` is not defined. All Metal/Cocoa APIs are unavailable. The backend_bridge_stub.c is compiled into BOTH the PE DLL (mingw) and the native dylib (clang) -- Metal code is guarded by `#if defined(__APPLE__) && !defined(DX9MT_NO_METAL)` and stripped from the PE build automatically.
+## 2) Frame boundaries and packet order are strict
 
-### Shared-memory IPC bridges the PE/native gap
-Since the PE DLL can't call Metal, a standalone native Metal viewer process reads frame data from a 16MB memory-mapped file (`/tmp/dx9mt_metal_frame.bin`). The PE DLL writes via Win32 `CreateFileMapping`/`MapViewOfFile` on `Z:\tmp\...` (Wine maps Z: to /). The viewer mmaps the same file with POSIX. They synchronize via an atomic sequence counter with acquire/release semantics.
+- `BEGIN_FRAME`, `DRAW_INDEXED`, `CLEAR`, and `PRESENT` are all packetized.
+- Backend rejects non-monotonic packet sequence IDs.
+- Repeated `BeginScene/EndScene` within the same `frame_id` are expected and accumulated.
 
-### The native dylib exists but isn't loaded
-`libdx9mt_unixlib.dylib` is built with Metal support but Wine never loads it. The proper solution is Wine's `__wine_unix_call` mechanism, but the IPC approach works without Wine integration. The dylib is kept buildable for future use.
+## 3) Upload overflow behavior is fail-closed
 
-### Upload arena is frontend-only memory
-The triple-buffered upload arena (`g_frontend_upload_state.slots[]`) lives in the PE DLL's address space. The backend bridge stub (also in the PE DLL) resolves upload refs to pointers via `dx9mt_frontend_upload_resolve()` and copies data into the IPC bulk region.
+- Upload arena: `3 x 128 MB` slots.
+- Overflow returns a zero upload ref (intentional), backend rejects required missing payloads.
+- This avoids silent memory corruption, but can manifest as missing world draws under heavy load.
 
-## Wine Integration
+## 4) Shader translation coverage is materially broader than old docs claimed
 
-### Both launcher and game need d3d9=native,builtin
-Wine's DLL override must apply to both `FalloutNVLauncher.exe` and `FalloutNV.exe` via per-app registry keys. Global overrides don't work reliably.
+Current parser/emitter includes:
 
-### Wine restart required after override changes
-Stale wineserver state masks override changes. Always `wineserver --kill` before testing new builds.
+- Flow control (`if/ifc/else/endif`, `rep/endrep`, `break/breakc`).
+- Relative constant addressing via `a0` indexing.
+- `def`, `defi`, `defb` immediate declarations.
+- Multi-sampler bindings (`s0..s7`) in translated path.
+- Core arithmetic + texture ops (`texld`, `texldl`, `texkill`, etc.).
 
-### Win32 file paths through Wine
-The PE DLL accesses Unix paths via the Z: drive. `CreateFileA("Z:\\tmp\\foo")` maps to `/tmp/foo`. This is the standard Wine path mapping and is used for the IPC shared memory file.
+## 5) State coverage in viewer is broader than old docs claimed
 
-## Adapter Identity & Caps (Critical for FNV)
+Viewer currently consumes:
 
-### FNV uses adapter name matching, not just caps
-The game calls `GetAdapterIdentifier` and matches the Description string against an internal GPU table to select the shader package number. **Unknown adapters get fallback behavior** that can break shader initialization. We must report as a known NVIDIA GPU.
+- Depth test/write and compare func.
+- Stencil compare/op/read-mask/write-mask.
+- Cull mode.
+- Scissor test.
+- Blend factors + blend operation + color write mask.
+- Fog params in fallback shader path.
 
-Current identity: NVIDIA GeForce GTX 280 (VendorId 0x10DE, DeviceId 0x0611, Driver "nvd3dum.dll"). This was previously Apple VendorId 0x106B with description "dx9mt Step1 Stub Adapter", which caused the BSShader type 29 (SHADER_LIGHTING30) to never be initialized, leading to a deterministic crash on save loading.
+## 6) Some important D3D9 methods are still stub-driven
 
-### D3DCAPS9 must match DXVK reference closely
-Caps audited against DXVK's d3d9_caps.h and Microsoft SM3.0 requirements. Key mistakes caught:
-- `MaxSimultaneousTextures=16` was wrong (D3D9 FFP max is 8)
-- `MaxVShaderInstructionsExecuted=65535` was too low (should be 0xFFFFFFFF)
-- Missing `PS20Caps` flags (`NODEPENDENTREADLIMIT`, `NOTEXINSTRUCTIONLIMIT`)
-- Missing `PrimitiveMiscCaps` flags (`CLIPTLVERTS`, `PERSTAGECONSTANT`, `FOGINFVF`)
-- Missing `TextureAddressCaps` (`INDEPENDENTUV`, `MIRRORONCE`)
-- `ZBUFFERLESSHSR` in RasterCaps was wrong (T&L-only hardware flag)
-- Missing fog modes (`WFOG`, `ZFOG`) in RasterCaps
+Default device methods log `dx9mt/STUB` and return generic fallback values unless overridden.
+This is still relevant for cursor and less-used API surfaces.
 
-### Shader package selection depends on adapter identity
-FNV loads compiled shader bytecode from `Data\Shaders\shaderpackageNNN.sdp` files. The package number (1-19) is selected based on GPU detection. Package 19 is the SM3.0 NVIDIA package. If the adapter name doesn't match any known GPU, the game may select a minimal package, skip shader types, or use fallback code paths.
+## 7) Log analyzer script currently lags log format
 
-## BSShader System (FNV/Gamebryo)
-
-### BSShaderType enum is sparse
-The shader type table has 35 entries but only ~8 defined types: 0=TallGrass, 1=Default(ShadowLight), 10=Sky, 14=Skin, 17=Water, 29=Lighting30, 32=Tile, 33=NoLighting. Most entries are NULL gaps in the enum.
-
-### Lighting30Shader (type 29) requires SM3.0 + INI setting
-SHADER_LIGHTING30 is the SM3.0 upgrade path for BSShaderPPLightingProperty. It requires both `bAllow30Shaders=1` in the INI AND the GPU reporting SM3.0. NIFs reference this shader type unconditionally, so if it's not initialized but a NIF requests it, the factory tries lazy creation via TLS and fails on IO threads.
-
-### TLS slot 0 is only initialized on the main rendering thread
-The NiDX9Renderer per-thread context in TLS slot 0 is set up during device creation on the main thread. Background IO threads never initialize it. The BSShader factory's lazy-creation path reads TLS data at `[tls_slot + 0x2B4]`, which faults when the slot is NULL. The factory's SEH catches this and returns NULL, but the caller doesn't null-check.
-
-### VEH patches are a safety net, not the fix
-The VEH crash handler in dllmain.c patches two crash sites:
-1. Primary: EIP=0xB57AA9, ESI=0 -> skip to 0xB57AD2, ESP+=4, EAX=0
-2. Fallback: Any `mov eax,[esi]` (8b 06) with ESI=0 in 0xB57A00-0xB57C00 -> scan forward to `call edx`, skip past
-
-The **actual fix** was changing the adapter identity to NVIDIA, which causes proper shader package selection and BSShader initialization at startup.
-
-## Packet Protocol
-
-### BEGIN_FRAME is now in the packet stream
-Originally `BeginScene` called `begin_frame()` as a direct side-channel. Now it emits a `BEGIN_FRAME` packet through `submit_packets`, making the stream self-describing. The backend parser dispatches `BEGIN_FRAME` packets to the same `begin_frame()` logic.
-
-### Draw packet carries full geometry data + shader bytecode
-`dx9mt_packet_draw_indexed` includes upload refs for VB data, IB data, vertex declaration, VS constants, PS constants, texture data (8 stages), and VS/PS shader bytecode. The frontend copies all this into the upload arena on every `DrawIndexedPrimitive`. The IPC writer then copies from the arena into the shared memory bulk region. Shader bytecode is small (1-10KB per shader) and many draws reuse the same shader, so the same bytecode is uploaded redundantly per-draw but the viewer deduplicates by hash.
-
-### Upload arena overflow returns zero-ref, not corrupt data
-When a slot runs out of space, `dx9mt_frontend_upload_copy` returns a zero-ref instead of wrapping to offset 0. The backend rejects draws with zero-size constant refs. This prevents silent shader constant corruption.
-
-## Metal Rendering
-
-### WVP matrix extraction works for FNV menu
-D3D9 SM3.0 vertex shaders commonly store the world-view-projection matrix in constants c0-c3. The Metal vertex shader reads these 4 float4s, transposes from D3D9 row-major to Metal column-major, and multiplies the position. FNV's main menu renders correctly with this approach. This is a temporary approximation until proper shader translation.
-
-### D3D9 vertex declarations map cleanly to Metal vertex descriptors
-`D3DVERTEXELEMENT9` (stream, offset, type, usage) translates to `MTLVertexDescriptor` attributes. Type mapping: `D3DDECLTYPE_FLOAT3` -> `MTLVertexFormatFloat3`, `D3DDECLTYPE_D3DCOLOR` -> `MTLVertexFormatUChar4Normalized`, etc. The PSO is cached by (vertex layout + blend state) hash.
-
-### FVF-to-vertex-declaration conversion
-Games using `SetFVF` instead of `SetVertexDeclaration` get their FVF bitmask converted to an equivalent `D3DVERTEXELEMENT9` array in the frontend's `DrawIndexedPrimitive`. This handles position type variants (XYZ, XYZRHW, XYZW, XYZBn), normals, diffuse/specular colors, and texture coordinates with per-coordinate format bits.
-
-### Standalone NSWindow works alongside Wine
-The Metal viewer creates its own `NSWindow` with `CAMetalLayer`. Wine's macOS driver runs its own `NSApplication` event loop. The viewer runs a separate `NSApplication` in its own process, avoiding conflicts. `dispatch_sync(main_queue)` handles window creation from non-main threads.
-
-### D3D9 cull mode winding convention
-D3D9 uses left-handed winding by default. D3DCULL_CW means "cull faces with clockwise winding" which are front faces in Metal's right-handed convention. So D3DCULL_CW maps to MTLCullModeFront and D3DCULL_CCW maps to MTLCullModeBack. The default D3D9 cull mode is D3DCULL_CCW (back-face culling), which maps to MTLCullModeBack. This is set per-draw via `[encoder setCullMode:]`, not baked into the PSO.
-
-## Texture Pipeline
-
-### Texture caching with generation tracking
-Each `dx9mt_texture` has a `generation` counter incremented on Lock/Unlock, AddDirtyRect, and surface copy operations. The frontend only uploads texture data when the generation changes (or on a periodic 60-frame refresh for cache recovery). The viewer caches `MTLTexture` objects by `(object_id, generation)` and skips re-creation when the generation matches.
-
-### DXT compressed texture support
-D3D9 DXT1/DXT3/DXT5 formats map directly to Metal's BC1_RGBA/BC2_RGBA/BC3_RGBA. Block-compressed pitch is calculated as `((width + 3) / 4) * block_bytes` where block_bytes is 8 for DXT1 and 16 for DXT3/DXT5. The frontend computes this correctly for both surface allocation and upload sizing.
-
-### Render-target texture routing
-Draws can target offscreen render targets (not just the swapchain). The viewer tracks per-draw `render_target_id` and creates separate `MTLTexture` objects for each RT. When a later draw samples a texture whose `texture_id` matches a previous RT's `render_target_texture_id`, the viewer substitutes the RT's Metal texture. This enables render-to-texture effects (e.g., UI compositing).
-
-### Multi-texture uses arrays, not duplicated fields
-The initial stage-0-only implementation used individual fields (`texture0_id`, `sampler0_min_filter`, etc.) across packets, IPC, and backend structs. For multi-texture (stages 0-7), these were refactored to fixed-size arrays (`tex_id[DX9MT_MAX_PS_SAMPLERS]`, `sampler_min_filter[DX9MT_MAX_PS_SAMPLERS]`). This keeps the code manageable -- copy/hash/validation sites use loops instead of 8x field duplication. The wire format is internal-only so there are no backward compatibility concerns. TSS combiner fields remain stage-0-only since they are irrelevant when a pixel shader is active.
-
-### Multi-texture data budget
-With 8 stages, texture metadata per draw grew from ~80 bytes to ~640 bytes. With DX9MT_METAL_IPC_MAX_DRAWS=256 draws and 16MB IPC, each draw has ~64KB budget, so this fits comfortably. Texture upload data is dominated by cache behavior -- most draws transmit 0 bytes for cached textures. Only first-seen or dirty textures upload actual pixel data.
-
-## Shader Translation (RB3 Phase 3 + RB5)
-
-### D3D9 SM2.0/SM3.0 bytecode format
-The bytecode is a stream of 32-bit DWORD tokens. Token 0 is the version (`0xFFFE03xx` for VS 3.x, `0xFFFF03xx` for PS 3.x). Each instruction is an opcode token followed by destination and source register tokens. The stream ends with `0x0000FFFF`. Register tokens encode type (5 bits split across bits [30:28] and [12:11]), number (bits [10:0]), and for sources: swizzle (bits [23:16], 2 bits per component) and modifier (bits [27:24]). For destinations: write mask (bits [19:16]) and result modifier (bits [23:20]).
-
-### Transpiler architecture: parse -> IR -> MSL source -> compile -> cache
-The bytecode is parsed into a flat IR (`dx9mt_sm_program` with instruction/dcl/def arrays), then emitted as MSL source text, compiled with `[MTLDevice newLibraryWithSource:]`, and the resulting `MTLFunction` cached by bytecode hash. Compilation happens once per unique shader; subsequent draws just look up the cache. Failures are sticky (cached as NSNull) to avoid retrying every frame.
-
-### VS/PS interface uses a "fat" interpolant struct
-The emitted VS output struct and PS input struct must have matching field names and types. Rather than dynamically matching VS output semantics to PS input semantics (complex), the emitter generates per-shader structs based on dcl declarations. The VS writes its declared outputs; the PS reads its declared inputs. As long as the same VS/PS pair is used together, the structs match.
-
-### Register mapping is straightforward for SM3.0
-- `r#` -> `float4 r#` (local variable, initialized to 0)
-- `v#` -> `in.v#` (from `[[stage_in]]` struct)
-- `c#` -> `c[#]` (constant buffer at buffer index 1 for VS, 0 for PS)
-- `i#` -> `float4 i#` (from `defi`, used as loop bounds via `int(i#.x)`)
-- `b#` -> `float4 b#` (from `defb`, used as boolean predicate via `b#.x != 0.0`)
-- `s#` + `texld` -> `tex#.sample(samp#, coord.xy)` (texture + sampler pair)
-- `oPos` (rastout 0) -> `out.position` with `[[position]]`
-- `oC0` -> return value of fragment function
-
-### D3D9 swizzle maps directly to MSL component access
-D3D9 swizzle encodes 4 component indices (0=x, 1=y, 2=z, 3=w). Identity swizzle `.xyzw` is omitted. Replicate swizzle `.xxxx` emits `.x`. The emitter handles all modifiers: negate `(-expr)`, abs `abs(expr)`, complement `(1.0 - expr)`, x2 `(expr * 2.0)`, bias `(expr - 0.5)`.
-
-### Flow control token format differs from arithmetic instructions
-Arithmetic instructions follow the pattern: opcode token, destination token, source tokens. Flow control opcodes have different layouts:
-- `ifc`/`breakc`: opcode token (comparison in bits 18-20) + 2 source tokens, no destination. The comparison (GT=1, EQ=2, GE=3, LT=4, NE=5, LE=6) must be extracted before consuming source tokens.
-- `rep`/`if`: opcode token + 1 source token (integer or boolean register), no destination.
-- `else`/`endif`/`endrep`/`break`: opcode token only, no additional tokens.
-
-The parser previously used `opcode_src_count()` returning -2 for flow control (special marker), which caused the hard-fail path. Now each opcode is handled individually before the generic arithmetic parsing.
-
-### ifc/breakc compare scalar .x components
-D3D9 `ifc` compares the .x component of two source registers. The emitter generates `if (s0.x > s1.x) {` rather than vector comparison. This matches D3D9 spec behavior where the comparison operates on the first component.
-
-### rep loops use integer constant registers coerced to float4
-D3D9's `defi i0, 4, 0, 0, 0` defines an integer constant. The emitter stores these as `float4 i0 = float4(4.0, 0.0, 0.0, 0.0)` and the `rep` loop uses `int(i0.x)` for the bound. This avoids a separate integer register type system while maintaining correct loop counts (integer constants are always small whole numbers).
-
-### Multi-texture emitter was already correct
-The MSL emitter generates `tex%u.sample(samp%u, coord.xy)` using the sampler register number from bytecode, and the PS function signature declares `texture2d<float> tex%u [[texture(%u)]]` / `sampler samp%u [[sampler(%u)]]` for each declared sampler. This naturally supports any sampler index 0-7. The only blocker was the data pipeline (individual stage-0 fields) and the parser's explicit rejection of PS sampler index > 0.
-
-### POSITIONT draws skip translation entirely
-Pre-transformed vertices (D3DFVF_XYZRHW / `dcl_positiont`) are already in screen space. The existing hardcoded `geo_vertex` shader with a synthetic screen-to-NDC matrix handles these correctly. When the vertex declaration has POSITIONT, the viewer uses the fallback path and only the PS could potentially be translated (currently skipped -- both VS and PS are needed for the translated path).
-
-## Fragment Shader Strategy
-
-### Four-tier fragment shader approach (with translation)
-The Metal viewer now has four tiers for fragment shading, tried in order:
-
-1. **Translated shader** (when bytecode is available and compiles): Full D3D9 shader translated to MSL. Reads from constant buffer, samples textures (up to 8 stages), executes all arithmetic including flow control. Uses the full VS/PS constant arrays at buffer indices 1 and 0 respectively.
-
-2. **TSS fixed-function combiner** (`use_stage0_combiner=1`, when `pixel_shader_id==0`): Full D3D9 texture stage state evaluation. Supports all D3DTOP operations (MODULATE, SELECTARG, ADD, BLEND*, etc.) with configurable arg sources (TEXTURE, CURRENT, DIFFUSE, TFACTOR). Stage 0 only.
-
-3. **PS constant c0 tint** (`has_pixel_shader=1`, translation failed): When a D3D9 pixel shader is active but translation failed, the viewer reads PS constant register c0 and multiplies it by the texture sample. This approximation works for FNV's menu shaders.
-
-4. **Raw passthrough** (no PS, no TSS): `output = diffuse * texture` (textured) or `output = diffuse` (non-textured).
-
-### D3D9 TSS state is irrelevant when a pixel shader is active
-When a pixel shader is bound, D3D9 completely ignores texture stage state. Games may set TSS to anything (including DISABLE) while a pixel shader handles all texturing. The viewer mirrors this: `use_stage0_combiner` is only set when `pixel_shader_id == 0`.
-
-## Depth/Stencil (RB4)
-
-### Metal requires depth format on PSO even if depth test is disabled
-All PSOs that render into a pass with a depth attachment must declare `depthAttachmentPixelFormat`. Even the overlay PSO (which doesn't care about depth) needs this set to `Depth32Float` because the render pass has a depth attachment. Without it, Metal will fail PSO creation with a format mismatch.
-
-### Depth textures are per-render-target, not per-frame
-Each render target (including the drawable) needs its own `Depth32Float` texture. The viewer caches these in `s_depth_texture_cache` keyed by RT ID, and separately caches the drawable depth texture. When a render target changes size, the depth texture is recreated. Depth textures use `MTLStorageModePrivate` since they never need CPU access.
-
-### Depth clear follows the game's Clear() flags
-D3D9's `Clear()` has separate flags for color (0x1) and depth (0x2). The depth clear value (`clear_z`) is transmitted through IPC in the frame header. On first use of a render target, if the game issued a depth clear, the render pass uses `MTLLoadActionClear` with the game's clear_z value. On subsequent uses (when the target was already rendered to this frame), the pass uses `MTLLoadActionLoad` to preserve the depth buffer.
-
-### 2D menu rendering is depth-transparent
-FNV's main menu draws 2D quads (POSITIONT) with default depth state (zenable=1, zwrite=1, zfunc=LESSEQUAL). Since all geometry is at the same depth, depth testing passes for everything and the result is identical to no depth test. This means RB4 can be validated by checking that the menu still looks correct -- any regression would indicate a PSO or render pass configuration bug.
-
-### Stencil state fields are transmitted but not yet consumed
-The 5 stencil fields (enable, func, ref, mask, writemask) are transmitted through the full pipeline and visible in frame dumps, but the Metal viewer doesn't create stencil textures or configure stencil operations on the MTLDepthStencilDescriptor yet. This is deferred to when FNV gameplay actually uses stencil (shadow volumes, UI masking).
-
-## Crash Investigation & VEH (RB5)
-
-### BSShader factory crash root cause
-Deterministic crash loading a save game. Root cause: adapter identity reported as Apple (VendorId 0x106B), which FNV didn't recognize, causing the game to skip initializing BSShader type 29 (SHADER_LIGHTING30). When a NIF mesh referenced this shader type during save loading, the factory returned NULL, and the caller crashed on vtable dereference.
-
-### VEH crash handler as diagnostic tool
-The VEH handler in dllmain.c was extended incrementally to diagnose the crash:
-- Thread ID logging (distinguish main vs IO thread)
-- Extended code byte dumps around crash EIP
-- Factory function code dump and disassembly
-- Shader type table dump (individual reads, not loops -- loops cause recursive VEH)
-- TLS index and slot value dump
-- Stack frame walk
-
-### VEH handler pitfalls
-- **For-loops inside VEH cause recursive VEH**: Reading memory in a loop can fault, triggering the VEH recursively and hanging. Use individual explicit reads.
-- **IsBadReadPtr is unreliable on Wine**: Some regions pass IsBadReadPtr but still fault. Use VirtualQuery for reliable checks.
-- **Sampled logging hides multi-thread activity**: The main thread consumed "first N" log slots, making IO thread calls invisible. Always use unconditional logging when diagnosing multi-thread issues.
-
-### Fixes attempted that didn't help
-- Heap-allocating BSS buffers (reduced 31MB BSS to 1.5KB) -- crash was in game code, not our BSS
-- Adding CheckDeviceFormat whitelist -- game didn't check these before the crash path
-- Adding PrimitiveMiscCaps (MASKZ, SEPARATEALPHABLEND, etc.) -- not the gating condition for shader init
-- Adding TextureCaps (VOLUMEMAP, etc.) -- not the gating condition
-
-## Debugging
-
-### Frame dump for per-draw diagnosis
-The Metal viewer can dump per-draw state to `/tmp/dx9mt_frame_dump.txt`. Each draw shows: primitive type/count, vertex format, per-stage texture info (id, generation, format, size, upload status for all active stages 0-7), per-stage sampler state, TSS state, blend state, depth state, cull mode, viewport, and vertex data samples. Key field: `upload=0` means the texture is in the viewer's cache (no upload needed this frame), NOT that data is missing.
-
-### Sampled logging prevents log flooding
-High-frequency calls (GetDeviceCaps, CheckDeviceFormat, DebugSetMute) use `dx9mt_should_log_method_sample(&counter, first_n, every_n)`. First N calls logged in full, then every Nth call. Backend frames log on frames 0-9 then every 120th. Note: Create* methods and STUB macro now log unconditionally for diagnostic visibility.
-
-### Kind-tagged object IDs
-Object IDs encode the type: `(kind << 24) | serial`. Kind values: 1=device, 2=swapchain, 3=buffer, 4=texture, 5=surface, 6=VS, 7=PS, 8=state_block, 9=query, 10=vertex_decl. Log line `target=33554433` = `0x02000001` = swapchain serial 1.
-
-### Shader bytecode validation
-`dx9mt_shader_dword_count` validates the version token (`0xFFFE` for VS, `0xFFFF` for PS) before scanning for the end marker. Scan limit reduced from 4MB to 256KB (64K DWORDs). Rejects bad input early with a log message.
-
-### Replay hash for frame fingerprinting
-Each frame's draw commands are hashed (FNV-1a) into a `replay_hash`. If the hash changes between frames, the draw content changed. If it's stable, the game is rendering the same scene. Visible in logs and in the overlay bar color.
+- `tools/analyze_dx9mt_log.py` expects older log lines without `[tid=....]`.
+- Current `dx9mt_logf` includes thread IDs, so parser updates are required before relying on that script.
