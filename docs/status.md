@@ -86,6 +86,13 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
   - full `IDirect3DDevice9` vtbl now routes through lock-aware wrappers
   - VB/IB/surface/texture lock/unlock and dirty-marking paths now also honor the same device guard
   - targets save-load crash path where FNV creates device with `behavior=0x00000054`
+- Vertex declaration API contract hardening landed:
+  - `IDirect3DVertexDeclaration9::GetDeclaration` now returns element counts (not byte counts)
+  - too-small `num_elements` now reports required element count while returning `D3DERR_INVALIDCALL`
+  - removes caller-side overrun risk from count/size mismatch during declaration introspection
+- Transform default-state hardening landed:
+  - all transform slots initialize to identity and marked set at device creation
+  - `GetTransform` no longer fails on untouched transform states
 - `test-native` passes:
   - backend contract tests
   - frontend Wine regression tests (`frontend_surface_copy_test`)
@@ -114,6 +121,7 @@ The PE DLL and Metal viewer are separate processes. The PE DLL runs under Wine (
 make -C dx9mt                # Build frontend DLL + backend dylib + Metal viewer
 make -C dx9mt test-native    # Backend contract + frontend Wine regression tests
 make run                     # Kill old viewer, create IPC file, launch viewer + Wine + FNV
+make run-capture             # Same as run, with capture env defaults for viewer hotkey capture
 make run-wine                # Launch FNV with builtin Wine d3d9 (native wined3d sanity path)
 make clear                   # Kill viewer + wineserver, remove IPC file
 make show-logs               # Display runtime logs
@@ -167,6 +175,25 @@ Press 'D' in the viewer window to write per-draw state to `/tmp/dx9mt_frame_dump
 - Viewport, vertex data samples
 - Shader bytecode: VS/PS IDs, bytecode size, version token, first 4 DWORDs
 - `upload=0` means texture is cached (not missing), `upload=N` means N bytes uploaded this frame
+
+## Continuous Capture (Loading-Screen Crash Debugging)
+
+Viewer hotkeys (focus the Metal viewer window):
+- `C` toggles continuous capture on/off
+- `X` force-stops active capture
+- `D` keeps legacy one-shot next-frame dump
+
+Continuous capture writes session folders under `DX9MT_CAPTURE_DIR` (default `/tmp/dx9mt_capture`):
+- `session-YYYYmmdd-HHMMSS/index.tsv` (per-frame index metadata)
+- `frame_000001_f<frame_id>.txt` (text dump per frame)
+- `frame_000001_f<frame_id>.bin` (raw IPC blob per frame)
+
+Capture env vars (passed by `make run` / `make run-capture` into `dx9mt_metal_viewer`):
+- `DX9MT_CAPTURE_DIR` default `/tmp/dx9mt_capture`
+- `DX9MT_CAPTURE_MAX_FRAMES` default `0` (unlimited)
+- `DX9MT_CAPTURE_IDLE_MS` default `5000` (auto-stop when no new frame)
+- `DX9MT_CAPTURE_TEXT` default `1`
+- `DX9MT_CAPTURE_RAW` default `1`
 
 ## File Map
 

@@ -456,6 +456,60 @@ cleanup:
   return rc;
 }
 
+static int test_vertex_declaration_getdeclaration_count(void) {
+  IDirect3DDevice9 *device = NULL;
+  IDirect3DVertexDeclaration9 *decl = NULL;
+  D3DVERTEXELEMENT9 decl_out[4];
+  UINT count = 0;
+  HRESULT hr = E_FAIL;
+  int rc = TEST_FAIL;
+  const D3DVERTEXELEMENT9 decl_in[] = {
+      {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION,
+       0},
+      {0, 12, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD,
+       0},
+      D3DDECL_END(),
+  };
+
+  if (dx9mt_create_device(&device) != TEST_OK) {
+    return TEST_FAIL;
+  }
+
+  CHECK_HR("CreateVertexDeclaration",
+           IDirect3DDevice9_CreateVertexDeclaration(device, decl_in, &decl));
+
+  count = 0;
+  CHECK_HR("GetDeclaration(NULL)",
+           IDirect3DVertexDeclaration9_GetDeclaration(decl, NULL, &count));
+  CHECK_TRUE("GetDeclaration returns element count (not bytes)", count == 3u);
+
+  memset(decl_out, 0, sizeof(decl_out));
+  count = (UINT)(sizeof(decl_out) / sizeof(decl_out[0]));
+  CHECK_HR("GetDeclaration(copy)",
+           IDirect3DVertexDeclaration9_GetDeclaration(decl, decl_out, &count));
+  CHECK_TRUE("GetDeclaration copy count", count == 3u);
+  CHECK_TRUE("GetDeclaration sentinel stream", decl_out[2].Stream == 0xFFu);
+  CHECK_TRUE("GetDeclaration sentinel type",
+             decl_out[2].Type == D3DDECLTYPE_UNUSED);
+
+  count = 2;
+  hr = IDirect3DVertexDeclaration9_GetDeclaration(decl, decl_out, &count);
+  CHECK_TRUE("GetDeclaration rejects too-small element count",
+             hr == D3DERR_INVALIDCALL);
+  CHECK_TRUE("GetDeclaration reports required element count", count == 3u);
+
+  rc = TEST_OK;
+
+cleanup:
+  if (decl) {
+    IDirect3DVertexDeclaration9_Release(decl);
+  }
+  if (device) {
+    IDirect3DDevice9_Release(device);
+  }
+  return rc;
+}
+
 int main(void) {
   if (test_dxt_subrect_copy_stays_within_blocks() != TEST_OK) {
     return 1;
@@ -473,6 +527,9 @@ int main(void) {
     return 1;
   }
   if (test_colorfill_rejects_block_compressed() != TEST_OK) {
+    return 1;
+  }
+  if (test_vertex_declaration_getdeclaration_count() != TEST_OK) {
     return 1;
   }
   printf("frontend_surface_copy_test: PASS\n");

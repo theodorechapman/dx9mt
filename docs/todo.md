@@ -67,6 +67,11 @@
 - [x] Implemented per-device `D3DCREATE_MULTITHREADED` synchronization:
   - lock-aware wrappers for full `IDirect3DDevice9` vtbl dispatch
   - shared device guard on VB/IB/surface/texture lock/unlock hot paths
+- [x] Fixed vertex declaration contract mismatch:
+  - `IDirect3DVertexDeclaration9::GetDeclaration` now returns element counts, not byte counts
+  - too-small output count now reports required element count
+  - added frontend regression coverage for `GetDeclaration` count semantics
+- [x] Initialized default transform state to identity for all transform slots
 
 ## Current Priority: RB5 -- In-Game Rendering
 

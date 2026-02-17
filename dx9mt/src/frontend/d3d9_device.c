@@ -37,6 +37,13 @@
 #define D3DFMT_DXT5 ((D3DFORMAT)DX9MT_MAKEFOURCC('D', 'X', 'T', '5'))
 #endif
 
+#ifndef D3DSPD_IUNKNOWN
+#define D3DSPD_IUNKNOWN 0x00000001L
+#endif
+#ifndef D3DSPD_VOLATILE
+#define D3DSPD_VOLATILE 0x00000002L
+#endif
+
 static WINBOOL dx9mt_should_log_method_sample(LONG *counter, LONG first_n,
                                               LONG every_n) {
   LONG count = InterlockedIncrement(counter);
@@ -59,18 +66,78 @@ typedef struct dx9mt_frontend_upload_state {
 } dx9mt_frontend_upload_state;
 
 static dx9mt_frontend_upload_state g_frontend_upload_state;
+static CRITICAL_SECTION g_frontend_upload_guard;
+static LONG g_frontend_upload_guard_state;
+
+static void dx9mt_frontend_upload_guard_ensure_initialized(void) {
+  LONG state = InterlockedCompareExchange(&g_frontend_upload_guard_state, 1, 0);
+
+  if (state == 2) {
+    return;
+  }
+  if (state == 1) {
+    while (InterlockedCompareExchange(&g_frontend_upload_guard_state, 2, 2) != 2) {
+      Sleep(0);
+    }
+    return;
+  }
+
+  InitializeCriticalSection(&g_frontend_upload_guard);
+  InterlockedExchange(&g_frontend_upload_guard_state, 2);
+}
+
+static void dx9mt_frontend_upload_guard_enter(void) {
+  dx9mt_frontend_upload_guard_ensure_initialized();
+  EnterCriticalSection(&g_frontend_upload_guard);
+}
+
+static void dx9mt_frontend_upload_guard_leave(void) {
+  LeaveCriticalSection(&g_frontend_upload_guard);
+}
 
 const void *dx9mt_frontend_upload_resolve(const dx9mt_upload_ref *ref) {
+  const void *data = NULL;
+
+  dx9mt_frontend_upload_guard_enter();
   if (!ref || ref->size == 0) {
-    return NULL;
+    goto done;
   }
   if ((uint32_t)ref->arena_index >= DX9MT_UPLOAD_ARENA_SLOTS) {
-    return NULL;
+    goto done;
   }
   if (ref->offset + ref->size > DX9MT_UPLOAD_BYTES_PER_SLOT) {
-    return NULL;
+    goto done;
   }
-  return g_frontend_upload_state.slots[ref->arena_index] + ref->offset;
+  data = g_frontend_upload_state.slots[ref->arena_index] + ref->offset;
+
+done:
+  dx9mt_frontend_upload_guard_leave();
+  return data;
+}
+
+int dx9mt_frontend_upload_copy_out(const dx9mt_upload_ref *ref, void *dst,
+                                   uint32_t size) {
+  const unsigned char *src = NULL;
+  int result = -1;
+
+  dx9mt_frontend_upload_guard_enter();
+  if (!ref || !dst || size == 0 || ref->size != size) {
+    goto done;
+  }
+  if ((uint32_t)ref->arena_index >= DX9MT_UPLOAD_ARENA_SLOTS) {
+    goto done;
+  }
+  if (ref->offset + size > DX9MT_UPLOAD_BYTES_PER_SLOT) {
+    goto done;
+  }
+
+  src = g_frontend_upload_state.slots[ref->arena_index] + ref->offset;
+  memcpy(dst, src, size);
+  result = 0;
+
+done:
+  dx9mt_frontend_upload_guard_leave();
+  return result;
 }
 
 typedef struct dx9mt_device dx9mt_device;
@@ -84,17 +151,29 @@ typedef struct dx9mt_pixel_shader dx9mt_pixel_shader;
 typedef struct dx9mt_texture dx9mt_texture;
 typedef struct dx9mt_cube_texture dx9mt_cube_texture;
 typedef struct dx9mt_query dx9mt_query;
+typedef struct dx9mt_private_data_entry dx9mt_private_data_entry;
+
+struct dx9mt_private_data_entry {
+  dx9mt_private_data_entry *next;
+  GUID guid;
+  DWORD flags;
+  DWORD size;
+  unsigned char data[];
+};
 
 struct dx9mt_surface {
   IDirect3DSurface9 iface;
   LONG refcount;
   dx9mt_object_id object_id;
   dx9mt_device *device;
+  dx9mt_private_data_entry *private_data;
   IUnknown *container;
   D3DSURFACE_DESC desc;
   WINBOOL lockable;
   unsigned char *sysmem;
   UINT pitch;
+  WINBOOL lock_active;
+  DWORD lock_flags;
 };
 
 struct dx9mt_swapchain {
@@ -112,8 +191,10 @@ struct dx9mt_vertex_buffer {
   LONG refcount;
   dx9mt_object_id object_id;
   dx9mt_device *device;
+  dx9mt_private_data_entry *private_data;
   D3DVERTEXBUFFER_DESC desc;
   unsigned char *data;
+  WINBOOL lock_active;
 };
 
 struct dx9mt_index_buffer {
@@ -121,8 +202,10 @@ struct dx9mt_index_buffer {
   LONG refcount;
   dx9mt_object_id object_id;
   dx9mt_device *device;
+  dx9mt_private_data_entry *private_data;
   D3DINDEXBUFFER_DESC desc;
   unsigned char *data;
+  WINBOOL lock_active;
 };
 
 struct dx9mt_vertex_decl {
@@ -157,6 +240,7 @@ struct dx9mt_texture {
   LONG refcount;
   dx9mt_object_id object_id;
   dx9mt_device *device;
+  dx9mt_private_data_entry *private_data;
   DWORD usage;
   D3DFORMAT format;
   D3DPOOL pool;
@@ -176,6 +260,7 @@ struct dx9mt_cube_texture {
   LONG refcount;
   dx9mt_object_id object_id;
   dx9mt_device *device;
+  dx9mt_private_data_entry *private_data;
   DWORD usage;
   D3DFORMAT format;
   D3DPOOL pool;
@@ -273,6 +358,173 @@ static void dx9mt_device_guard_leave(dx9mt_device *self) {
     return;
   }
   LeaveCriticalSection(&self->multithread_guard);
+}
+
+static void dx9mt_private_data_entry_release(dx9mt_private_data_entry *entry) {
+  if (!entry) {
+    return;
+  }
+
+  if ((entry->flags & D3DSPD_IUNKNOWN) != 0 &&
+      entry->size == sizeof(IUnknown *)) {
+    IUnknown *object = *(IUnknown **)entry->data;
+    if (object) {
+      object->lpVtbl->Release(object);
+    }
+  }
+
+  HeapFree(GetProcessHeap(), 0, entry);
+}
+
+static void
+dx9mt_private_data_clear(dx9mt_private_data_entry **head) {
+  dx9mt_private_data_entry *entry;
+  dx9mt_private_data_entry *next;
+
+  if (!head) {
+    return;
+  }
+
+  entry = *head;
+  *head = NULL;
+  while (entry) {
+    next = entry->next;
+    dx9mt_private_data_entry_release(entry);
+    entry = next;
+  }
+}
+
+static dx9mt_private_data_entry *
+dx9mt_private_data_find(dx9mt_private_data_entry *head, REFGUID guid) {
+  dx9mt_private_data_entry *entry = head;
+
+  while (entry) {
+    if (IsEqualGUID(&entry->guid, guid)) {
+      return entry;
+    }
+    entry = entry->next;
+  }
+  return NULL;
+}
+
+static HRESULT dx9mt_private_data_set(dx9mt_private_data_entry **head,
+                                      REFGUID guid, const void *data,
+                                      DWORD data_size, DWORD flags) {
+  const DWORD allowed_flags = D3DSPD_IUNKNOWN | D3DSPD_VOLATILE;
+  dx9mt_private_data_entry *entry = NULL;
+  dx9mt_private_data_entry *old = NULL;
+  dx9mt_private_data_entry **cursor = NULL;
+  size_t bytes = sizeof(dx9mt_private_data_entry);
+
+  if (!head || !guid) {
+    return D3DERR_INVALIDCALL;
+  }
+
+  if ((flags & ~allowed_flags) != 0) {
+    return D3DERR_INVALIDCALL;
+  }
+  if ((flags & D3DSPD_IUNKNOWN) != 0 && data_size != sizeof(IUnknown *)) {
+    return D3DERR_INVALIDCALL;
+  }
+  if (!data && data_size != 0) {
+    return D3DERR_INVALIDCALL;
+  }
+
+  if (data_size > 0) {
+    bytes += (size_t)data_size;
+  }
+
+  entry = (dx9mt_private_data_entry *)HeapAlloc(GetProcessHeap(),
+                                                HEAP_ZERO_MEMORY, bytes);
+  if (!entry) {
+    return E_OUTOFMEMORY;
+  }
+
+  entry->guid = *guid;
+  entry->flags = flags;
+  entry->size = data_size;
+  if (data_size > 0) {
+    memcpy(entry->data, data, data_size);
+  }
+  if ((flags & D3DSPD_IUNKNOWN) != 0) {
+    IUnknown *object = *(IUnknown **)entry->data;
+    if (object) {
+      object->lpVtbl->AddRef(object);
+    }
+  }
+
+  cursor = head;
+  while (*cursor) {
+    if (IsEqualGUID(&(*cursor)->guid, guid)) {
+      old = *cursor;
+      *cursor = old->next;
+      break;
+    }
+    cursor = &(*cursor)->next;
+  }
+
+  entry->next = *head;
+  *head = entry;
+  dx9mt_private_data_entry_release(old);
+  return D3D_OK;
+}
+
+static HRESULT dx9mt_private_data_get(dx9mt_private_data_entry *head,
+                                      REFGUID guid, void *data,
+                                      DWORD *data_size) {
+  dx9mt_private_data_entry *entry;
+  DWORD required;
+
+  if (!guid || !data_size) {
+    return D3DERR_INVALIDCALL;
+  }
+
+  entry = dx9mt_private_data_find(head, guid);
+  if (!entry) {
+    return D3DERR_NOTFOUND;
+  }
+
+  required = entry->size;
+  if (!data || *data_size < required) {
+    *data_size = required;
+    return D3DERR_MOREDATA;
+  }
+
+  if (required > 0) {
+    memcpy(data, entry->data, required);
+  }
+  if ((entry->flags & D3DSPD_IUNKNOWN) != 0 &&
+      required == sizeof(IUnknown *)) {
+    IUnknown *object = *(IUnknown **)data;
+    if (object) {
+      object->lpVtbl->AddRef(object);
+    }
+  }
+  *data_size = required;
+  return D3D_OK;
+}
+
+static HRESULT dx9mt_private_data_free(dx9mt_private_data_entry **head,
+                                       REFGUID guid) {
+  dx9mt_private_data_entry *entry;
+  dx9mt_private_data_entry **cursor;
+
+  if (!head || !guid) {
+    return D3DERR_INVALIDCALL;
+  }
+
+  cursor = head;
+  while (*cursor) {
+    if (IsEqualGUID(&(*cursor)->guid, guid)) {
+      entry = *cursor;
+      *cursor = entry->next;
+      dx9mt_private_data_entry_release(entry);
+      return D3D_OK;
+    }
+    cursor = &(*cursor)->next;
+  }
+
+  return D3DERR_NOTFOUND;
 }
 
 static dx9mt_surface *dx9mt_surface_from_iface(IDirect3DSurface9 *iface) {
@@ -465,6 +717,7 @@ static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
     return ref;
   }
 
+  dx9mt_frontend_upload_guard_enter();
   dx9mt_frontend_upload_begin_frame(frame_id);
 
   /*
@@ -488,6 +741,7 @@ static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
                  g_frontend_upload_state.next_offset, aligned_size,
                  DX9MT_UPLOAD_BYTES_PER_SLOT);
     }
+    dx9mt_frontend_upload_guard_leave();
     return ref;
   }
 
@@ -497,6 +751,7 @@ static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
   ref.offset = g_frontend_upload_state.next_offset;
   ref.size = size;
   g_frontend_upload_state.next_offset += aligned_size;
+  dx9mt_frontend_upload_guard_leave();
   return ref;
 }
 
@@ -1528,17 +1783,28 @@ static HRESULT WINAPI dx9mt_surface_QueryInterface(IDirect3DSurface9 *iface,
 
 static ULONG WINAPI dx9mt_surface_AddRef(IDirect3DSurface9 *iface) {
   dx9mt_surface *self = dx9mt_surface_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_surface_Release(IDirect3DSurface9 *iface) {
   dx9mt_surface *self = dx9mt_surface_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  dx9mt_device *device = self->device;
+  LONG refcount;
+
+  dx9mt_device_guard_enter(device);
+  refcount = InterlockedDecrement(&self->refcount);
 
   if (refcount == 0) {
+    dx9mt_private_data_clear(&self->private_data);
     HeapFree(GetProcessHeap(), 0, self->sysmem);
     HeapFree(GetProcessHeap(), 0, self);
   }
+  dx9mt_device_guard_leave(device);
 
   return (ULONG)refcount;
 }
@@ -1562,30 +1828,37 @@ static HRESULT WINAPI dx9mt_surface_SetPrivateData(IDirect3DSurface9 *iface,
                                                     const void *data,
                                                     DWORD data_size,
                                                     DWORD flags) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  (void)flags;
-  return D3D_OK;
+  dx9mt_surface *self = dx9mt_surface_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_set(&self->private_data, guid, data, data_size, flags);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_surface_GetPrivateData(IDirect3DSurface9 *iface,
                                                     REFGUID guid,
                                                     void *data,
                                                     DWORD *data_size) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  return D3DERR_NOTFOUND;
+  dx9mt_surface *self = dx9mt_surface_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_get(self->private_data, guid, data, data_size);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_surface_FreePrivateData(IDirect3DSurface9 *iface,
                                                      REFGUID guid) {
-  (void)iface;
-  (void)guid;
-  return D3D_OK;
+  dx9mt_surface *self = dx9mt_surface_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_free(&self->private_data, guid);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static DWORD WINAPI dx9mt_surface_SetPriority(IDirect3DSurface9 *iface,
@@ -1642,11 +1915,13 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
                                               const RECT *rect,
                                               DWORD flags) {
   dx9mt_surface *self = dx9mt_surface_from_iface(iface);
+  RECT lock_rect;
+  UINT bpp;
+  UINT block_bytes;
+  SIZE_T row_offset;
+  SIZE_T row_extent;
   uint32_t size;
   HRESULT hr = D3D_OK;
-
-  (void)rect;
-  (void)flags;
 
   dx9mt_device_guard_enter(self->device);
 
@@ -1656,6 +1931,16 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
   }
 
   if (!self->lockable) {
+    hr = D3DERR_INVALIDCALL;
+    goto done;
+  }
+  if (self->lock_active) {
+    hr = D3DERR_INVALIDCALL;
+    goto done;
+  }
+
+  dx9mt_resolve_rect(&self->desc, rect, &lock_rect);
+  if (!dx9mt_rect_valid_for_surface(&lock_rect, &self->desc)) {
     hr = D3DERR_INVALIDCALL;
     goto done;
   }
@@ -1670,8 +1955,42 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
     }
   }
 
+  bpp = dx9mt_bytes_per_pixel(self->desc.Format);
+  if (dx9mt_format_is_block_compressed(self->desc.Format)) {
+    if (!dx9mt_rect_valid_for_block_compressed_copy(&lock_rect, &self->desc)) {
+      hr = D3DERR_INVALIDCALL;
+      goto done;
+    }
+    block_bytes = dx9mt_format_block_bytes(self->desc.Format);
+    if (block_bytes == 0) {
+      hr = D3DERR_INVALIDCALL;
+      goto done;
+    }
+    row_offset = (SIZE_T)((UINT)lock_rect.left / 4u) * block_bytes;
+    row_extent =
+        row_offset +
+        (SIZE_T)(dx9mt_div_ceil_u32((UINT)(lock_rect.right - lock_rect.left), 4u) *
+                 block_bytes);
+  } else {
+    row_offset = (SIZE_T)(UINT)lock_rect.left * bpp;
+    row_extent = row_offset + (SIZE_T)(UINT)(lock_rect.right - lock_rect.left) * bpp;
+  }
+  if (row_extent > self->pitch) {
+    hr = D3DERR_INVALIDCALL;
+    goto done;
+  }
+
   locked_rect->Pitch = (INT)self->pitch;
-  locked_rect->pBits = self->sysmem;
+  if (dx9mt_format_is_block_compressed(self->desc.Format)) {
+    locked_rect->pBits =
+        self->sysmem +
+        (SIZE_T)((UINT)lock_rect.top / 4u) * self->pitch + row_offset;
+  } else {
+    locked_rect->pBits =
+        self->sysmem + (SIZE_T)(UINT)lock_rect.top * self->pitch + row_offset;
+  }
+  self->lock_active = TRUE;
+  self->lock_flags = flags;
 done:
   dx9mt_device_guard_leave(self->device);
   return hr;
@@ -1679,10 +1998,21 @@ done:
 
 static HRESULT WINAPI dx9mt_surface_UnlockRect(IDirect3DSurface9 *iface) {
   dx9mt_surface *self = dx9mt_surface_from_iface(iface);
+  HRESULT hr = D3D_OK;
+
   dx9mt_device_guard_enter(self->device);
-  dx9mt_surface_mark_container_dirty(self);
+  if (!self->lock_active) {
+    hr = D3DERR_INVALIDCALL;
+    goto done;
+  }
+  self->lock_active = FALSE;
+  if ((self->lock_flags & D3DLOCK_READONLY) == 0) {
+    dx9mt_surface_mark_container_dirty(self);
+  }
+  self->lock_flags = 0;
+done:
   dx9mt_device_guard_leave(self->device);
-  return D3D_OK;
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_surface_GetDC(IDirect3DSurface9 *iface, HDC *phdc) {
@@ -1807,12 +2137,21 @@ static HRESULT WINAPI dx9mt_swapchain_QueryInterface(IDirect3DSwapChain9 *iface,
 
 static ULONG WINAPI dx9mt_swapchain_AddRef(IDirect3DSwapChain9 *iface) {
   dx9mt_swapchain *self = dx9mt_swapchain_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_swapchain_Release(IDirect3DSwapChain9 *iface) {
   dx9mt_swapchain *self = dx9mt_swapchain_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  dx9mt_device *device = self->device;
+  LONG refcount;
+
+  dx9mt_device_guard_enter(device);
+  refcount = InterlockedDecrement(&self->refcount);
 
   if (refcount == 0) {
     if (self->backbuffer) {
@@ -1822,6 +2161,7 @@ static ULONG WINAPI dx9mt_swapchain_Release(IDirect3DSwapChain9 *iface) {
     }
     HeapFree(GetProcessHeap(), 0, self);
   }
+  dx9mt_device_guard_leave(device);
 
   return (ULONG)refcount;
 }
@@ -2096,15 +2436,24 @@ static HRESULT WINAPI dx9mt_texture_QueryInterface(IDirect3DTexture9 *iface,
 
 static ULONG WINAPI dx9mt_texture_AddRef(IDirect3DTexture9 *iface) {
   dx9mt_texture *self = dx9mt_texture_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_texture_Release(IDirect3DTexture9 *iface) {
   dx9mt_texture *self = dx9mt_texture_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  dx9mt_device *device = self->device;
+  LONG refcount;
   UINT i;
 
+  dx9mt_device_guard_enter(device);
+  refcount = InterlockedDecrement(&self->refcount);
   if (refcount == 0) {
+    dx9mt_private_data_clear(&self->private_data);
     for (i = 0; i < self->levels; ++i) {
       if (self->surfaces[i]) {
         dx9mt_surface *surface = dx9mt_surface_from_iface(self->surfaces[i]);
@@ -2115,6 +2464,7 @@ static ULONG WINAPI dx9mt_texture_Release(IDirect3DTexture9 *iface) {
     HeapFree(GetProcessHeap(), 0, self->surfaces);
     HeapFree(GetProcessHeap(), 0, self);
   }
+  dx9mt_device_guard_leave(device);
 
   return (ULONG)refcount;
 }
@@ -2138,30 +2488,37 @@ static HRESULT WINAPI dx9mt_texture_SetPrivateData(IDirect3DTexture9 *iface,
                                                     const void *data,
                                                     DWORD data_size,
                                                     DWORD flags) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  (void)flags;
-  return D3D_OK;
+  dx9mt_texture *self = dx9mt_texture_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_set(&self->private_data, guid, data, data_size, flags);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_texture_GetPrivateData(IDirect3DTexture9 *iface,
                                                     REFGUID guid,
                                                     void *data,
                                                     DWORD *data_size) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  return D3DERR_NOTFOUND;
+  dx9mt_texture *self = dx9mt_texture_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_get(self->private_data, guid, data, data_size);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_texture_FreePrivateData(IDirect3DTexture9 *iface,
                                                      REFGUID guid) {
-  (void)iface;
-  (void)guid;
-  return D3D_OK;
+  dx9mt_texture *self = dx9mt_texture_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_free(&self->private_data, guid);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static DWORD WINAPI dx9mt_texture_SetPriority(IDirect3DTexture9 *iface,
@@ -2467,15 +2824,24 @@ static HRESULT WINAPI dx9mt_cube_texture_QueryInterface(
 
 static ULONG WINAPI dx9mt_cube_texture_AddRef(IDirect3DCubeTexture9 *iface) {
   dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_cube_texture_Release(IDirect3DCubeTexture9 *iface) {
   dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  dx9mt_device *device = self->device;
+  LONG refcount;
   UINT i;
 
+  dx9mt_device_guard_enter(device);
+  refcount = InterlockedDecrement(&self->refcount);
   if (refcount == 0) {
+    dx9mt_private_data_clear(&self->private_data);
     for (i = 0; i < (self->levels * 6); ++i) {
       if (self->surfaces[i]) {
         dx9mt_surface *surface = dx9mt_surface_from_iface(self->surfaces[i]);
@@ -2486,6 +2852,7 @@ static ULONG WINAPI dx9mt_cube_texture_Release(IDirect3DCubeTexture9 *iface) {
     HeapFree(GetProcessHeap(), 0, self->surfaces);
     HeapFree(GetProcessHeap(), 0, self);
   }
+  dx9mt_device_guard_leave(device);
 
   return (ULONG)refcount;
 }
@@ -2507,28 +2874,35 @@ static HRESULT WINAPI dx9mt_cube_texture_GetDevice(
 static HRESULT WINAPI dx9mt_cube_texture_SetPrivateData(
     IDirect3DCubeTexture9 *iface, REFGUID guid, const void *data,
     DWORD data_size, DWORD flags) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  (void)flags;
-  return D3D_OK;
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_set(&self->private_data, guid, data, data_size, flags);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_cube_texture_GetPrivateData(
     IDirect3DCubeTexture9 *iface, REFGUID guid, void *data, DWORD *data_size) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  return D3DERR_NOTFOUND;
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_get(self->private_data, guid, data, data_size);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_cube_texture_FreePrivateData(
     IDirect3DCubeTexture9 *iface, REFGUID guid) {
-  (void)iface;
-  (void)guid;
-  return D3D_OK;
+  dx9mt_cube_texture *self = dx9mt_cube_texture_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_free(&self->private_data, guid);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static DWORD WINAPI dx9mt_cube_texture_SetPriority(IDirect3DCubeTexture9 *iface,
@@ -2802,17 +3176,27 @@ static HRESULT WINAPI dx9mt_vb_QueryInterface(IDirect3DVertexBuffer9 *iface,
 
 static ULONG WINAPI dx9mt_vb_AddRef(IDirect3DVertexBuffer9 *iface) {
   dx9mt_vertex_buffer *self = dx9mt_vb_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_vb_Release(IDirect3DVertexBuffer9 *iface) {
   dx9mt_vertex_buffer *self = dx9mt_vb_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  dx9mt_device *device = self->device;
+  LONG refcount;
 
+  dx9mt_device_guard_enter(device);
+  refcount = InterlockedDecrement(&self->refcount);
   if (refcount == 0) {
+    dx9mt_private_data_clear(&self->private_data);
     HeapFree(GetProcessHeap(), 0, self->data);
     HeapFree(GetProcessHeap(), 0, self);
   }
+  dx9mt_device_guard_leave(device);
 
   return (ULONG)refcount;
 }
@@ -2836,30 +3220,37 @@ static HRESULT WINAPI dx9mt_vb_SetPrivateData(IDirect3DVertexBuffer9 *iface,
                                                const void *data,
                                                DWORD data_size,
                                                DWORD flags) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  (void)flags;
-  return D3D_OK;
+  dx9mt_vertex_buffer *self = dx9mt_vb_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_set(&self->private_data, guid, data, data_size, flags);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_vb_GetPrivateData(IDirect3DVertexBuffer9 *iface,
                                                REFGUID guid,
                                                void *data,
                                                DWORD *data_size) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  return D3DERR_NOTFOUND;
+  dx9mt_vertex_buffer *self = dx9mt_vb_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_get(self->private_data, guid, data, data_size);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_vb_FreePrivateData(IDirect3DVertexBuffer9 *iface,
                                                 REFGUID guid) {
-  (void)iface;
-  (void)guid;
-  return D3D_OK;
+  dx9mt_vertex_buffer *self = dx9mt_vb_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_free(&self->private_data, guid);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static DWORD WINAPI dx9mt_vb_SetPriority(IDirect3DVertexBuffer9 *iface,
@@ -2887,13 +3278,18 @@ static HRESULT WINAPI dx9mt_vb_Lock(IDirect3DVertexBuffer9 *iface,
                                      UINT offset_to_lock, UINT size_to_lock,
                                      void **data, DWORD flags) {
   dx9mt_vertex_buffer *self = dx9mt_vb_from_iface(iface);
+  HRESULT hr = D3D_OK;
   (void)flags;
 
   dx9mt_device_guard_enter(self->device);
 
   if (!data || offset_to_lock > self->desc.Size) {
-    dx9mt_device_guard_leave(self->device);
-    return D3DERR_INVALIDCALL;
+    hr = D3DERR_INVALIDCALL;
+    goto done;
+  }
+  if (self->lock_active) {
+    hr = D3DERR_INVALIDCALL;
+    goto done;
   }
 
   if (size_to_lock == 0 || offset_to_lock + size_to_lock > self->desc.Size) {
@@ -2901,15 +3297,27 @@ static HRESULT WINAPI dx9mt_vb_Lock(IDirect3DVertexBuffer9 *iface,
   }
 
   *data = self->data + offset_to_lock;
+  self->lock_active = TRUE;
+
+done:
   dx9mt_device_guard_leave(self->device);
-  return D3D_OK;
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_vb_Unlock(IDirect3DVertexBuffer9 *iface) {
   dx9mt_vertex_buffer *self = dx9mt_vb_from_iface(iface);
+  HRESULT hr = D3D_OK;
+
   dx9mt_device_guard_enter(self->device);
+  if (!self->lock_active) {
+    hr = D3DERR_INVALIDCALL;
+    goto done;
+  }
+  self->lock_active = FALSE;
+
+done:
   dx9mt_device_guard_leave(self->device);
-  return D3D_OK;
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_vb_GetDesc(IDirect3DVertexBuffer9 *iface,
@@ -3020,17 +3428,27 @@ static HRESULT WINAPI dx9mt_ib_QueryInterface(IDirect3DIndexBuffer9 *iface,
 
 static ULONG WINAPI dx9mt_ib_AddRef(IDirect3DIndexBuffer9 *iface) {
   dx9mt_index_buffer *self = dx9mt_ib_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_ib_Release(IDirect3DIndexBuffer9 *iface) {
   dx9mt_index_buffer *self = dx9mt_ib_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  dx9mt_device *device = self->device;
+  LONG refcount;
 
+  dx9mt_device_guard_enter(device);
+  refcount = InterlockedDecrement(&self->refcount);
   if (refcount == 0) {
+    dx9mt_private_data_clear(&self->private_data);
     HeapFree(GetProcessHeap(), 0, self->data);
     HeapFree(GetProcessHeap(), 0, self);
   }
+  dx9mt_device_guard_leave(device);
 
   return (ULONG)refcount;
 }
@@ -3054,30 +3472,37 @@ static HRESULT WINAPI dx9mt_ib_SetPrivateData(IDirect3DIndexBuffer9 *iface,
                                                const void *data,
                                                DWORD data_size,
                                                DWORD flags) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  (void)flags;
-  return D3D_OK;
+  dx9mt_index_buffer *self = dx9mt_ib_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_set(&self->private_data, guid, data, data_size, flags);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_ib_GetPrivateData(IDirect3DIndexBuffer9 *iface,
                                                REFGUID guid,
                                                void *data,
                                                DWORD *data_size) {
-  (void)iface;
-  (void)guid;
-  (void)data;
-  (void)data_size;
-  return D3DERR_NOTFOUND;
+  dx9mt_index_buffer *self = dx9mt_ib_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_get(self->private_data, guid, data, data_size);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_ib_FreePrivateData(IDirect3DIndexBuffer9 *iface,
                                                 REFGUID guid) {
-  (void)iface;
-  (void)guid;
-  return D3D_OK;
+  dx9mt_index_buffer *self = dx9mt_ib_from_iface(iface);
+  HRESULT hr;
+
+  dx9mt_device_guard_enter(self->device);
+  hr = dx9mt_private_data_free(&self->private_data, guid);
+  dx9mt_device_guard_leave(self->device);
+  return hr;
 }
 
 static DWORD WINAPI dx9mt_ib_SetPriority(IDirect3DIndexBuffer9 *iface,
@@ -3105,13 +3530,18 @@ static HRESULT WINAPI dx9mt_ib_Lock(IDirect3DIndexBuffer9 *iface,
                                      UINT offset_to_lock, UINT size_to_lock,
                                      void **data, DWORD flags) {
   dx9mt_index_buffer *self = dx9mt_ib_from_iface(iface);
+  HRESULT hr = D3D_OK;
   (void)flags;
 
   dx9mt_device_guard_enter(self->device);
 
   if (!data || offset_to_lock > self->desc.Size) {
-    dx9mt_device_guard_leave(self->device);
-    return D3DERR_INVALIDCALL;
+    hr = D3DERR_INVALIDCALL;
+    goto done;
+  }
+  if (self->lock_active) {
+    hr = D3DERR_INVALIDCALL;
+    goto done;
   }
 
   if (size_to_lock == 0 || offset_to_lock + size_to_lock > self->desc.Size) {
@@ -3119,15 +3549,27 @@ static HRESULT WINAPI dx9mt_ib_Lock(IDirect3DIndexBuffer9 *iface,
   }
 
   *data = self->data + offset_to_lock;
+  self->lock_active = TRUE;
+
+done:
   dx9mt_device_guard_leave(self->device);
-  return D3D_OK;
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_ib_Unlock(IDirect3DIndexBuffer9 *iface) {
   dx9mt_index_buffer *self = dx9mt_ib_from_iface(iface);
+  HRESULT hr = D3D_OK;
+
   dx9mt_device_guard_enter(self->device);
+  if (!self->lock_active) {
+    hr = D3DERR_INVALIDCALL;
+    goto done;
+  }
+  self->lock_active = FALSE;
+
+done:
   dx9mt_device_guard_leave(self->device);
-  return D3D_OK;
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_ib_GetDesc(IDirect3DIndexBuffer9 *iface,
@@ -3223,16 +3665,25 @@ static HRESULT WINAPI dx9mt_vdecl_QueryInterface(IDirect3DVertexDeclaration9 *if
 
 static ULONG WINAPI dx9mt_vdecl_AddRef(IDirect3DVertexDeclaration9 *iface) {
   dx9mt_vertex_decl *self = dx9mt_vdecl_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_vdecl_Release(IDirect3DVertexDeclaration9 *iface) {
   dx9mt_vertex_decl *self = dx9mt_vdecl_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  LONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = InterlockedDecrement(&self->refcount);
   if (refcount == 0) {
     HeapFree(GetProcessHeap(), 0, self->elements);
     HeapFree(GetProcessHeap(), 0, self);
   }
+  dx9mt_device_guard_leave(self->device);
   return (ULONG)refcount;
 }
 
@@ -3254,24 +3705,27 @@ static HRESULT WINAPI dx9mt_vdecl_GetDeclaration(IDirect3DVertexDeclaration9 *if
                                                   D3DVERTEXELEMENT9 *elements,
                                                   UINT *num_elements) {
   dx9mt_vertex_decl *self = dx9mt_vdecl_from_iface(iface);
+  UINT required_elements;
   UINT bytes;
 
   if (!num_elements) {
     return D3DERR_INVALIDCALL;
   }
 
-  bytes = self->count * (UINT)sizeof(D3DVERTEXELEMENT9);
+  required_elements = self->count;
+  bytes = required_elements * (UINT)sizeof(D3DVERTEXELEMENT9);
   if (!elements) {
-    *num_elements = bytes;
+    *num_elements = required_elements;
     return D3D_OK;
   }
 
-  if (*num_elements < bytes) {
+  if (*num_elements < required_elements) {
+    *num_elements = required_elements;
     return D3DERR_INVALIDCALL;
   }
 
   memcpy(elements, self->elements, bytes);
-  *num_elements = bytes;
+  *num_elements = required_elements;
   return D3D_OK;
 }
 
@@ -3346,16 +3800,25 @@ static HRESULT WINAPI dx9mt_vshader_QueryInterface(IDirect3DVertexShader9 *iface
 
 static ULONG WINAPI dx9mt_vshader_AddRef(IDirect3DVertexShader9 *iface) {
   dx9mt_vertex_shader *self = dx9mt_vshader_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_vshader_Release(IDirect3DVertexShader9 *iface) {
   dx9mt_vertex_shader *self = dx9mt_vshader_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  LONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = InterlockedDecrement(&self->refcount);
   if (refcount == 0) {
     HeapFree(GetProcessHeap(), 0, self->byte_code);
     HeapFree(GetProcessHeap(), 0, self);
   }
+  dx9mt_device_guard_leave(self->device);
   return (ULONG)refcount;
 }
 
@@ -3468,16 +3931,25 @@ static HRESULT WINAPI dx9mt_pshader_QueryInterface(IDirect3DPixelShader9 *iface,
 
 static ULONG WINAPI dx9mt_pshader_AddRef(IDirect3DPixelShader9 *iface) {
   dx9mt_pixel_shader *self = dx9mt_pshader_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_pshader_Release(IDirect3DPixelShader9 *iface) {
   dx9mt_pixel_shader *self = dx9mt_pshader_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  LONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = InterlockedDecrement(&self->refcount);
   if (refcount == 0) {
     HeapFree(GetProcessHeap(), 0, self->byte_code);
     HeapFree(GetProcessHeap(), 0, self);
   }
+  dx9mt_device_guard_leave(self->device);
   return (ULONG)refcount;
 }
 
@@ -3558,15 +4030,25 @@ static HRESULT WINAPI dx9mt_query_QueryInterface(IDirect3DQuery9 *iface,
 
 static ULONG WINAPI dx9mt_query_AddRef(IDirect3DQuery9 *iface) {
   dx9mt_query *self = dx9mt_query_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  dx9mt_device_guard_enter(self->device);
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  dx9mt_device_guard_leave(self->device);
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_query_Release(IDirect3DQuery9 *iface) {
   dx9mt_query *self = dx9mt_query_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  dx9mt_device *device = self->device;
+  LONG refcount;
+
+  dx9mt_device_guard_enter(device);
+  refcount = InterlockedDecrement(&self->refcount);
+  dx9mt_device_guard_leave(device);
 
   if (refcount == 0) {
-    dx9mt_safe_release((IUnknown *)self->device);
+    dx9mt_safe_release((IUnknown *)device);
     HeapFree(GetProcessHeap(), 0, self);
   }
 
@@ -5113,9 +5595,19 @@ static void dx9mt_device_init_vtbl(void) {
 static void dx9mt_device_init_default_states(dx9mt_device *self) {
   uint32_t stage;
   uint32_t sampler;
+  uint32_t transform;
 
   if (!self) {
     return;
+  }
+
+  for (transform = 0; transform < DX9MT_MAX_TRANSFORM_STATES; ++transform) {
+    D3DMATRIX *matrix = &self->transforms[transform];
+    matrix->m[0][0] = 1.0f;
+    matrix->m[1][1] = 1.0f;
+    matrix->m[2][2] = 1.0f;
+    matrix->m[3][3] = 1.0f;
+    self->transform_set[transform] = TRUE;
   }
 
   for (sampler = 0; sampler < DX9MT_MAX_SAMPLERS; ++sampler) {
@@ -5260,12 +5752,27 @@ static HRESULT WINAPI dx9mt_device_QueryInterface(IDirect3DDevice9 *iface,
 
 static ULONG WINAPI dx9mt_device_AddRef(IDirect3DDevice9 *iface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
-  return (ULONG)InterlockedIncrement(&self->refcount);
+  ULONG refcount;
+
+  if (self->multithread_guard_enabled) {
+    EnterCriticalSection(&self->multithread_guard);
+  }
+  refcount = (ULONG)InterlockedIncrement(&self->refcount);
+  if (self->multithread_guard_enabled) {
+    LeaveCriticalSection(&self->multithread_guard);
+  }
+  return refcount;
 }
 
 static ULONG WINAPI dx9mt_device_Release(IDirect3DDevice9 *iface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
-  LONG refcount = InterlockedDecrement(&self->refcount);
+  WINBOOL use_guard = self->multithread_guard_enabled;
+  LONG refcount;
+
+  if (use_guard) {
+    EnterCriticalSection(&self->multithread_guard);
+  }
+  refcount = InterlockedDecrement(&self->refcount);
 
   if (refcount == 0) {
     dx9mt_device_release_bindings(self);
@@ -5276,8 +5783,16 @@ static ULONG WINAPI dx9mt_device_Release(IDirect3DDevice9 *iface) {
     }
 
     dx9mt_safe_release((IUnknown *)self->parent);
-    DeleteCriticalSection(&self->multithread_guard);
+    if (use_guard) {
+      LeaveCriticalSection(&self->multithread_guard);
+      DeleteCriticalSection(&self->multithread_guard);
+    }
     HeapFree(GetProcessHeap(), 0, self);
+    return (ULONG)refcount;
+  }
+
+  if (use_guard) {
+    LeaveCriticalSection(&self->multithread_guard);
   }
 
   return (ULONG)refcount;

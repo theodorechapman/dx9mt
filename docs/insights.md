@@ -38,6 +38,20 @@ The observed save-load crash (`falloutnv+0x757aa9`, `movl (%esi), %eax`, `ESI=0`
 ### Coarse per-device lock is the correct first compatibility move
 The frontend now uses a per-device critical section and lock-aware `IDirect3DDevice9` vtbl wrappers, plus guarded resource lock/unlock paths (VB/IB/surface/texture). This mirrors D3D9's coarse `D3DCREATE_MULTITHREADED` semantics and trades performance for correctness.
 
+## API Contract Pitfalls
+
+### `GetDeclaration` count is elements, not bytes
+`IDirect3DVertexDeclaration9::GetDeclaration` uses `UINT*` as an element count contract. Returning byte size (for example `24` instead of `3`) can make callers over-iterate declaration entries and consume garbage past the sentinel, which is a direct memory-corruption vector in caller-side declaration processing.
+
+Practical verification with a Wine probe:
+- expected contract shape: `GetDeclaration(NULL, &n)` returns `n=3` for a 2-element declaration + end marker
+- broken shape (pre-fix): returned `n=24`, then copied 24 bytes while reporting 24 elements
+
+The frontend now returns/report counts in elements and copies `count * sizeof(D3DVERTEXELEMENT9)` bytes.
+
+### D3D9 default transforms should be queryable immediately
+Returning `D3DERR_INVALIDCALL` from `GetTransform` until an explicit `SetTransform` is not compatibility-safe. Many callers assume default identity transforms are available from device creation. Initializing transform slots to identity avoids uninitialized caller paths.
+
 ## Packet Protocol
 
 ### BEGIN_FRAME is now in the packet stream
@@ -167,6 +181,14 @@ The 5 stencil fields (enable, func, ref, mask, writemask) are transmitted throug
 
 ### Frame dump for per-draw diagnosis
 The Metal viewer can dump per-draw state to `/tmp/dx9mt_frame_dump.txt`. Each draw shows: primitive type/count, vertex format, per-stage texture info (id, generation, format, size, upload status for all active stages 0-7), per-stage sampler state, TSS state, blend state, depth state, cull mode, viewport, and vertex data samples. Key field: `upload=0` means the texture is in the viewer's cache (no upload needed this frame), NOT that data is missing.
+
+### Continuous capture is better than one-shot for load-screen crashes
+One-shot frame dump (`D`) is useful for visual inspection, but save-load crashes often require the full lead-up sequence. The viewer now supports capture sessions:
+- `C` start/stop capture, `X` force-stop
+- per-frame text dump + raw IPC blob (`frame_*.txt`, `frame_*.bin`)
+- indexed metadata (`index.tsv`) with sequence, frame_id, draw_count, replay_hash
+
+This enables deterministic postmortem analysis of all frames immediately before a crash, including in-flight state transitions that a single snapshot misses.
 
 ### Sampled logging prevents log flooding
 High-frequency calls (GetDeviceCaps, CheckDeviceFormat, DebugSetMute) use `dx9mt_should_log_method_sample(&counter, first_n, every_n)`. First N calls logged in full, then every Nth call. Backend frames log on frames 0-9 then every 120th.

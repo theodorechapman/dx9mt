@@ -10,6 +10,11 @@ FNV_DIR := $(WINEPREFIX)/drive_c/Games/GOG Fallout New Vegas/Fallout New Vegas
 DX9MT_RUNTIME_LOG ?= /tmp/dx9mt_runtime.log
 DX9MT_LAUNCHER_LOG ?= /tmp/fnv_dx9mt_probe.log
 DX9MT_ANALYZE_TOP ?= 20
+DX9MT_CAPTURE_DIR ?= /tmp/dx9mt_capture
+DX9MT_CAPTURE_MAX_FRAMES ?= 0
+DX9MT_CAPTURE_IDLE_MS ?= 5000
+DX9MT_CAPTURE_TEXT ?= 1
+DX9MT_CAPTURE_RAW ?= 1
 
 WINEDLLOVERRIDES := dxsetup.exe=d
 
@@ -17,7 +22,7 @@ export WINEPREFIX
 export WINEDLLOVERRIDES
 
 .DEFAULT_GOAL := run
-.PHONY: run run-wine show-logs analyze-logs test clear dx9mt-build dx9mt-test install-dx9mt-fnv configure-fnv-dx9mt-override configure-fnv-wine-d3d9 show-fnv-dx9mt-override wine-restart
+.PHONY: run run-capture run-wine show-logs analyze-logs test clear dx9mt-build dx9mt-test install-dx9mt-fnv configure-fnv-dx9mt-override configure-fnv-wine-d3d9 show-fnv-dx9mt-override wine-restart
 
 wine-restart:
 	@echo "Restarting wineserver"; \
@@ -69,6 +74,11 @@ run: install-dx9mt-fnv
 	dd if=/dev/zero of="$(DX9MT_METAL_IPC_FILE)" bs=1048576 count=16 >/dev/null 2>&1; \
 	if [ -x "$(DX9MT_METAL_VIEWER)" ]; then \
 		echo "Launching Metal viewer"; \
+		DX9MT_CAPTURE_DIR="$(DX9MT_CAPTURE_DIR)" \
+		DX9MT_CAPTURE_MAX_FRAMES="$(DX9MT_CAPTURE_MAX_FRAMES)" \
+		DX9MT_CAPTURE_IDLE_MS="$(DX9MT_CAPTURE_IDLE_MS)" \
+		DX9MT_CAPTURE_TEXT="$(DX9MT_CAPTURE_TEXT)" \
+		DX9MT_CAPTURE_RAW="$(DX9MT_CAPTURE_RAW)" \
 		"$(DX9MT_METAL_VIEWER)" &  \
 		VIEWER_PID=$$!; \
 		echo "Metal viewer pid $$VIEWER_PID"; \
@@ -84,6 +94,17 @@ run: install-dx9mt-fnv
 	echo "Wine exited $$?"; \
 	echo "=== Wine stderr (crash trace) ==="; \
 	tail -60 /tmp/dx9mt_wine_stderr.log
+
+run-capture:
+	@echo "Launching with continuous capture support"; \
+	echo "In the Metal viewer window: press C to start/stop capture, X to force-stop, D for one-shot frame dump"; \
+	echo "Capture output root: $(DX9MT_CAPTURE_DIR)"; \
+	$(MAKE) --no-print-directory run \
+		DX9MT_CAPTURE_DIR="$(DX9MT_CAPTURE_DIR)" \
+		DX9MT_CAPTURE_MAX_FRAMES="$(DX9MT_CAPTURE_MAX_FRAMES)" \
+		DX9MT_CAPTURE_IDLE_MS="$(DX9MT_CAPTURE_IDLE_MS)" \
+		DX9MT_CAPTURE_TEXT="$(DX9MT_CAPTURE_TEXT)" \
+		DX9MT_CAPTURE_RAW="$(DX9MT_CAPTURE_RAW)"
 
 run-wine: configure-fnv-wine-d3d9
 	@set -e; \

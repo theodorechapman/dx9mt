@@ -1133,8 +1133,6 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
     for (i = 0; i < draw_count; ++i) {
       const dx9mt_backend_draw_command *cmd = &g_frame_replay_state.draws[i];
       dx9mt_metal_ipc_draw *d = &ipc_draws[i];
-      const void *data;
-
       memset(d, 0, sizeof(*d));
       d->primitive_type = cmd->primitive_type;
       d->base_vertex = cmd->base_vertex;
@@ -1200,101 +1198,110 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       d->rs_cull_mode = cmd->rs_cull_mode;
 
       /* Copy VB data into bulk region */
-      data = dx9mt_frontend_upload_resolve(&cmd->vertex_data);
-      if (data && cmd->vertex_data_size > 0 &&
+      if (cmd->vertex_data_size > 0 &&
           bulk_offset + bulk_used + cmd->vertex_data_size <=
               DX9MT_METAL_IPC_SLOT_SIZE) {
-        d->vb_bulk_offset = bulk_used;
-        d->vb_bulk_size = cmd->vertex_data_size;
-        memcpy(slot_base + bulk_offset + bulk_used, data,
-               cmd->vertex_data_size);
-        bulk_used += (cmd->vertex_data_size + 15u) & ~15u;
+        void *dst = slot_base + bulk_offset + bulk_used;
+        if (dx9mt_frontend_upload_copy_out(&cmd->vertex_data, dst,
+                                           cmd->vertex_data_size) == 0) {
+          d->vb_bulk_offset = bulk_used;
+          d->vb_bulk_size = cmd->vertex_data_size;
+          bulk_used += (cmd->vertex_data_size + 15u) & ~15u;
+        }
       }
 
       /* Copy IB data into bulk region */
-      data = dx9mt_frontend_upload_resolve(&cmd->index_data);
-      if (data && cmd->index_data_size > 0 &&
+      if (cmd->index_data_size > 0 &&
           bulk_offset + bulk_used + cmd->index_data_size <=
               DX9MT_METAL_IPC_SLOT_SIZE) {
-        d->ib_bulk_offset = bulk_used;
-        d->ib_bulk_size = cmd->index_data_size;
-        memcpy(slot_base + bulk_offset + bulk_used, data,
-               cmd->index_data_size);
-        bulk_used += (cmd->index_data_size + 15u) & ~15u;
+        void *dst = slot_base + bulk_offset + bulk_used;
+        if (dx9mt_frontend_upload_copy_out(&cmd->index_data, dst,
+                                           cmd->index_data_size) == 0) {
+          d->ib_bulk_offset = bulk_used;
+          d->ib_bulk_size = cmd->index_data_size;
+          bulk_used += (cmd->index_data_size + 15u) & ~15u;
+        }
       }
 
       /* Copy vertex declaration into bulk region */
-      data = dx9mt_frontend_upload_resolve(&cmd->vertex_decl_data);
-      if (data && cmd->vertex_decl_count > 0) {
+      if (cmd->vertex_decl_count > 0) {
         uint32_t decl_bytes = cmd->vertex_decl_count * 8u;
         if (bulk_offset + bulk_used + decl_bytes <=
             DX9MT_METAL_IPC_SLOT_SIZE) {
-          d->decl_bulk_offset = bulk_used;
-          d->decl_count = cmd->vertex_decl_count;
-          memcpy(slot_base + bulk_offset + bulk_used, data, decl_bytes);
-          bulk_used += (decl_bytes + 15u) & ~15u;
+          void *dst = slot_base + bulk_offset + bulk_used;
+          if (dx9mt_frontend_upload_copy_out(&cmd->vertex_decl_data, dst,
+                                             decl_bytes) == 0) {
+            d->decl_bulk_offset = bulk_used;
+            d->decl_count = cmd->vertex_decl_count;
+            bulk_used += (decl_bytes + 15u) & ~15u;
+          }
         }
       }
 
       /* Copy VS float constants into bulk region */
-      data = dx9mt_frontend_upload_resolve(&cmd->constants_vs);
-      if (data && cmd->constants_vs.size > 0 &&
+      if (cmd->constants_vs.size > 0 &&
           bulk_offset + bulk_used + cmd->constants_vs.size <=
               DX9MT_METAL_IPC_SLOT_SIZE) {
-        d->vs_constants_bulk_offset = bulk_used;
-        d->vs_constants_size = cmd->constants_vs.size;
-        memcpy(slot_base + bulk_offset + bulk_used, data,
-               cmd->constants_vs.size);
-        bulk_used += (cmd->constants_vs.size + 15u) & ~15u;
+        void *dst = slot_base + bulk_offset + bulk_used;
+        if (dx9mt_frontend_upload_copy_out(&cmd->constants_vs, dst,
+                                           cmd->constants_vs.size) == 0) {
+          d->vs_constants_bulk_offset = bulk_used;
+          d->vs_constants_size = cmd->constants_vs.size;
+          bulk_used += (cmd->constants_vs.size + 15u) & ~15u;
+        }
       }
 
       /* Copy PS float constants into bulk region */
-      data = dx9mt_frontend_upload_resolve(&cmd->constants_ps);
-      if (data && cmd->constants_ps.size > 0 &&
+      if (cmd->constants_ps.size > 0 &&
           bulk_offset + bulk_used + cmd->constants_ps.size <=
               DX9MT_METAL_IPC_SLOT_SIZE) {
-        d->ps_constants_bulk_offset = bulk_used;
-        d->ps_constants_size = cmd->constants_ps.size;
-        memcpy(slot_base + bulk_offset + bulk_used, data,
-               cmd->constants_ps.size);
-        bulk_used += (cmd->constants_ps.size + 15u) & ~15u;
+        void *dst = slot_base + bulk_offset + bulk_used;
+        if (dx9mt_frontend_upload_copy_out(&cmd->constants_ps, dst,
+                                           cmd->constants_ps.size) == 0) {
+          d->ps_constants_bulk_offset = bulk_used;
+          d->ps_constants_size = cmd->constants_ps.size;
+          bulk_used += (cmd->constants_ps.size + 15u) & ~15u;
+        }
       }
 
       /* Copy per-stage texture uploads when present (texture cache updates). */
       for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
-        data = dx9mt_frontend_upload_resolve(&cmd->tex_data[s]);
-        if (data && cmd->tex_data[s].size > 0 &&
+        if (cmd->tex_data[s].size > 0 &&
             bulk_offset + bulk_used + cmd->tex_data[s].size <=
                 DX9MT_METAL_IPC_SLOT_SIZE) {
-          d->tex_bulk_offset[s] = bulk_used;
-          d->tex_bulk_size[s] = cmd->tex_data[s].size;
-          memcpy(slot_base + bulk_offset + bulk_used, data,
-                 cmd->tex_data[s].size);
-          bulk_used += (cmd->tex_data[s].size + 15u) & ~15u;
+          void *dst = slot_base + bulk_offset + bulk_used;
+          if (dx9mt_frontend_upload_copy_out(&cmd->tex_data[s], dst,
+                                             cmd->tex_data[s].size) == 0) {
+            d->tex_bulk_offset[s] = bulk_used;
+            d->tex_bulk_size[s] = cmd->tex_data[s].size;
+            bulk_used += (cmd->tex_data[s].size + 15u) & ~15u;
+          }
         }
       }
 
       /* Copy VS/PS shader bytecode for translation. */
       d->vertex_shader_id = cmd->vertex_shader_id;
-      data = dx9mt_frontend_upload_resolve(&cmd->vs_bytecode);
-      if (data && cmd->vs_bytecode.size > 0 &&
+      if (cmd->vs_bytecode.size > 0 &&
           bulk_offset + bulk_used + cmd->vs_bytecode.size <=
               DX9MT_METAL_IPC_SLOT_SIZE) {
-        d->vs_bytecode_bulk_offset = bulk_used;
-        d->vs_bytecode_bulk_size = cmd->vs_bytecode.size;
-        memcpy(slot_base + bulk_offset + bulk_used, data,
-               cmd->vs_bytecode.size);
-        bulk_used += (cmd->vs_bytecode.size + 15u) & ~15u;
+        void *dst = slot_base + bulk_offset + bulk_used;
+        if (dx9mt_frontend_upload_copy_out(&cmd->vs_bytecode, dst,
+                                           cmd->vs_bytecode.size) == 0) {
+          d->vs_bytecode_bulk_offset = bulk_used;
+          d->vs_bytecode_bulk_size = cmd->vs_bytecode.size;
+          bulk_used += (cmd->vs_bytecode.size + 15u) & ~15u;
+        }
       }
-      data = dx9mt_frontend_upload_resolve(&cmd->ps_bytecode);
-      if (data && cmd->ps_bytecode.size > 0 &&
+      if (cmd->ps_bytecode.size > 0 &&
           bulk_offset + bulk_used + cmd->ps_bytecode.size <=
               DX9MT_METAL_IPC_SLOT_SIZE) {
-        d->ps_bytecode_bulk_offset = bulk_used;
-        d->ps_bytecode_bulk_size = cmd->ps_bytecode.size;
-        memcpy(slot_base + bulk_offset + bulk_used, data,
-               cmd->ps_bytecode.size);
-        bulk_used += (cmd->ps_bytecode.size + 15u) & ~15u;
+        void *dst = slot_base + bulk_offset + bulk_used;
+        if (dx9mt_frontend_upload_copy_out(&cmd->ps_bytecode, dst,
+                                           cmd->ps_bytecode.size) == 0) {
+          d->ps_bytecode_bulk_offset = bulk_used;
+          d->ps_bytecode_bulk_size = cmd->ps_bytecode.size;
+          bulk_used += (cmd->ps_bytecode.size + 15u) & ~15u;
+        }
       }
     }
 

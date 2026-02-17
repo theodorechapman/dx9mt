@@ -35,4 +35,13 @@ typedef struct dx9mt_upload_arena_desc {
  */
 const void *dx9mt_frontend_upload_resolve(const dx9mt_upload_ref *ref);
 
+/*
+ * Copy an upload ref into caller-provided storage while holding the
+ * frontend upload arena guard. Returns 0 on success, -1 on validation
+ * failure. This is intended for backend packet processing paths where
+ * the source ref may otherwise race with concurrent frontend writers.
+ */
+int dx9mt_frontend_upload_copy_out(const dx9mt_upload_ref *ref, void *dst,
+                                   uint32_t size);
+
 #endif

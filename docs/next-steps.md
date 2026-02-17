@@ -6,6 +6,8 @@ RB5 is still in progress, but the focus shifted from feature bring-up to crash h
 
 - **Block-compressed safety fixes landed** -- DXT copy rect validation, block-size scaling rejection, and `ColorFill` rejection for compressed surfaces.
 - **Multithread runtime guard landed** -- per-device critical section with lock-aware `IDirect3DDevice9` wrappers; VB/IB/surface/texture lock/unlock paths now use the same guard.
+- **Declaration contract fix landed** -- `IDirect3DVertexDeclaration9::GetDeclaration` now reports element counts (not bytes), removing a high-risk caller memory-corruption path.
+- **Transform defaults fix landed** -- transform slots now initialize to identity so `GetTransform` is safe before first `SetTransform`.
 - **Known crash signature** -- save-load crash was a null dereference in game code (`falloutnv+0x757aa9`, `ESI=0`) while device behavior flags included `D3DCREATE_MULTITHREADED` (`0x00000054`).
 
 ## Immediate Next: Re-Validate Save/Load Stability
@@ -22,6 +24,7 @@ The highest-priority question is now binary: does gameplay save/load remain stab
    - `backtrace.txt`
    - `/tmp/dx9mt_runtime.log` around crash time
    - whether faulting thread is still a worker thread vs render thread
+   - continuous capture session from `/tmp/dx9mt_capture/session-*/` (use `make run-capture`, press `C` before triggering load, then stop with `X`/`C` after crash)
 4. **If crash persists with same signature**, extend locking scope to all child COM vtbls (not only lock/unlock hot paths) and add upload-arena global guarding for multi-device/thread edge cases.
 
 ### Remaining RB5 Items

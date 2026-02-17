@@ -9,9 +9,16 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "dx9mt/metal_ipc.h"
@@ -174,6 +181,31 @@ typedef struct dx9mt_d3d_vertex_element {
 #pragma pack(pop)
 
 static volatile int s_dump_next_frame = 0;
+
+typedef struct dx9mt_capture_config {
+  char root_dir[PATH_MAX];
+  uint32_t max_frames;
+  uint32_t idle_ms;
+  int write_text;
+  int write_raw;
+} dx9mt_capture_config;
+
+typedef struct dx9mt_capture_session {
+  int active;
+  char session_dir[PATH_MAX];
+  FILE *index_file;
+  uint32_t frame_count;
+  uint64_t started_ms;
+  uint64_t last_frame_ms;
+  uint32_t max_frames;
+  uint32_t idle_ms;
+  int write_text;
+  int write_raw;
+} dx9mt_capture_session;
+
+static dx9mt_capture_config s_capture_config = {
+    "/tmp/dx9mt_capture", 0u, 5000u, 1, 1};
+static dx9mt_capture_session s_capture_session = {0};
 
 static id<MTLDevice> s_device;
 static id<MTLCommandQueue> s_queue;
@@ -1734,7 +1766,305 @@ static id<MTLRenderPipelineState> create_translated_pso(
   return pso;
 }
 
-static void dump_frame(const volatile unsigned char *slot_base) {
+static uint64_t dx9mt_now_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    return 0;
+  }
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void dx9mt_copy_string(char *dst, size_t dst_size, const char *src) {
+  if (!dst || dst_size == 0) {
+    return;
+  }
+  if (!src) {
+    src = "";
+  }
+  strncpy(dst, src, dst_size - 1);
+  dst[dst_size - 1] = '\0';
+}
+
+static uint32_t dx9mt_env_u32(const char *name, uint32_t fallback) {
+  const char *value = getenv(name);
+  char *end = NULL;
+  unsigned long parsed;
+  if (!value || !value[0]) {
+    return fallback;
+  }
+  errno = 0;
+  parsed = strtoul(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0') {
+    return fallback;
+  }
+  if (parsed > UINT32_MAX) {
+    return UINT32_MAX;
+  }
+  return (uint32_t)parsed;
+}
+
+static int dx9mt_env_bool(const char *name, int fallback) {
+  const char *value = getenv(name);
+  if (!value || !value[0]) {
+    return fallback;
+  }
+  if (!strcmp(value, "1") || !strcasecmp(value, "true") ||
+      !strcasecmp(value, "yes") || !strcasecmp(value, "on")) {
+    return 1;
+  }
+  if (!strcmp(value, "0") || !strcasecmp(value, "false") ||
+      !strcasecmp(value, "no") || !strcasecmp(value, "off")) {
+    return 0;
+  }
+  return fallback;
+}
+
+static void dx9mt_capture_load_config_from_env(void) {
+  const char *root = getenv("DX9MT_CAPTURE_DIR");
+  if (root && root[0]) {
+    dx9mt_copy_string(s_capture_config.root_dir, sizeof(s_capture_config.root_dir),
+                      root);
+  } else {
+    dx9mt_copy_string(s_capture_config.root_dir, sizeof(s_capture_config.root_dir),
+                      "/tmp/dx9mt_capture");
+  }
+  s_capture_config.max_frames =
+      dx9mt_env_u32("DX9MT_CAPTURE_MAX_FRAMES", 0u);
+  s_capture_config.idle_ms = dx9mt_env_u32("DX9MT_CAPTURE_IDLE_MS", 5000u);
+  s_capture_config.write_text = dx9mt_env_bool("DX9MT_CAPTURE_TEXT", 1);
+  s_capture_config.write_raw = dx9mt_env_bool("DX9MT_CAPTURE_RAW", 1);
+  if (!s_capture_config.write_text && !s_capture_config.write_raw) {
+    s_capture_config.write_text = 1;
+  }
+}
+
+static int dx9mt_mkdir_recursive(const char *path) {
+  char tmp[PATH_MAX];
+  size_t len;
+  if (!path || !path[0]) {
+    return -1;
+  }
+  len = strlen(path);
+  if (len >= sizeof(tmp)) {
+    return -1;
+  }
+
+  memcpy(tmp, path, len + 1);
+  if (len > 1 && tmp[len - 1] == '/') {
+    tmp[len - 1] = '\0';
+  }
+
+  for (char *p = tmp + 1; *p; ++p) {
+    if (*p != '/') {
+      continue;
+    }
+    *p = '\0';
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+      return -1;
+    }
+    *p = '/';
+  }
+  if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+    return -1;
+  }
+  return 0;
+}
+
+static int dx9mt_join_path(char *out, size_t out_size, const char *dir,
+                           const char *name) {
+  int written;
+  if (!out || !dir || !name) {
+    return -1;
+  }
+  written = snprintf(out, out_size, "%s/%s", dir, name);
+  if (written < 0 || (size_t)written >= out_size) {
+    return -1;
+  }
+  return 0;
+}
+
+static int dx9mt_capture_make_session_dir(char *out, size_t out_size) {
+  time_t now = time(NULL);
+  struct tm local_tm;
+  char ts[32];
+  int written;
+
+  if (!out || out_size == 0) {
+    return -1;
+  }
+  if (localtime_r(&now, &local_tm) == NULL) {
+    memset(&local_tm, 0, sizeof(local_tm));
+  }
+  written = snprintf(ts, sizeof(ts), "%04d%02d%02d-%02d%02d%02d",
+                     local_tm.tm_year + 1900, local_tm.tm_mon + 1,
+                     local_tm.tm_mday, local_tm.tm_hour, local_tm.tm_min,
+                     local_tm.tm_sec);
+  if (written < 0 || (size_t)written >= sizeof(ts)) {
+    return -1;
+  }
+
+  for (uint32_t attempt = 0; attempt < 1000u; ++attempt) {
+    int path_written;
+    if (attempt == 0) {
+      path_written = snprintf(out, out_size, "%s/session-%s",
+                              s_capture_config.root_dir, ts);
+    } else {
+      path_written = snprintf(out, out_size, "%s/session-%s-%03u",
+                              s_capture_config.root_dir, ts, attempt);
+    }
+    if (path_written < 0 || (size_t)path_written >= out_size) {
+      return -1;
+    }
+    if (mkdir(out, 0755) == 0) {
+      return 0;
+    }
+    if (errno != EEXIST) {
+      return -1;
+    }
+  }
+  return -1;
+}
+
+static void dx9mt_capture_stop(const char *reason) {
+  const char *final_reason = reason ? reason : "stopped";
+  if (!s_capture_session.active) {
+    return;
+  }
+
+  if (s_capture_session.index_file) {
+    fprintf(s_capture_session.index_file, "# stop\treason=%s\tframes=%u\n",
+            final_reason, s_capture_session.frame_count);
+    fflush(s_capture_session.index_file);
+    fclose(s_capture_session.index_file);
+    s_capture_session.index_file = NULL;
+  }
+
+  fprintf(stderr,
+          "dx9mt_metal_viewer: capture stopped (%s) frames=%u dir=%s\n",
+          final_reason, s_capture_session.frame_count,
+          s_capture_session.session_dir);
+  memset(&s_capture_session, 0, sizeof(s_capture_session));
+}
+
+static int dx9mt_capture_start(void) {
+  char session_dir[PATH_MAX];
+  char index_path[PATH_MAX];
+  FILE *index_file = NULL;
+  uint64_t now_ms;
+
+  if (s_capture_session.active) {
+    return 0;
+  }
+
+  dx9mt_capture_load_config_from_env();
+  if (dx9mt_mkdir_recursive(s_capture_config.root_dir) != 0) {
+    fprintf(stderr,
+            "dx9mt_metal_viewer: capture start failed (mkdir %s, errno=%d)\n",
+            s_capture_config.root_dir, errno);
+    return -1;
+  }
+  if (dx9mt_capture_make_session_dir(session_dir, sizeof(session_dir)) != 0) {
+    fprintf(stderr, "dx9mt_metal_viewer: capture start failed (session dir)\n");
+    return -1;
+  }
+  if (dx9mt_join_path(index_path, sizeof(index_path), session_dir, "index.tsv") !=
+      0) {
+    fprintf(stderr, "dx9mt_metal_viewer: capture start failed (index path)\n");
+    return -1;
+  }
+
+  index_file = fopen(index_path, "w");
+  if (!index_file) {
+    fprintf(stderr,
+            "dx9mt_metal_viewer: capture start failed (open %s, errno=%d)\n",
+            index_path, errno);
+    return -1;
+  }
+
+  fprintf(index_file,
+          "capture_frame\tmono_ms\tsequence\tframe_id\tdraw_count\treplay_hash\t"
+          "present_rt\ttext_file\traw_file\traw_bytes\n");
+  fflush(index_file);
+
+  memset(&s_capture_session, 0, sizeof(s_capture_session));
+  dx9mt_copy_string(s_capture_session.session_dir,
+                    sizeof(s_capture_session.session_dir), session_dir);
+  s_capture_session.index_file = index_file;
+  s_capture_session.active = 1;
+  s_capture_session.max_frames = s_capture_config.max_frames;
+  s_capture_session.idle_ms = s_capture_config.idle_ms;
+  s_capture_session.write_text = s_capture_config.write_text;
+  s_capture_session.write_raw = s_capture_config.write_raw;
+  now_ms = dx9mt_now_ms();
+  s_capture_session.started_ms = now_ms;
+  s_capture_session.last_frame_ms = now_ms;
+
+  fprintf(stderr,
+          "dx9mt_metal_viewer: capture started dir=%s text=%d raw=%d "
+          "max_frames=%u idle_ms=%u\n",
+          s_capture_session.session_dir, s_capture_session.write_text,
+          s_capture_session.write_raw, s_capture_session.max_frames,
+          s_capture_session.idle_ms);
+  return 0;
+}
+
+static size_t dx9mt_frame_blob_size(const volatile unsigned char *slot_base) {
+  const volatile dx9mt_metal_ipc_frame_header *hdr =
+      (const volatile dx9mt_metal_ipc_frame_header *)slot_base;
+  size_t draw_count = hdr->draw_count;
+  size_t min_bytes;
+  size_t used_bytes;
+
+  if (draw_count > DX9MT_METAL_IPC_MAX_DRAWS) {
+    draw_count = DX9MT_METAL_IPC_MAX_DRAWS;
+  }
+
+  min_bytes = sizeof(dx9mt_metal_ipc_frame_header) +
+              draw_count * sizeof(dx9mt_metal_ipc_draw);
+  used_bytes = hdr->bulk_data_offset;
+  if (used_bytes < min_bytes) {
+    used_bytes = min_bytes;
+  }
+  used_bytes += hdr->bulk_data_used;
+  if (used_bytes > DX9MT_METAL_IPC_SLOT_SIZE) {
+    used_bytes = DX9MT_METAL_IPC_SLOT_SIZE;
+  }
+  return used_bytes;
+}
+
+static int dx9mt_capture_write_raw(const volatile unsigned char *slot_base,
+                                   const char *path, size_t *written_size) {
+  FILE *f;
+  size_t blob_size = dx9mt_frame_blob_size(slot_base);
+  size_t wrote;
+
+  if (written_size) {
+    *written_size = 0;
+  }
+  if (!path || !path[0]) {
+    return -1;
+  }
+
+  f = fopen(path, "wb");
+  if (!f) {
+    return -1;
+  }
+  wrote = fwrite((const void *)(const unsigned char *)slot_base, 1, blob_size, f);
+  if (wrote != blob_size || fflush(f) != 0) {
+    fclose(f);
+    return -1;
+  }
+  fclose(f);
+
+  if (written_size) {
+    *written_size = blob_size;
+  }
+  return 0;
+}
+
+static int dump_frame_text_to_file(const volatile unsigned char *slot_base,
+                                   const char *dump_path,
+                                   int dump_texture_files) {
   const volatile dx9mt_metal_ipc_frame_header *hdr =
       (const volatile dx9mt_metal_ipc_frame_header *)slot_base;
   const volatile dx9mt_metal_ipc_draw *draws =
@@ -1743,10 +2073,11 @@ static void dump_frame(const volatile unsigned char *slot_base) {
   uint32_t bulk_off = hdr->bulk_data_offset;
   uint32_t draw_count = hdr->draw_count;
 
-  FILE *f = fopen("/tmp/dx9mt_frame_dump.txt", "w");
+  FILE *f = fopen(dump_path, "w");
   if (!f) {
-    fprintf(stderr, "dx9mt_metal_viewer: cannot open dump file\n");
-    return;
+    fprintf(stderr, "dx9mt_metal_viewer: cannot open dump file '%s'\n",
+            dump_path ? dump_path : "(null)");
+    return -1;
   }
 
   fprintf(f, "=== FRAME DUMP ===\n");
@@ -1918,21 +2249,23 @@ static void dump_frame(const volatile unsigned char *slot_base) {
     }
 
     /* Save texture data to file */
-    for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
-      if (d->tex_bulk_size[s] > 0 && d->tex_id[s] != 0) {
-        char tex_path[256];
-        snprintf(tex_path, sizeof(tex_path), "/tmp/dx9mt_tex_%u_s%u.raw",
-                 d->tex_id[s], s);
-        FILE *tf = fopen(tex_path, "wb");
-        if (tf) {
-          const void *tex_data = (const void *)(slot_base + bulk_off +
-                                                 d->tex_bulk_offset[s]);
-          fwrite(tex_data, 1, d->tex_bulk_size[s], tf);
-          fclose(tf);
-          fprintf(f, "  >> texture saved: %s (%u bytes, %s %ux%u)\n",
-                  tex_path, d->tex_bulk_size[s],
-                  d3d_fmt_name(d->tex_format[s]),
-                  d->tex_width[s], d->tex_height[s]);
+    if (dump_texture_files) {
+      for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
+        if (d->tex_bulk_size[s] > 0 && d->tex_id[s] != 0) {
+          char tex_path[256];
+          snprintf(tex_path, sizeof(tex_path), "/tmp/dx9mt_tex_%u_s%u.raw",
+                   d->tex_id[s], s);
+          FILE *tf = fopen(tex_path, "wb");
+          if (tf) {
+            const void *tex_data = (const void *)(slot_base + bulk_off +
+                                                  d->tex_bulk_offset[s]);
+            fwrite(tex_data, 1, d->tex_bulk_size[s], tf);
+            fclose(tf);
+            fprintf(f, "  >> texture saved: %s (%u bytes, %s %ux%u)\n",
+                    tex_path, d->tex_bulk_size[s],
+                    d3d_fmt_name(d->tex_format[s]),
+                    d->tex_width[s], d->tex_height[s]);
+          }
         }
       }
     }
@@ -1940,8 +2273,102 @@ static void dump_frame(const volatile unsigned char *slot_base) {
   }
 
   fclose(f);
-  fprintf(stderr, "dx9mt_metal_viewer: frame dump written to "
-                  "/tmp/dx9mt_frame_dump.txt (%u draws)\n", draw_count);
+  fprintf(stderr, "dx9mt_metal_viewer: frame dump written to %s (%u draws)\n",
+          dump_path ? dump_path : "(null)", draw_count);
+  return 0;
+}
+
+static void dump_frame(const volatile unsigned char *slot_base) {
+  (void)dump_frame_text_to_file(slot_base, "/tmp/dx9mt_frame_dump.txt", 1);
+}
+
+static void dx9mt_capture_record_frame(uint32_t sequence,
+                                       const volatile unsigned char *slot_base) {
+  const volatile dx9mt_metal_ipc_frame_header *hdr =
+      (const volatile dx9mt_metal_ipc_frame_header *)slot_base;
+  uint32_t capture_idx;
+  uint64_t now_ms;
+  char text_name[64] = "-";
+  char raw_name[64] = "-";
+  char text_path[PATH_MAX];
+  char raw_path[PATH_MAX];
+  size_t raw_bytes = 0;
+  int text_ok = 1;
+  int raw_ok = 1;
+  const char *text_field = "-";
+  const char *raw_field = "-";
+
+  if (!s_capture_session.active) {
+    return;
+  }
+
+  capture_idx = s_capture_session.frame_count + 1u;
+
+  if (s_capture_session.write_text) {
+    if (snprintf(text_name, sizeof(text_name), "frame_%06u_f%u.txt", capture_idx,
+                 hdr->frame_id) > 0 &&
+        dx9mt_join_path(text_path, sizeof(text_path), s_capture_session.session_dir,
+                        text_name) == 0 &&
+        dump_frame_text_to_file(slot_base, text_path, 0) == 0) {
+      text_ok = 1;
+      text_field = text_name;
+    } else {
+      text_field = "ERROR";
+      fprintf(stderr,
+              "dx9mt_metal_viewer: capture frame %u text dump failed\n",
+              capture_idx);
+    }
+  }
+
+  if (s_capture_session.write_raw) {
+    if (snprintf(raw_name, sizeof(raw_name), "frame_%06u_f%u.bin", capture_idx,
+                 hdr->frame_id) > 0 &&
+        dx9mt_join_path(raw_path, sizeof(raw_path), s_capture_session.session_dir,
+                        raw_name) == 0 &&
+        dx9mt_capture_write_raw(slot_base, raw_path, &raw_bytes) == 0) {
+      raw_ok = 1;
+      raw_field = raw_name;
+    } else {
+      raw_field = "ERROR";
+      fprintf(stderr,
+              "dx9mt_metal_viewer: capture frame %u raw dump failed\n",
+              capture_idx);
+    }
+  }
+
+  now_ms = dx9mt_now_ms();
+  s_capture_session.frame_count = capture_idx;
+  s_capture_session.last_frame_ms = now_ms;
+
+  if (s_capture_session.index_file) {
+    fprintf(s_capture_session.index_file,
+            "%u\t%llu\t%u\t%u\t%u\t0x%08x\t%u\t%s\t%s\t%zu\n",
+            capture_idx, (unsigned long long)now_ms, sequence, hdr->frame_id,
+            hdr->draw_count, hdr->replay_hash, hdr->present_render_target_id,
+            text_field, raw_field, raw_bytes);
+    fflush(s_capture_session.index_file);
+  }
+
+  if (s_capture_session.max_frames > 0 &&
+      s_capture_session.frame_count >= s_capture_session.max_frames) {
+    dx9mt_capture_stop("max-frames reached");
+  } else if ((capture_idx % 120u) == 0u || !text_ok || !raw_ok) {
+    fprintf(stderr,
+            "dx9mt_metal_viewer: capture progress frames=%u last_seq=%u\n",
+            s_capture_session.frame_count, sequence);
+  }
+}
+
+static void dx9mt_capture_check_idle(uint64_t now_ms) {
+  if (!s_capture_session.active || s_capture_session.idle_ms == 0 || now_ms == 0) {
+    return;
+  }
+  if (now_ms < s_capture_session.last_frame_ms) {
+    return;
+  }
+  if ((now_ms - s_capture_session.last_frame_ms) >= s_capture_session.idle_ms) {
+    dx9mt_capture_stop("idle-timeout");
+  }
 }
 
 static void render_frame(const volatile unsigned char *slot_base) {
@@ -2545,13 +2972,31 @@ static void render_frame(const volatile unsigned char *slot_base) {
                                           selector:@selector(pollAndRender)
                                           userInfo:nil
                                            repeats:YES];
-  /* Press 'D' in the viewer window to dump the next frame. */
+  /*
+   * Viewer hotkeys:
+   *  - D: one-shot dump of next frame to /tmp/dx9mt_frame_dump.txt
+   *  - C: toggle continuous frame capture to DX9MT_CAPTURE_DIR
+   *  - X: stop continuous capture
+   */
   [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
                                         handler:^NSEvent *(NSEvent *event) {
-    if ([[event charactersIgnoringModifiers] isEqualToString:@"d"]) {
+    NSString *key = [[event charactersIgnoringModifiers] lowercaseString];
+    if ([key isEqualToString:@"d"]) {
       s_dump_next_frame = 1;
       fprintf(stderr,
               "dx9mt_metal_viewer: frame dump requested (next frame)\n");
+    } else if ([key isEqualToString:@"c"]) {
+      if (s_capture_session.active) {
+        dx9mt_capture_stop("hotkey-toggle");
+      } else {
+        (void)dx9mt_capture_start();
+      }
+    } else if ([key isEqualToString:@"x"]) {
+      if (s_capture_session.active) {
+        dx9mt_capture_stop("hotkey-stop");
+      } else {
+        fprintf(stderr, "dx9mt_metal_viewer: capture is not active\n");
+      }
     }
     return event;
   }];
@@ -2560,8 +3005,10 @@ static void render_frame(const volatile unsigned char *slot_base) {
 - (void)pollAndRender {
   const volatile dx9mt_metal_ipc_global_header *ghdr =
       (const volatile dx9mt_metal_ipc_global_header *)_ipc_base;
+  uint64_t now_ms = dx9mt_now_ms();
   uint32_t seq = __atomic_load_n(&ghdr->sequence, __ATOMIC_ACQUIRE);
   if (seq == _last_seq || seq == 0) {
+    dx9mt_capture_check_idle(now_ms);
     return;
   }
   _last_seq = seq;
@@ -2584,12 +3031,14 @@ static void render_frame(const volatile unsigned char *slot_base) {
     dump_frame(slot_base);
   }
 
+  dx9mt_capture_record_frame(seq, slot_base);
   render_frame(slot_base);
 }
 
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
   (void)notification;
+  dx9mt_capture_stop("application-terminate");
   [_timer invalidate];
   _timer = nil;
 }
