@@ -8,8 +8,11 @@ DX9MT_DLL := $(DX9MT_DIR)/build/d3d9.dll
 FNV_DIR := $(WINEPREFIX)/drive_c/Games/GOG Fallout New Vegas/Fallout New Vegas
 
 DX9MT_OUTPUT_DIR ?= $(CURDIR)/dx9mt-output
-DX9MT_RUNTIME_LOG ?= $(DX9MT_OUTPUT_DIR)/dx9mt_runtime.log
-DX9MT_LAUNCHER_LOG ?= $(DX9MT_OUTPUT_DIR)/fnv_dx9mt_probe.log
+DX9MT_SESSION_STAMP ?= $(shell date +"%Y%m%d-%H%M%S")
+DX9MT_SESSION_DIR ?= $(DX9MT_OUTPUT_DIR)/session-$(DX9MT_SESSION_STAMP)
+DX9MT_LATEST_DIR ?= $(DX9MT_OUTPUT_DIR)/latest
+DX9MT_RUNTIME_LOG ?= $(DX9MT_LATEST_DIR)/dx9mt_runtime.log
+DX9MT_LAUNCHER_LOG ?= $(DX9MT_LATEST_DIR)/fnv_dx9mt_probe.log
 DX9MT_ANALYZE_TOP ?= 20
 
 WINEDLLOVERRIDES := dxsetup.exe=d
@@ -55,13 +58,15 @@ DX9MT_METAL_VIEWER := $(DX9MT_DIR)/build/dx9mt_metal_viewer
 run: install-dx9mt-fnv
 	@set -e; \
 	pkill -f dx9mt_metal_viewer 2>/dev/null || true; \
-	mkdir -p "$(DX9MT_OUTPUT_DIR)"; \
+	mkdir -p "$(DX9MT_OUTPUT_DIR)" "$(DX9MT_SESSION_DIR)"; \
+	ln -sfn "$(DX9MT_SESSION_DIR)" "$(DX9MT_LATEST_DIR)"; \
 	: > "$(DX9MT_RUNTIME_LOG)"; \
+	echo "Session output dir: $(DX9MT_SESSION_DIR)"; \
 	echo "Creating Metal IPC shared file"; \
 	dd if=/dev/zero of="$(DX9MT_METAL_IPC_FILE)" bs=1048576 count=256 >/dev/null 2>&1; \
 	if [ -x "$(DX9MT_METAL_VIEWER)" ]; then \
 		echo "Launching Metal viewer"; \
-		DX9MT_OUTPUT_DIR="$(DX9MT_OUTPUT_DIR)" "$(DX9MT_METAL_VIEWER)" &  \
+		DX9MT_OUTPUT_DIR="$(DX9MT_SESSION_DIR)" "$(DX9MT_METAL_VIEWER)" &  \
 		VIEWER_PID=$$!; \
 		echo "Metal viewer pid $$VIEWER_PID"; \
 		sleep 1; \
