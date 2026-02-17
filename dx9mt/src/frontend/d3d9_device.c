@@ -268,6 +268,12 @@ struct dx9mt_device {
   WINBOOL vs_const_b[DX9MT_MAX_SHADER_BOOL_CONSTANTS];
   WINBOOL ps_const_b[DX9MT_MAX_SHADER_BOOL_CONSTANTS];
 
+  /* Dirty tracking for shader constants -- avoid re-uploading when unchanged */
+  WINBOOL vs_const_dirty;
+  WINBOOL ps_const_dirty;
+  dx9mt_upload_ref vs_const_last_ref;
+  dx9mt_upload_ref ps_const_last_ref;
+
   dx9mt_swapchain *swapchain;
 };
 
@@ -4135,6 +4141,11 @@ static HRESULT WINAPI dx9mt_device_Present(IDirect3DDevice9 *iface,
   }
 
   ++self->frame_id;
+  /* Invalidate cached constant refs -- arena slot rotates per frame */
+  memset(&self->vs_const_last_ref, 0, sizeof(self->vs_const_last_ref));
+  memset(&self->ps_const_last_ref, 0, sizeof(self->ps_const_last_ref));
+  self->vs_const_dirty = TRUE;
+  self->ps_const_dirty = TRUE;
   return hr;
 }
 
@@ -5185,10 +5196,18 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
   packet.texture_stage_hash = dx9mt_hash_texture_stage_state(self);
   packet.sampler_state_hash = dx9mt_hash_sampler_state(self);
   packet.stream_binding_hash = dx9mt_hash_stream_bindings(self);
-  packet.constants_vs = dx9mt_frontend_upload_copy(
-      self->frame_id, &self->vs_const_f[0][0], DX9MT_DRAW_SHADER_CONSTANT_BYTES);
-  packet.constants_ps = dx9mt_frontend_upload_copy(
-      self->frame_id, &self->ps_const_f[0][0], DX9MT_DRAW_SHADER_CONSTANT_BYTES);
+  if (self->vs_const_dirty || self->vs_const_last_ref.size == 0) {
+    self->vs_const_last_ref = dx9mt_frontend_upload_copy(
+        self->frame_id, &self->vs_const_f[0][0], DX9MT_DRAW_SHADER_CONSTANT_BYTES);
+    self->vs_const_dirty = FALSE;
+  }
+  packet.constants_vs = self->vs_const_last_ref;
+  if (self->ps_const_dirty || self->ps_const_last_ref.size == 0) {
+    self->ps_const_last_ref = dx9mt_frontend_upload_copy(
+        self->frame_id, &self->ps_const_f[0][0], DX9MT_DRAW_SHADER_CONSTANT_BYTES);
+    self->ps_const_dirty = FALSE;
+  }
+  packet.constants_ps = self->ps_const_last_ref;
 
   /* RB3 Phase 3: shader bytecode for translation */
   {
@@ -5368,6 +5387,7 @@ static HRESULT WINAPI dx9mt_device_SetVertexShaderConstantF(
   }
 
   memcpy(&self->vs_const_f[reg_idx][0], data, count * sizeof(self->vs_const_f[0]));
+  self->vs_const_dirty = TRUE;
   return D3D_OK;
 }
 
@@ -5560,6 +5580,7 @@ static HRESULT WINAPI dx9mt_device_SetPixelShaderConstantF(
   }
 
   memcpy(&self->ps_const_f[reg_idx][0], data, count * sizeof(self->ps_const_f[0]));
+  self->ps_const_dirty = TRUE;
   return D3D_OK;
 }
 

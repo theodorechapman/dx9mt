@@ -167,6 +167,8 @@ typedef struct dx9mt_d3d_vertex_element {
 #pragma pack(pop)
 
 static volatile int s_dump_next_frame = 0;
+static volatile int s_dump_continuous = 0;
+static uint32_t s_dump_seq = 0;
 
 static id<MTLDevice> s_device;
 static id<MTLCommandQueue> s_queue;
@@ -1797,7 +1799,8 @@ static id<MTLRenderPipelineState> create_translated_pso(
   return pso;
 }
 
-static void dump_frame(const volatile unsigned char *ipc_base) {
+static void dump_frame_to(const volatile unsigned char *ipc_base,
+                          const char *path) {
   const volatile dx9mt_metal_ipc_header *hdr =
       (const volatile dx9mt_metal_ipc_header *)ipc_base;
   const volatile dx9mt_metal_ipc_draw *draws =
@@ -1806,9 +1809,9 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
   uint32_t bulk_off = hdr->bulk_data_offset;
   uint32_t draw_count = hdr->draw_count;
 
-  FILE *f = fopen("/tmp/dx9mt_frame_dump.txt", "w");
+  FILE *f = fopen(path, "w");
   if (!f) {
-    fprintf(stderr, "dx9mt_metal_viewer: cannot open dump file\n");
+    fprintf(stderr, "dx9mt_metal_viewer: cannot open dump file %s\n", path);
     return;
   }
 
@@ -2003,8 +2006,12 @@ static void dump_frame(const volatile unsigned char *ipc_base) {
   }
 
   fclose(f);
-  fprintf(stderr, "dx9mt_metal_viewer: frame dump written to "
-                  "/tmp/dx9mt_frame_dump.txt (%u draws)\n", draw_count);
+  fprintf(stderr, "dx9mt_metal_viewer: frame dump written to %s (%u draws)\n",
+          path, draw_count);
+}
+
+static void dump_frame(const volatile unsigned char *ipc_base) {
+  dump_frame_to(ipc_base, "/tmp/dx9mt_frame_dump.txt");
 }
 
 static void render_frame(const volatile unsigned char *ipc_base) {
@@ -2623,6 +2630,19 @@ static void render_frame(const volatile unsigned char *ipc_base) {
       s_dump_next_frame = 1;
       fprintf(stderr,
               "dx9mt_metal_viewer: frame dump requested (next frame)\n");
+    } else if ([[event charactersIgnoringModifiers] isEqualToString:@"f"]) {
+      if (s_dump_continuous) {
+        s_dump_continuous = 0;
+        fprintf(stderr,
+                "dx9mt_metal_viewer: continuous dump OFF (%u frames captured)\n",
+                s_dump_seq);
+      } else {
+        s_dump_seq = 0;
+        s_dump_continuous = 1;
+        fprintf(stderr,
+                "dx9mt_metal_viewer: continuous dump ON "
+                "(writing to /tmp/dx9mt_frame_dump_NNNN.txt)\n");
+      }
     }
     return event;
   }];
@@ -2646,6 +2666,11 @@ static void render_frame(const volatile unsigned char *ipc_base) {
   if (s_dump_next_frame) {
     s_dump_next_frame = 0;
     dump_frame(_ipc_base);
+  }
+  if (s_dump_continuous) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/dx9mt_frame_dump_%04u.txt", s_dump_seq++);
+    dump_frame_to(_ipc_base, path);
   }
 
   render_frame(_ipc_base);

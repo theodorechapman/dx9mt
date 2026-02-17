@@ -1072,11 +1072,21 @@ int dx9mt_backend_bridge_begin_frame(uint32_t frame_id) {
                frame_id, g_last_frame_id);
   }
   g_frame_open = 1;
-  g_last_frame_id = frame_id;
-  dx9mt_backend_reset_frame_stats();
-  memset(&g_current_frame_snapshot, 0, sizeof(g_current_frame_snapshot));
-  g_current_frame_snapshot.frame_id = frame_id;
-  dx9mt_backend_reset_frame_replay_state(frame_id);
+
+  /*
+   * Only reset draw accumulation when frame_id changes. FNV (and many D3D9
+   * titles) call BeginScene/EndScene multiple times per visual frame for
+   * multi-pass rendering (shadow maps, scene, post-process, HUD). All passes
+   * share the same frame_id, so we accumulate draws across all passes and
+   * only flush on Present.
+   */
+  if (frame_id != g_last_frame_id) {
+    dx9mt_backend_reset_frame_stats();
+    memset(&g_current_frame_snapshot, 0, sizeof(g_current_frame_snapshot));
+    g_current_frame_snapshot.frame_id = frame_id;
+    dx9mt_backend_reset_frame_replay_state(frame_id);
+    g_last_frame_id = frame_id;
+  }
 
   if (dx9mt_backend_should_log_frame(frame_id)) {
     dx9mt_logf("backend", "begin_frame=%u", frame_id);

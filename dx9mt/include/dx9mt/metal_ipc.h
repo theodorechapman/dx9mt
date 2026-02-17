@@ -21,8 +21,8 @@
 #define DX9MT_METAL_IPC_MAGIC 0xDEAD9001u
 #define DX9MT_METAL_IPC_PATH "/tmp/dx9mt_metal_frame.bin"
 #define DX9MT_METAL_IPC_WIN_PATH "Z:\\tmp\\dx9mt_metal_frame.bin"
-#define DX9MT_METAL_IPC_SIZE (16u * 1024u * 1024u)
-#define DX9MT_METAL_IPC_MAX_DRAWS 256u
+#define DX9MT_METAL_IPC_SIZE (256u * 1024u * 1024u)
+#define DX9MT_METAL_IPC_MAX_DRAWS 2048u
 
 typedef struct dx9mt_metal_ipc_draw {
   uint32_t primitive_type;

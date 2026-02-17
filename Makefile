@@ -56,7 +56,7 @@ run: install-dx9mt-fnv
 	pkill -f dx9mt_metal_viewer 2>/dev/null || true; \
 	: > "$(DX9MT_RUNTIME_LOG)"; \
 	echo "Creating Metal IPC shared file"; \
-	dd if=/dev/zero of="$(DX9MT_METAL_IPC_FILE)" bs=1048576 count=16 >/dev/null 2>&1; \
+	dd if=/dev/zero of="$(DX9MT_METAL_IPC_FILE)" bs=1048576 count=256 >/dev/null 2>&1; \
 	if [ -x "$(DX9MT_METAL_VIEWER)" ]; then \
 		echo "Launching Metal viewer"; \
 		"$(DX9MT_METAL_VIEWER)" &  \
