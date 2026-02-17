@@ -1,9 +1,0 @@
-[project]
-name = "dx9mt-tools"
-version = "0.1.0"
-description = "Local tooling for dx9mt diagnostics."
-requires-python = ">=3.11"
-dependencies = []
-
-[tool.uv]
-package = false
