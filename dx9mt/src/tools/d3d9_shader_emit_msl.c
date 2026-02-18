@@ -15,8 +15,12 @@ typedef struct emit_ctx {
   int error;
   const dx9mt_sm_program *prog;
   uint32_t hash;
+  int is_vs;
+  int major_ver;
   /* Set of c# registers that have def (inline constant) values */
   int def_reg_set[256];
+  /* Sampler type per register (from DCL), default 0 = SAMP_2D */
+  uint16_t sampler_type_map[16];
 } emit_ctx;
 
 static void emit(emit_ctx *ctx, const char *fmt, ...) {
@@ -37,7 +41,7 @@ static void emit(emit_ctx *ctx, const char *fmt, ...) {
 /* ------------------------------------------------------------------ */
 
 static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
-                     int is_vs, int major_ver) {
+                     const emit_ctx *ctx) {
   switch (r->type) {
   case DX9MT_SM_REG_TEMP:
     snprintf(out, out_sz, "r%u", r->number);
@@ -50,13 +54,15 @@ static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
       const char *rc = "xyzw";
       snprintf(out, out_sz, "c[clamp(int(a0.%c) + %u, 0, 255)]",
                rc[r->relative_component], r->number);
+    } else if (r->number < 256 && ctx->def_reg_set[r->number]) {
+      snprintf(out, out_sz, "c_def_%u", r->number);
     } else {
       snprintf(out, out_sz, "c[%u]", r->number);
     }
     break;
   case DX9MT_SM_REG_ADDR:
     /* VS: a0 (address register).  PS: t# (texture coordinate input). */
-    if (is_vs)
+    if (ctx->is_vs)
       snprintf(out, out_sz, "a%u", r->number);
     else
       snprintf(out, out_sz, "in.t%u", r->number);
@@ -71,7 +77,7 @@ static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
     break;
   case DX9MT_SM_REG_OUTPUT:
     /* VS SM<3.0: oT# (texcoord output).  VS SM>=3.0: o# (generic output). */
-    if (is_vs && major_ver < 3)
+    if (ctx->is_vs && ctx->major_ver < 3)
       snprintf(out, out_sz, "out.oT%u", r->number);
     else
       snprintf(out, out_sz, "out.o%u", r->number);
@@ -92,8 +98,10 @@ static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
     snprintf(out, out_sz, "b%u", r->number);
     break;
   case DX9MT_SM_REG_MISCTYPE:
-    if (r->number == 0) snprintf(out, out_sz, "in.vpos");
-    else snprintf(out, out_sz, "in.vface");
+    if (r->number == 0)
+      snprintf(out, out_sz, "in.position");
+    else
+      snprintf(out, out_sz, "(in.front_facing ? 1.0 : -1.0)");
     break;
   default:
     snprintf(out, out_sz, "UNKNOWN%u_%u", r->type, r->number);
@@ -144,15 +152,25 @@ static int mask_count(uint8_t mask) {
   return c;
 }
 
+/* Return "float", "float2", "float3", or "float4" for a given component count */
+static const char *float_type_for_count(int count) {
+  switch (count) {
+  case 1:  return "float";
+  case 2:  return "float2";
+  case 3:  return "float3";
+  default: return "float4";
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Source expression with modifier and swizzle                         */
 /* ------------------------------------------------------------------ */
 
 static void src_expr(char *out, size_t out_sz, const dx9mt_sm_register *r,
-                     int is_vs, int major_ver) {
+                     const emit_ctx *ctx) {
   char base[80];
   char swiz[8];
-  reg_name(base, sizeof(base), r, is_vs, major_ver);
+  reg_name(base, sizeof(base), r, ctx);
   swizzle_str(swiz, r->swizzle);
 
   switch (r->src_modifier) {
@@ -162,11 +180,17 @@ static void src_expr(char *out, size_t out_sz, const dx9mt_sm_register *r,
   case DX9MT_SM_SRCMOD_NEGATE:
     snprintf(out, out_sz, "(-%s%s)", base, swiz);
     break;
-  case DX9MT_SM_SRCMOD_ABS:
-    snprintf(out, out_sz, "abs(%s%s)", base, swiz);
+  case DX9MT_SM_SRCMOD_BIAS:
+    snprintf(out, out_sz, "(%s%s - 0.5)", base, swiz);
     break;
-  case DX9MT_SM_SRCMOD_ABS_NEG:
-    snprintf(out, out_sz, "(-abs(%s%s))", base, swiz);
+  case DX9MT_SM_SRCMOD_BIAS_NEG:
+    snprintf(out, out_sz, "(-(%s%s - 0.5))", base, swiz);
+    break;
+  case DX9MT_SM_SRCMOD_SIGN:
+    snprintf(out, out_sz, "(2.0 * (%s%s - 0.5))", base, swiz);
+    break;
+  case DX9MT_SM_SRCMOD_SIGN_NEG:
+    snprintf(out, out_sz, "-(2.0 * (%s%s - 0.5))", base, swiz);
     break;
   case DX9MT_SM_SRCMOD_COMPLEMENT:
     snprintf(out, out_sz, "(1.0 - %s%s)", base, swiz);
@@ -177,14 +201,22 @@ static void src_expr(char *out, size_t out_sz, const dx9mt_sm_register *r,
   case DX9MT_SM_SRCMOD_X2_NEG:
     snprintf(out, out_sz, "(-%s%s * 2.0)", base, swiz);
     break;
-  case DX9MT_SM_SRCMOD_BIAS:
-    snprintf(out, out_sz, "(%s%s - 0.5)", base, swiz);
+  case DX9MT_SM_SRCMOD_DZ:
+    snprintf(out, out_sz, "(%s%s / %s.z)", base, swiz, base);
     break;
-  case DX9MT_SM_SRCMOD_BIAS_NEG:
-    snprintf(out, out_sz, "(-(%s%s - 0.5))", base, swiz);
+  case DX9MT_SM_SRCMOD_DW:
+    snprintf(out, out_sz, "(%s%s / %s.w)", base, swiz, base);
+    break;
+  case DX9MT_SM_SRCMOD_ABS:
+    snprintf(out, out_sz, "abs(%s%s)", base, swiz);
+    break;
+  case DX9MT_SM_SRCMOD_ABS_NEG:
+    snprintf(out, out_sz, "(-abs(%s%s))", base, swiz);
+    break;
+  case DX9MT_SM_SRCMOD_NOT:
+    snprintf(out, out_sz, "(1.0 - %s%s)", base, swiz);
     break;
   default:
-    /* Fallback: just use raw value */
     snprintf(out, out_sz, "%s%s", base, swiz);
     break;
   }
@@ -206,8 +238,7 @@ static const char *comparison_op_str(uint8_t cmp) {
 /* Instruction emission                                                */
 /* ------------------------------------------------------------------ */
 
-static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
-                             int is_vs, int major_ver) {
+static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
   char dst[80], wm[8];
   char s0[128], s1[128], s2[128];
   char rhs[512];
@@ -223,13 +254,13 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
   }
 
   if (has_dst) {
-    reg_name(dst, sizeof(dst), &inst->dst, is_vs, major_ver);
+    reg_name(dst, sizeof(dst), &inst->dst, ctx);
     wmask_str(wm, inst->dst.write_mask);
   }
 
   for (int i = 0; i < inst->num_sources && i < 3; ++i) {
     char *tgt = (i == 0) ? s0 : (i == 1) ? s1 : s2;
-    src_expr(tgt, 128, &inst->src[i], is_vs, major_ver);
+    src_expr(tgt, 128, &inst->src[i], ctx);
   }
 
   int do_sat = (has_dst && (inst->dst.result_modifier & DX9MT_SM_RMOD_SATURATE));
@@ -286,13 +317,19 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     snprintf(rhs, sizeof(rhs), "max(%s, %s)", s0, s1);
     break;
 
-  case DX9MT_SM_OP_SLT:
-    snprintf(rhs, sizeof(rhs), "select(float4(0.0), float4(1.0), (%s < %s))", s0, s1);
+  case DX9MT_SM_OP_SLT: {
+    int mc = mask_count(inst->dst.write_mask);
+    const char *ft = float_type_for_count(mc);
+    snprintf(rhs, sizeof(rhs), "select(%s(0.0), %s(1.0), (%s < %s))", ft, ft, s0, s1);
     break;
+  }
 
-  case DX9MT_SM_OP_SGE:
-    snprintf(rhs, sizeof(rhs), "select(float4(0.0), float4(1.0), (%s >= %s))", s0, s1);
+  case DX9MT_SM_OP_SGE: {
+    int mc = mask_count(inst->dst.write_mask);
+    const char *ft = float_type_for_count(mc);
+    snprintf(rhs, sizeof(rhs), "select(%s(0.0), %s(1.0), (%s >= %s))", ft, ft, s0, s1);
     break;
+  }
 
   case DX9MT_SM_OP_EXP:
     snprintf(rhs, sizeof(rhs), "exp2(%s.x)", s0);
@@ -324,11 +361,14 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     snprintf(rhs, sizeof(rhs), "mix(%s, %s, %s)", s2, s1, s0);
     break;
 
-  case DX9MT_SM_OP_CMP:
+  case DX9MT_SM_OP_CMP: {
     /* cmp dst, src0, src1, src2: per-component (src0 >= 0) ? src1 : src2 */
+    int mc = mask_count(inst->dst.write_mask);
+    const char *ft = float_type_for_count(mc);
     snprintf(rhs, sizeof(rhs),
-             "select(%s, %s, %s >= float4(0.0))", s2, s1, s0);
+             "select(%s, %s, %s >= %s(0.0))", s2, s1, s0, ft);
     break;
+  }
 
   case DX9MT_SM_OP_POW:
     snprintf(rhs, sizeof(rhs), "pow(abs(%s.x), %s.x)", s0, s1);
@@ -382,7 +422,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
   case DX9MT_SM_OP_M4x4: {
     /* m4x4 dst, src0, src1: dst.x = dp4(src0, c[src1+0]) ... */
     char base_c[80];
-    reg_name(base_c, sizeof(base_c), &inst->src[1], is_vs, major_ver);
+    reg_name(base_c, sizeof(base_c), &inst->src[1], ctx);
     /* src1 is a const register, we need c[n], c[n+1], c[n+2], c[n+3] */
     uint16_t cn = inst->src[1].number;
     emit(ctx, "  { // m4x4\n");
@@ -462,9 +502,14 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     /* texld dst, coord, sampler */
     uint16_t samp_num = inst->src[1].number;
     char coord_expr[128];
-    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], is_vs, major_ver);
-    snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s.xy)",
-             samp_num, samp_num, coord_expr);
+    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], ctx);
+    const char *coord_swiz = ".xy";
+    if (samp_num < 16 &&
+        (ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_CUBE ||
+         ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_VOLUME))
+      coord_swiz = ".xyz";
+    snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s%s)",
+             samp_num, samp_num, coord_expr, coord_swiz);
     break;
   }
 
@@ -472,9 +517,14 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
     /* texldl dst, coord, sampler: coord.w = LOD */
     uint16_t samp_num = inst->src[1].number;
     char coord_expr[128];
-    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], is_vs, major_ver);
-    snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s.xy, level(%s.w))",
-             samp_num, samp_num, coord_expr, coord_expr);
+    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], ctx);
+    const char *coord_swiz = ".xy";
+    if (samp_num < 16 &&
+        (ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_CUBE ||
+         ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_VOLUME))
+      coord_swiz = ".xyz";
+    snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s%s, level(%s.w))",
+             samp_num, samp_num, coord_expr, coord_swiz, coord_expr);
     break;
   }
 
@@ -484,8 +534,8 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
 
   case DX9MT_SM_OP_IFC: {
     char s0e[128], s1e[128];
-    src_expr(s0e, sizeof(s0e), &inst->src[0], is_vs, major_ver);
-    src_expr(s1e, sizeof(s1e), &inst->src[1], is_vs, major_ver);
+    src_expr(s0e, sizeof(s0e), &inst->src[0], ctx);
+    src_expr(s1e, sizeof(s1e), &inst->src[1], ctx);
     emit(ctx, "  if (%s.x %s %s.x) {\n",
          s0e, comparison_op_str(inst->comparison), s1e);
     return;
@@ -493,7 +543,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
 
   case DX9MT_SM_OP_IF: {
     char s0e[128];
-    src_expr(s0e, sizeof(s0e), &inst->src[0], is_vs, major_ver);
+    src_expr(s0e, sizeof(s0e), &inst->src[0], ctx);
     emit(ctx, "  if (%s.x != 0.0) {\n", s0e);
     return;
   }
@@ -508,7 +558,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
 
   case DX9MT_SM_OP_REP: {
     char s0e[128];
-    src_expr(s0e, sizeof(s0e), &inst->src[0], is_vs, major_ver);
+    src_expr(s0e, sizeof(s0e), &inst->src[0], ctx);
     emit(ctx, "  for (int rep_i = 0; rep_i < int(%s.x); rep_i++) {\n", s0e);
     return;
   }
@@ -523,8 +573,8 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst,
 
   case DX9MT_SM_OP_BREAKC: {
     char s0e[128], s1e[128];
-    src_expr(s0e, sizeof(s0e), &inst->src[0], is_vs, major_ver);
-    src_expr(s1e, sizeof(s1e), &inst->src[1], is_vs, major_ver);
+    src_expr(s0e, sizeof(s0e), &inst->src[0], ctx);
+    src_expr(s1e, sizeof(s1e), &inst->src[1], ctx);
     emit(ctx, "  if (%s.x %s %s.x) break;\n",
          s0e, comparison_op_str(inst->comparison), s1e);
     return;
@@ -632,6 +682,8 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   ctx.cap = DX9MT_MSL_MAX_SOURCE;
   ctx.prog = prog;
   ctx.hash = bytecode_hash;
+  ctx.is_vs = 1;
+  ctx.major_ver = prog->major_version;
 
   /* Mark which c# registers have def values */
   for (uint32_t i = 0; i < prog->def_count; ++i) {
@@ -732,7 +784,9 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   for (uint32_t i = 0; i < prog->def_count; ++i) {
     const dx9mt_sm_def_entry *d = &prog->defs[i];
     if (d->reg_type == DX9MT_SM_REG_CONST) {
-      emit(&ctx, "  // def c%u overridden by inline constant\n", d->reg_number);
+      emit(&ctx, "  float4 c_def_%u = float4(%.9g, %.9g, %.9g, %.9g);\n",
+           d->reg_number, d->values.f[0], d->values.f[1],
+           d->values.f[2], d->values.f[3]);
     } else if (d->reg_type == DX9MT_SM_REG_CONSTINT) {
       emit(&ctx, "  float4 i%u = float4(%d.0, %d.0, %d.0, %d.0);\n",
            d->reg_number, d->values.i[0], d->values.i[1],
@@ -749,7 +803,7 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
 
   /* Emit instructions */
   for (uint32_t i = 0; i < prog->instruction_count; ++i) {
-    emit_instruction(&ctx, &prog->instructions[i], 1, prog->major_version);
+    emit_instruction(&ctx, &prog->instructions[i]);
   }
 
   emit(&ctx, "\n  return out;\n");
@@ -786,11 +840,21 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   ctx.cap = DX9MT_MSL_MAX_SOURCE;
   ctx.prog = prog;
   ctx.hash = bytecode_hash;
+  ctx.is_vs = 0;
+  ctx.major_ver = prog->major_version;
 
   for (uint32_t i = 0; i < prog->def_count; ++i) {
     if (prog->defs[i].reg_type == DX9MT_SM_REG_CONST &&
         prog->defs[i].reg_number < 256) {
       ctx.def_reg_set[prog->defs[i].reg_number] = 1;
+    }
+  }
+
+  /* Build sampler type map from DCL entries */
+  for (uint32_t i = 0; i < prog->dcl_count; ++i) {
+    const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
+    if (d->reg_type == DX9MT_SM_REG_SAMPLER && d->reg_number < 16) {
+      ctx.sampler_type_map[d->reg_number] = d->sampler_type;
     }
   }
 
@@ -830,17 +894,37 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
          d->reg_number, d->reg_number);
   }
 
-  /* vPos if used */
+  /* vPos/vFace if used */
   for (uint32_t i = 0; i < prog->dcl_count; ++i) {
-    if (prog->dcls[i].reg_type == DX9MT_SM_REG_MISCTYPE &&
-        prog->dcls[i].reg_number == 0) {
-      emit(&ctx, "  // vPos mapped to position\n");
+    if (prog->dcls[i].reg_type == DX9MT_SM_REG_MISCTYPE) {
+      if (prog->dcls[i].reg_number == 0) {
+        emit(&ctx, "  // vPos mapped to position\n");
+      } else if (prog->dcls[i].reg_number == 1) {
+        emit(&ctx, "  bool front_facing [[front_facing]];\n");
+      }
     }
   }
   emit(&ctx, "};\n\n");
 
+  int needs_output_struct = (prog->num_color_outputs > 1 || prog->writes_depth);
+
+  /* PS output struct for MRT or depth output */
+  if (needs_output_struct) {
+    emit(&ctx, "struct PS_Out_%08x {\n", bytecode_hash);
+    for (int i = 0; i < prog->num_color_outputs; ++i) {
+      emit(&ctx, "  float4 color%d [[color(%d)]];\n", i, i);
+    }
+    if (prog->writes_depth) {
+      emit(&ctx, "  float depth [[depth(any)]];\n");
+    }
+    emit(&ctx, "};\n\n");
+  }
+
   /* Fragment function */
-  emit(&ctx, "fragment float4 %s(\n", out->entry_name);
+  if (needs_output_struct)
+    emit(&ctx, "fragment PS_Out_%08x %s(\n", bytecode_hash, out->entry_name);
+  else
+    emit(&ctx, "fragment float4 %s(\n", out->entry_name);
   emit(&ctx, "    PS_In_%08x in [[stage_in]]", bytecode_hash);
 
   /* Texture and sampler arguments */
@@ -865,12 +949,9 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
     emit(&ctx, "  float4 r%u = float4(0.0);\n", i);
   }
 
-  /* Output color register */
-  emit(&ctx, "  float4 oC0 = float4(0.0);\n");
-  if (prog->num_color_outputs > 1) {
-    for (int i = 1; i < prog->num_color_outputs; ++i) {
-      emit(&ctx, "  float4 oC%d = float4(0.0);\n", i);
-    }
+  /* Output color registers */
+  for (int i = 0; i < prog->num_color_outputs || i < 1; ++i) {
+    emit(&ctx, "  float4 oC%d = float4(0.0);\n", i);
   }
   if (prog->writes_depth) {
     emit(&ctx, "  float oDepth = 0.0;\n");
@@ -880,7 +961,9 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   for (uint32_t i = 0; i < prog->def_count; ++i) {
     const dx9mt_sm_def_entry *d = &prog->defs[i];
     if (d->reg_type == DX9MT_SM_REG_CONST) {
-      emit(&ctx, "  // def c%u overridden by inline constant\n", d->reg_number);
+      emit(&ctx, "  float4 c_def_%u = float4(%.9g, %.9g, %.9g, %.9g);\n",
+           d->reg_number, d->values.f[0], d->values.f[1],
+           d->values.f[2], d->values.f[3]);
     } else if (d->reg_type == DX9MT_SM_REG_CONSTINT) {
       emit(&ctx, "  float4 i%u = float4(%d.0, %d.0, %d.0, %d.0);\n",
            d->reg_number, d->values.i[0], d->values.i[1],
@@ -895,10 +978,22 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
 
   /* Emit instructions */
   for (uint32_t i = 0; i < prog->instruction_count; ++i) {
-    emit_instruction(&ctx, &prog->instructions[i], 0, prog->major_version);
+    emit_instruction(&ctx, &prog->instructions[i]);
   }
 
-  emit(&ctx, "\n  return oC0;\n");
+  /* Return */
+  if (needs_output_struct) {
+    emit(&ctx, "\n  PS_Out_%08x ps_out;\n", bytecode_hash);
+    for (int i = 0; i < prog->num_color_outputs; ++i) {
+      emit(&ctx, "  ps_out.color%d = oC%d;\n", i, i);
+    }
+    if (prog->writes_depth) {
+      emit(&ctx, "  ps_out.depth = oDepth;\n");
+    }
+    emit(&ctx, "  return ps_out;\n");
+  } else {
+    emit(&ctx, "\n  return oC0;\n");
+  }
   emit(&ctx, "}\n");
 
   if (ctx.error) {
