@@ -2386,19 +2386,28 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         [encoder setViewport:vp];
       }
 
-      /* Scissor rect */
-      if (d->rs_scissortestenable &&
-          d->scissor_right > d->scissor_left &&
-          d->scissor_bottom > d->scissor_top) {
+      /* Scissor rect — Metal always applies the scissor, so we must
+       * explicitly reset to full render target when D3D9 scissor test is
+       * disabled, otherwise a previous draw's scissor rect leaks through. */
+      {
         uint32_t rt_w = target_is_drawable ? s_width : d->render_target_width;
         uint32_t rt_h = target_is_drawable ? s_height : d->render_target_height;
         MTLScissorRect sr;
-        sr.x = (NSUInteger)d->scissor_left;
-        sr.y = (NSUInteger)d->scissor_top;
-        sr.width = (NSUInteger)(d->scissor_right - d->scissor_left);
-        sr.height = (NSUInteger)(d->scissor_bottom - d->scissor_top);
-        if (sr.x + sr.width > rt_w) sr.width = rt_w - sr.x;
-        if (sr.y + sr.height > rt_h) sr.height = rt_h - sr.y;
+        if (d->rs_scissortestenable &&
+            d->scissor_right > d->scissor_left &&
+            d->scissor_bottom > d->scissor_top) {
+          sr.x = (NSUInteger)d->scissor_left;
+          sr.y = (NSUInteger)d->scissor_top;
+          sr.width = (NSUInteger)(d->scissor_right - d->scissor_left);
+          sr.height = (NSUInteger)(d->scissor_bottom - d->scissor_top);
+          if (sr.x + sr.width > rt_w) sr.width = rt_w - sr.x;
+          if (sr.y + sr.height > rt_h) sr.height = rt_h - sr.y;
+        } else {
+          sr.x = 0;
+          sr.y = 0;
+          sr.width = rt_w;
+          sr.height = rt_h;
+        }
         [encoder setScissorRect:sr];
       }
 
