@@ -4,7 +4,7 @@ A DirectX 9 to Metal translation layer for running **Fallout: New Vegas** native
 
 <table>
 <tr>
-<td align="center" width="50%"><strong>dx9mt (Metal)</strong></td>
+<td align="center" width="50%"><strong>dx9mt (Metal, rendering perfectly)</strong></td>
 <td align="center" width="50%"><strong>Original (DirectX 9)</strong></td>
 </tr>
 <tr>
