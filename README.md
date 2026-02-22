@@ -4,12 +4,12 @@ A DirectX 9 to Metal translation layer for running **Fallout: New Vegas** native
 
 <table>
 <tr>
-<td align="center"><strong>dx9mt (Metal)</strong></td>
-<td align="center"><strong>Original (DirectX 9)</strong></td>
+<td align="center" width="50%"><strong>dx9mt (Metal)</strong></td>
+<td align="center" width="50%"><strong>Original (DirectX 9)</strong></td>
 </tr>
 <tr>
-<td><img src="assets/images/current_state.png" width="100%"></td>
-<td><img src="assets/images/fnv_main_menu_actual.jpg" width="100%"></td>
+<td width="50%"><img src="assets/images/current_state.png" width="100%"></td>
+<td width="50%"><img src="assets/images/fnv_main_menu_actual.jpg" width="100%"></td>
 </tr>
 </table>
 
@@ -95,4 +95,4 @@ See [`docs/architecture.md`](docs/architecture.md) for full details.
 
 ## License
 
-This project is not yet licensed. All rights reserved.
+MIT License
