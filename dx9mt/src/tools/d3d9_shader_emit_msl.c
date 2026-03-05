@@ -21,7 +21,13 @@ typedef struct emit_ctx {
   int def_reg_set[256];
   /* Sampler type per register (from DCL), default 0 = SAMP_2D */
   uint16_t sampler_type_map[16];
+  uint8_t input_reg_width[32];
+  uint8_t addr_reg_width[32];
 } emit_ctx;
+
+#define DX9MT_MSL_NAME_BUFSZ 128
+#define DX9MT_MSL_EXPR_BUFSZ 512
+#define DX9MT_MSL_RHS_BUFSZ 4096
 
 static void emit(emit_ctx *ctx, const char *fmt, ...) {
   if (ctx->error) return;
@@ -39,6 +45,22 @@ static void emit(emit_ctx *ctx, const char *fmt, ...) {
 /* ------------------------------------------------------------------ */
 /* Register name emission                                              */
 /* ------------------------------------------------------------------ */
+
+static const dx9mt_sm_dcl_entry *
+find_output_dcl(const emit_ctx *ctx, uint16_t reg_number) {
+  if (!ctx || !ctx->prog) {
+    return NULL;
+  }
+
+  for (uint32_t i = 0; i < ctx->prog->dcl_count; ++i) {
+    const dx9mt_sm_dcl_entry *d = &ctx->prog->dcls[i];
+    if (d->reg_type == DX9MT_SM_REG_OUTPUT && d->reg_number == reg_number) {
+      return d;
+    }
+  }
+
+  return NULL;
+}
 
 static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
                      const emit_ctx *ctx) {
@@ -77,10 +99,18 @@ static void reg_name(char *out, size_t out_sz, const dx9mt_sm_register *r,
     break;
   case DX9MT_SM_REG_OUTPUT:
     /* VS SM<3.0: oT# (texcoord output).  VS SM>=3.0: o# (generic output). */
-    if (ctx->is_vs && ctx->major_ver < 3)
+    if (ctx->is_vs && ctx->major_ver < 3) {
       snprintf(out, out_sz, "out.oT%u", r->number);
-    else
+    } else if (ctx->is_vs && ctx->major_ver >= 3) {
+      const dx9mt_sm_dcl_entry *d = find_output_dcl(ctx, r->number);
+      if (d && d->usage == DX9MT_SM_USAGE_POSITION && d->usage_index == 0) {
+        snprintf(out, out_sz, "out.position");
+      } else {
+        snprintf(out, out_sz, "out.o%u", r->number);
+      }
+    } else {
       snprintf(out, out_sz, "out.o%u", r->number);
+    }
     break;
   case DX9MT_SM_REG_COLOROUT:
     snprintf(out, out_sz, "oC%u", r->number);
@@ -162,64 +192,160 @@ static const char *float_type_for_count(int count) {
   }
 }
 
+static const char *zero_literal_for_count(int count) {
+  switch (count) {
+  case 1:  return "0.0";
+  case 2:  return "float2(0.0)";
+  case 3:  return "float3(0.0)";
+  default: return "float4(0.0)";
+  }
+}
+
+static int dst_width_for_reg(const dx9mt_sm_register *r) {
+  int width;
+
+  if (!r) {
+    return 4;
+  }
+  if (r->type == DX9MT_SM_REG_DEPTHOUT) {
+    return 1;
+  }
+
+  width = mask_count(r->write_mask);
+  return width > 0 ? width : 4;
+}
+
+static uint8_t reg_available_width(const emit_ctx *ctx,
+                                   const dx9mt_sm_register *r) {
+  if (!ctx || !r) {
+    return 4;
+  }
+
+  switch (r->type) {
+  case DX9MT_SM_REG_INPUT:
+    if (r->number < 32 && ctx->input_reg_width[r->number] != 0)
+      return ctx->input_reg_width[r->number];
+    break;
+  case DX9MT_SM_REG_ADDR:
+    if (!ctx->is_vs && r->number < 32 && ctx->addr_reg_width[r->number] != 0)
+      return ctx->addr_reg_width[r->number];
+    break;
+  default:
+    break;
+  }
+  return 4;
+}
+
 /* ------------------------------------------------------------------ */
 /* Source expression with modifier and swizzle                         */
 /* ------------------------------------------------------------------ */
 
-static void src_expr(char *out, size_t out_sz, const dx9mt_sm_register *r,
-                     const emit_ctx *ctx) {
-  char base[80];
-  char swiz[8];
+static void reg_component_expr(char *out, size_t out_sz,
+                               const dx9mt_sm_register *r,
+                               const emit_ctx *ctx, uint8_t component) {
+  char base[DX9MT_MSL_NAME_BUFSZ];
+  uint8_t available_width;
   reg_name(base, sizeof(base), r, ctx);
-  swizzle_str(swiz, r->swizzle);
+  available_width = reg_available_width(ctx, r);
+
+  if (r->type == DX9MT_SM_REG_MISCTYPE && r->number == 1) {
+    snprintf(out, out_sz, "%s", base);
+  } else if (component >= available_width) {
+    snprintf(out, out_sz, "0.0");
+  } else {
+    snprintf(out, out_sz, "%s.%c", base, s_comp[component & 3u]);
+  }
+}
+
+static void src_component_expr(char *out, size_t out_sz,
+                               const dx9mt_sm_register *r,
+                               const emit_ctx *ctx, uint8_t swizzle_index) {
+  char comp_expr[DX9MT_MSL_EXPR_BUFSZ];
+  char base[DX9MT_MSL_NAME_BUFSZ];
+
+  reg_name(base, sizeof(base), r, ctx);
+  reg_component_expr(comp_expr, sizeof(comp_expr), r, ctx,
+                     r->swizzle[swizzle_index & 3u]);
 
   switch (r->src_modifier) {
   case DX9MT_SM_SRCMOD_NONE:
-    snprintf(out, out_sz, "%s%s", base, swiz);
+    snprintf(out, out_sz, "%s", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_NEGATE:
-    snprintf(out, out_sz, "(-%s%s)", base, swiz);
+    snprintf(out, out_sz, "(-%s)", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_BIAS:
-    snprintf(out, out_sz, "(%s%s - 0.5)", base, swiz);
+    snprintf(out, out_sz, "(%s - 0.5)", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_BIAS_NEG:
-    snprintf(out, out_sz, "(-(%s%s - 0.5))", base, swiz);
+    snprintf(out, out_sz, "(-(%s - 0.5))", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_SIGN:
-    snprintf(out, out_sz, "(2.0 * (%s%s - 0.5))", base, swiz);
+    snprintf(out, out_sz, "(2.0 * (%s - 0.5))", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_SIGN_NEG:
-    snprintf(out, out_sz, "-(2.0 * (%s%s - 0.5))", base, swiz);
+    snprintf(out, out_sz, "-(2.0 * (%s - 0.5))", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_COMPLEMENT:
-    snprintf(out, out_sz, "(1.0 - %s%s)", base, swiz);
+    snprintf(out, out_sz, "(1.0 - %s)", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_X2:
-    snprintf(out, out_sz, "(%s%s * 2.0)", base, swiz);
+    snprintf(out, out_sz, "(%s * 2.0)", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_X2_NEG:
-    snprintf(out, out_sz, "(-%s%s * 2.0)", base, swiz);
+    snprintf(out, out_sz, "(-%s * 2.0)", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_DZ:
-    snprintf(out, out_sz, "(%s%s / %s.z)", base, swiz, base);
+    snprintf(out, out_sz, "(%s / %s.z)", comp_expr, base);
     break;
   case DX9MT_SM_SRCMOD_DW:
-    snprintf(out, out_sz, "(%s%s / %s.w)", base, swiz, base);
+    snprintf(out, out_sz, "(%s / %s.w)", comp_expr, base);
     break;
   case DX9MT_SM_SRCMOD_ABS:
-    snprintf(out, out_sz, "abs(%s%s)", base, swiz);
+    snprintf(out, out_sz, "abs(%s)", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_ABS_NEG:
-    snprintf(out, out_sz, "(-abs(%s%s))", base, swiz);
+    snprintf(out, out_sz, "(-abs(%s))", comp_expr);
     break;
   case DX9MT_SM_SRCMOD_NOT:
-    snprintf(out, out_sz, "(1.0 - %s%s)", base, swiz);
+    snprintf(out, out_sz, "(1.0 - %s)", comp_expr);
     break;
   default:
-    snprintf(out, out_sz, "%s%s", base, swiz);
+    snprintf(out, out_sz, "%s", comp_expr);
     break;
   }
+}
+
+static void src_expr_width(char *out, size_t out_sz, const dx9mt_sm_register *r,
+                           const emit_ctx *ctx, int width) {
+  char c0[DX9MT_MSL_EXPR_BUFSZ], c1[DX9MT_MSL_EXPR_BUFSZ];
+  char c2[DX9MT_MSL_EXPR_BUFSZ], c3[DX9MT_MSL_EXPR_BUFSZ];
+
+  if (width <= 1) {
+    src_component_expr(out, out_sz, r, ctx, 0);
+    return;
+  }
+
+  src_component_expr(c0, sizeof(c0), r, ctx, 0);
+  src_component_expr(c1, sizeof(c1), r, ctx, 1);
+  if (width == 2) {
+    snprintf(out, out_sz, "float2(%s, %s)", c0, c1);
+    return;
+  }
+
+  src_component_expr(c2, sizeof(c2), r, ctx, 2);
+  if (width == 3) {
+    snprintf(out, out_sz, "float3(%s, %s, %s)", c0, c1, c2);
+    return;
+  }
+
+  src_component_expr(c3, sizeof(c3), r, ctx, 3);
+  snprintf(out, out_sz, "float4(%s, %s, %s, %s)", c0, c1, c2, c3);
+}
+
+static void src_expr(char *out, size_t out_sz, const dx9mt_sm_register *r,
+                     const emit_ctx *ctx) {
+  src_expr_width(out, out_sz, r, ctx, 4);
 }
 
 static const char *comparison_op_str(uint8_t cmp) {
@@ -234,15 +360,39 @@ static const char *comparison_op_str(uint8_t cmp) {
   }
 }
 
+static void semantic_user_name(char *out, size_t out_sz,
+                               const dx9mt_sm_dcl_entry *d) {
+  const char *uname = "attr";
+
+  if (!d) {
+    snprintf(out, out_sz, "attr0");
+    return;
+  }
+
+  if (d->usage == DX9MT_SM_USAGE_TEXCOORD) uname = "texcoord";
+  else if (d->usage == DX9MT_SM_USAGE_COLOR) uname = "color";
+  else if (d->usage == DX9MT_SM_USAGE_NORMAL) uname = "normal";
+  else if (d->usage == DX9MT_SM_USAGE_FOG) uname = "fog";
+  else if (d->usage == DX9MT_SM_USAGE_POSITION) uname = "position";
+  else if (d->usage == DX9MT_SM_USAGE_TANGENT) uname = "tangent";
+  else if (d->usage == DX9MT_SM_USAGE_BINORMAL) uname = "binormal";
+  else if (d->usage == DX9MT_SM_USAGE_BLENDWEIGHT) uname = "blendweight";
+  else if (d->usage == DX9MT_SM_USAGE_BLENDINDICES) uname = "blendindices";
+
+  snprintf(out, out_sz, "%s%u", uname, d->usage_index);
+}
+
 /* ------------------------------------------------------------------ */
 /* Instruction emission                                                */
 /* ------------------------------------------------------------------ */
 
 static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
-  char dst[80], wm[8];
-  char s0[128], s1[128], s2[128];
-  char rhs[512];
+  char dst[DX9MT_MSL_NAME_BUFSZ], wm[8];
+  char s0[DX9MT_MSL_EXPR_BUFSZ], s1[DX9MT_MSL_EXPR_BUFSZ];
+  char s2[DX9MT_MSL_EXPR_BUFSZ];
+  char rhs[DX9MT_MSL_RHS_BUFSZ];
   int rhs_is_scalar = 0;
+  int dst_width = 4;
 
   int has_dst = 1;
   switch (inst->opcode) {
@@ -256,6 +406,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
   if (has_dst) {
     reg_name(dst, sizeof(dst), &inst->dst, ctx);
     wmask_str(wm, inst->dst.write_mask);
+    dst_width = dst_width_for_reg(&inst->dst);
   }
 
   for (int i = 0; i < inst->num_sources && i < 3; ++i) {
@@ -270,56 +421,85 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
     return;
 
   case DX9MT_SM_OP_MOV:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s", s0);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_ADD:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s + %s", s0, s1);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_SUB:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s - %s", s0, s1);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_MUL:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s * %s", s0, s1);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_MAD:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
+    src_expr_width(s2, sizeof(s2), &inst->src[2], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s * %s + %s", s0, s1, s2);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_DP3:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 3);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, 3);
     snprintf(rhs, sizeof(rhs), "dot(%s.xyz, %s.xyz)", s0, s1);
     rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_DP4:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 4);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, 4);
     snprintf(rhs, sizeof(rhs), "dot(%s, %s)", s0, s1);
     rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_RCP:
-    snprintf(rhs, sizeof(rhs), "(1.0 / %s.x)", s0);
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 1);
+    snprintf(rhs, sizeof(rhs), "(1.0 / %s)", s0);
     rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_RSQ:
-    snprintf(rhs, sizeof(rhs), "rsqrt(abs(%s.x))", s0);
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 1);
+    snprintf(rhs, sizeof(rhs), "rsqrt(abs(%s))", s0);
     rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_MIN:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "min(%s, %s)", s0, s1);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_MAX:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "max(%s, %s)", s0, s1);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_SLT: {
     int mc = mask_count(inst->dst.write_mask);
     const char *ft = float_type_for_count(mc);
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, mc);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, mc);
     snprintf(rhs, sizeof(rhs), "select(%s(0.0), %s(1.0), (%s < %s))", ft, ft, s0, s1);
     break;
   }
@@ -327,64 +507,96 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
   case DX9MT_SM_OP_SGE: {
     int mc = mask_count(inst->dst.write_mask);
     const char *ft = float_type_for_count(mc);
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, mc);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, mc);
     snprintf(rhs, sizeof(rhs), "select(%s(0.0), %s(1.0), (%s >= %s))", ft, ft, s0, s1);
     break;
   }
 
   case DX9MT_SM_OP_EXP:
-    snprintf(rhs, sizeof(rhs), "exp2(%s.x)", s0);
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 1);
+    snprintf(rhs, sizeof(rhs), "exp2(%s)", s0);
     rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_LOG:
-    snprintf(rhs, sizeof(rhs), "log2(abs(%s.x))", s0);
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 1);
+    snprintf(rhs, sizeof(rhs), "log2(abs(%s))", s0);
     rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_FRC:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "fract(%s)", s0);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_ABS:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "abs(%s)", s0);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_NRM: {
     /* nrm dst, src: normalize xyz, w = 1/length */
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 3);
     snprintf(rhs, sizeof(rhs),
-             "float4(normalize(%s.xyz), rsqrt(dot(%s.xyz, %s.xyz)))", s0, s0, s0);
+             "float4(normalize(%s), rsqrt(dot(%s, %s)))", s0, s0, s0);
     break;
   }
 
   case DX9MT_SM_OP_LRP:
     /* lrp dst, f, a, b = mix(b, a, f) = f*(a-b)+b */
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
+    src_expr_width(s2, sizeof(s2), &inst->src[2], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "mix(%s, %s, %s)", s2, s1, s0);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_CMP: {
     /* cmp dst, src0, src1, src2: per-component (src0 >= 0) ? src1 : src2 */
     int mc = mask_count(inst->dst.write_mask);
     const char *ft = float_type_for_count(mc);
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, mc);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, mc);
+    src_expr_width(s2, sizeof(s2), &inst->src[2], ctx, mc);
     snprintf(rhs, sizeof(rhs),
              "select(%s, %s, %s >= %s(0.0))", s2, s1, s0, ft);
     break;
   }
 
   case DX9MT_SM_OP_POW:
-    snprintf(rhs, sizeof(rhs), "pow(abs(%s.x), %s.x)", s0, s1);
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 1);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, 1);
+    snprintf(rhs, sizeof(rhs), "pow(abs(%s), %s)", s0, s1);
     rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_CRS:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 3);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, 3);
     snprintf(rhs, sizeof(rhs),
-             "float4(cross(%s.xyz, %s.xyz), 0.0)", s0, s1);
+             "float4(cross(%s, %s), 0.0)", s0, s1);
     break;
 
-  case DX9MT_SM_OP_SINCOS:
-    /* sincos dst, src: dst.x = cos(src.x), dst.y = sin(src.x) */
-    snprintf(rhs, sizeof(rhs),
-             "float4(cos(%s.x), sin(%s.x), 0.0, 0.0)", s0, s0);
-    break;
+  case DX9MT_SM_OP_SINCOS: {
+    char scalar[DX9MT_MSL_EXPR_BUFSZ];
+    src_expr_width(scalar, sizeof(scalar), &inst->src[0], ctx, 1);
+    if (inst->dst.write_mask & 1) {
+      emit(ctx, "  %s.x = cos(%s);\n", dst, scalar);
+    }
+    if (inst->dst.write_mask & 2) {
+      emit(ctx, "  %s.y = sin(%s);\n", dst, scalar);
+    }
+    if (inst->dst.write_mask & 4) {
+      emit(ctx, "  %s.z = 0.0;\n", dst);
+    }
+    if (inst->dst.write_mask & 8) {
+      emit(ctx, "  %s.w = 0.0;\n", dst);
+    }
+    return;
+  }
 
   case DX9MT_SM_OP_LIT: {
     /* lit dst, src: standard D3D9 lit computation */
@@ -404,24 +616,42 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
 
   case DX9MT_SM_OP_DST:
     /* dst dst, src0, src1: (1, src0.y*src1.y, src0.z, src1.w) */
-    snprintf(rhs, sizeof(rhs),
-             "float4(1.0, %s.y * %s.y, %s.z, %s.w)", s0, s1, s0, s1);
+    src_component_expr(s0, sizeof(s0), &inst->src[0], ctx, 1);
+    src_component_expr(s1, sizeof(s1), &inst->src[1], ctx, 1);
+    {
+      char s0z[DX9MT_MSL_EXPR_BUFSZ], s1w[DX9MT_MSL_EXPR_BUFSZ];
+      src_component_expr(s0z, sizeof(s0z), &inst->src[0], ctx, 2);
+      src_component_expr(s1w, sizeof(s1w), &inst->src[1], ctx, 3);
+      snprintf(rhs, sizeof(rhs),
+               "float4(1.0, %s * %s, %s, %s)", s0, s1, s0z, s1w);
+    }
     break;
 
   case DX9MT_SM_OP_DP2ADD:
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 2);
+    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, 2);
+    src_expr_width(s2, sizeof(s2), &inst->src[2], ctx, 1);
     snprintf(rhs, sizeof(rhs),
-             "(dot(%s.xy, %s.xy) + %s.x)", s0, s1, s2);
+             "(dot(%s, %s) + %s)", s0, s1, s2);
     rhs_is_scalar = 1;
     break;
 
   case DX9MT_SM_OP_MOVA:
     /* mova a0, src: integer part of src -> address register */
-    snprintf(rhs, sizeof(rhs), "float4(floor(%s + float4(0.5)))", s0);
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx,
+                   dst_width == 1 ? 1 : dst_width);
+    if (dst_width == 1) {
+      snprintf(rhs, sizeof(rhs), "floor(%s + 0.5)", s0);
+      rhs_is_scalar = 1;
+    } else {
+      snprintf(rhs, sizeof(rhs), "floor(%s + %s(0.5))", s0,
+               float_type_for_count(dst_width));
+    }
     break;
 
   case DX9MT_SM_OP_M4x4: {
     /* m4x4 dst, src0, src1: dst.x = dp4(src0, c[src1+0]) ... */
-    char base_c[80];
+    char base_c[DX9MT_MSL_NAME_BUFSZ];
     reg_name(base_c, sizeof(base_c), &inst->src[1], ctx);
     /* src1 is a const register, we need c[n], c[n+1], c[n+2], c[n+3] */
     uint16_t cn = inst->src[1].number;
@@ -501,30 +731,36 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
   case DX9MT_SM_OP_TEXLD: {
     /* texld dst, coord, sampler */
     uint16_t samp_num = inst->src[1].number;
-    char coord_expr[128];
-    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], ctx);
-    const char *coord_swiz = ".xy";
+    char coord_expr[DX9MT_MSL_EXPR_BUFSZ];
+    int coord_width = 2;
     if (samp_num < 16 &&
         (ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_CUBE ||
-         ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_VOLUME))
-      coord_swiz = ".xyz";
-    snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s%s)",
-             samp_num, samp_num, coord_expr, coord_swiz);
+         ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_VOLUME)) {
+      coord_width = 3;
+    }
+    src_expr_width(coord_expr, sizeof(coord_expr), &inst->src[0], ctx,
+                   coord_width);
+    snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s)",
+             samp_num, samp_num, coord_expr);
     break;
   }
 
   case DX9MT_SM_OP_TEXLDL: {
     /* texldl dst, coord, sampler: coord.w = LOD */
     uint16_t samp_num = inst->src[1].number;
-    char coord_expr[128];
-    src_expr(coord_expr, sizeof(coord_expr), &inst->src[0], ctx);
-    const char *coord_swiz = ".xy";
+    char coord_expr[DX9MT_MSL_EXPR_BUFSZ];
+    char lod_expr[DX9MT_MSL_EXPR_BUFSZ];
+    int coord_width = 2;
     if (samp_num < 16 &&
         (ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_CUBE ||
-         ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_VOLUME))
-      coord_swiz = ".xyz";
-    snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s%s, level(%s.w))",
-             samp_num, samp_num, coord_expr, coord_swiz, coord_expr);
+         ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_VOLUME)) {
+      coord_width = 3;
+    }
+    src_expr_width(coord_expr, sizeof(coord_expr), &inst->src[0], ctx,
+                   coord_width);
+    src_component_expr(lod_expr, sizeof(lod_expr), &inst->src[0], ctx, 3);
+    snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s, level(%s))",
+             samp_num, samp_num, coord_expr, lod_expr);
     break;
   }
 
@@ -533,18 +769,18 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
     return;
 
   case DX9MT_SM_OP_IFC: {
-    char s0e[128], s1e[128];
-    src_expr(s0e, sizeof(s0e), &inst->src[0], ctx);
-    src_expr(s1e, sizeof(s1e), &inst->src[1], ctx);
-    emit(ctx, "  if (%s.x %s %s.x) {\n",
+    char s0e[DX9MT_MSL_EXPR_BUFSZ], s1e[DX9MT_MSL_EXPR_BUFSZ];
+    src_expr_width(s0e, sizeof(s0e), &inst->src[0], ctx, 1);
+    src_expr_width(s1e, sizeof(s1e), &inst->src[1], ctx, 1);
+    emit(ctx, "  if (%s %s %s) {\n",
          s0e, comparison_op_str(inst->comparison), s1e);
     return;
   }
 
   case DX9MT_SM_OP_IF: {
-    char s0e[128];
-    src_expr(s0e, sizeof(s0e), &inst->src[0], ctx);
-    emit(ctx, "  if (%s.x != 0.0) {\n", s0e);
+    char s0e[DX9MT_MSL_EXPR_BUFSZ];
+    src_expr_width(s0e, sizeof(s0e), &inst->src[0], ctx, 1);
+    emit(ctx, "  if (%s != 0.0) {\n", s0e);
     return;
   }
 
@@ -557,9 +793,9 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
     return;
 
   case DX9MT_SM_OP_REP: {
-    char s0e[128];
-    src_expr(s0e, sizeof(s0e), &inst->src[0], ctx);
-    emit(ctx, "  for (int rep_i = 0; rep_i < int(%s.x); rep_i++) {\n", s0e);
+    char s0e[DX9MT_MSL_EXPR_BUFSZ];
+    src_expr_width(s0e, sizeof(s0e), &inst->src[0], ctx, 1);
+    emit(ctx, "  for (int rep_i = 0; rep_i < int(%s); rep_i++) {\n", s0e);
     return;
   }
 
@@ -572,17 +808,19 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
     return;
 
   case DX9MT_SM_OP_BREAKC: {
-    char s0e[128], s1e[128];
-    src_expr(s0e, sizeof(s0e), &inst->src[0], ctx);
-    src_expr(s1e, sizeof(s1e), &inst->src[1], ctx);
-    emit(ctx, "  if (%s.x %s %s.x) break;\n",
+    char s0e[DX9MT_MSL_EXPR_BUFSZ], s1e[DX9MT_MSL_EXPR_BUFSZ];
+    src_expr_width(s0e, sizeof(s0e), &inst->src[0], ctx, 1);
+    src_expr_width(s1e, sizeof(s1e), &inst->src[1], ctx, 1);
+    emit(ctx, "  if (%s %s %s) break;\n",
          s0e, comparison_op_str(inst->comparison), s1e);
     return;
   }
 
   case DX9MT_SM_OP_SGN:
     /* sgn dst, src0, src1(scratch), src2(scratch) -- only src0 matters */
+    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "sign(%s)", s0);
+    rhs_is_scalar = (dst_width == 1);
     break;
 
   default:
@@ -593,9 +831,9 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
   /* Broadcast scalar RHS to match destination width when needed.
    * Single-component write mask: scalar is fine.
    * Multi-component: need floatN() wrapper so types match. */
-  char final_rhs[560];
+  char final_rhs[DX9MT_MSL_RHS_BUFSZ];
   if (rhs_is_scalar && has_dst) {
-    int mc = mask_count(inst->dst.write_mask);
+    int mc = dst_width;
     if (mc == 1)
       snprintf(final_rhs, sizeof(final_rhs), "%s", rhs);
     else if (mc == 2)
@@ -611,8 +849,8 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
   /* Truncate vector RHS to match write-mask width when needed.
    * E.g. dst.xy = float4_val → dst.xy = (float4_val).xy
    * Scalar RHS (from replicate swizzle) broadcasts naturally in MSL. */
-  if (!rhs_is_scalar && has_dst && inst->dst.write_mask != 0xF) {
-    int mc = mask_count(inst->dst.write_mask);
+  if (!rhs_is_scalar && has_dst && dst_width < 4) {
+    int mc = dst_width;
     int rhs_width = 4;
     if (inst->num_sources == 1) {
       const uint8_t *sw = inst->src[0].swizzle;
@@ -631,7 +869,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
     }
     if (mc < rhs_width) {
       static const char *trunc_swiz[] = {"", ".x", ".xy", ".xyz", ""};
-      char tmp[600];
+      char tmp[DX9MT_MSL_RHS_BUFSZ];
       snprintf(tmp, sizeof(tmp), "(%s)%s", final_rhs, trunc_swiz[mc]);
       snprintf(final_rhs, sizeof(final_rhs), "%s", tmp);
     }
@@ -654,10 +892,16 @@ static int usage_to_attr_idx(uint8_t usage, uint8_t usage_index) {
   if (usage == DX9MT_SM_USAGE_COLOR && usage_index == 0) return 1;
   if (usage == DX9MT_SM_USAGE_TEXCOORD && usage_index == 0) return 2;
   if (usage == DX9MT_SM_USAGE_NORMAL && usage_index == 0) return 3;
-  if (usage == DX9MT_SM_USAGE_TEXCOORD && usage_index == 1) return 4;
-  if (usage == DX9MT_SM_USAGE_COLOR && usage_index == 1) return 5;
+  if (usage == DX9MT_SM_USAGE_TANGENT && usage_index == 0) return 4;
+  if (usage == DX9MT_SM_USAGE_BINORMAL && usage_index == 0) return 5;
   if (usage == DX9MT_SM_USAGE_BLENDWEIGHT && usage_index == 0) return 6;
   if (usage == DX9MT_SM_USAGE_BLENDINDICES && usage_index == 0) return 7;
+  if (usage == DX9MT_SM_USAGE_TEXCOORD && usage_index == 1) return 8;
+  if (usage == DX9MT_SM_USAGE_COLOR && usage_index == 1) return 9;
+  if (usage == DX9MT_SM_USAGE_TEXCOORD && usage_index == 2) return 10;
+  if (usage == DX9MT_SM_USAGE_TEXCOORD && usage_index == 3) return 11;
+  if (usage == DX9MT_SM_USAGE_TEXCOORD && usage_index == 4) return 12;
+  if (usage == DX9MT_SM_USAGE_TEXCOORD && usage_index == 5) return 13;
   return -1; /* unmapped */
 }
 
@@ -690,6 +934,17 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
     if (prog->defs[i].reg_type == DX9MT_SM_REG_CONST &&
         prog->defs[i].reg_number < 256) {
       ctx.def_reg_set[prog->defs[i].reg_number] = 1;
+    }
+  }
+
+  for (uint32_t i = 0; i < prog->dcl_count; ++i) {
+    const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
+    uint8_t width = (uint8_t)mask_count(d->write_mask);
+    if (width == 0) width = 4;
+    if (d->reg_type == DX9MT_SM_REG_INPUT && d->reg_number < 32) {
+      ctx.input_reg_width[d->reg_number] = width;
+    } else if (d->reg_type == DX9MT_SM_REG_ADDR && d->reg_number < 32) {
+      ctx.addr_reg_width[d->reg_number] = width;
     }
   }
 
@@ -728,21 +983,13 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
       if (d->reg_type != DX9MT_SM_REG_OUTPUT) continue;
       /* Skip position (already emitted above) */
       if (d->usage == DX9MT_SM_USAGE_POSITION && d->usage_index == 0) continue;
-
-      int mc = mask_count(d->write_mask);
       const char *type = "float4";
-      if (mc == 1) type = "float";
-      else if (mc == 2) type = "float2";
-      else if (mc == 3) type = "float3";
 
-      const char *uname = "attr";
-      if (d->usage == DX9MT_SM_USAGE_TEXCOORD) uname = "texcoord";
-      else if (d->usage == DX9MT_SM_USAGE_COLOR) uname = "color";
-      else if (d->usage == DX9MT_SM_USAGE_NORMAL) uname = "normal";
-      else if (d->usage == DX9MT_SM_USAGE_FOG) uname = "fog";
-
-      emit(&ctx, "  %s o%u [[user(%s%u)]];\n", type, d->reg_number,
-           uname, d->usage_index);
+      {
+        char uname[64];
+        semantic_user_name(uname, sizeof(uname), d);
+        emit(&ctx, "  %s o%u [[user(%s)]];\n", type, d->reg_number, uname);
+      }
     }
   } else {
     /* VS 1.x/2.x: oD# (color) and oT# (texcoord) outputs */
@@ -797,8 +1044,36 @@ int dx9mt_msl_emit_vs(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
     }
   }
 
+  for (uint32_t i = 0; i < prog->dcl_count; ++i) {
+    const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
+    uint8_t width = (uint8_t)mask_count(d->write_mask);
+    if (width == 0) width = 4;
+    if (d->reg_type == DX9MT_SM_REG_INPUT && d->reg_number < 32) {
+      ctx.input_reg_width[d->reg_number] = width;
+    } else if (d->reg_type == DX9MT_SM_REG_ADDR && d->reg_number < 32) {
+      ctx.addr_reg_width[d->reg_number] = width;
+    }
+  }
+
   emit(&ctx, "  VS_Out_%08x out;\n", bytecode_hash);
   emit(&ctx, "  out.position = float4(0.0);\n");
+  if (prog->major_version >= 3) {
+    for (uint32_t i = 0; i < prog->dcl_count; ++i) {
+      const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
+      if (d->reg_type != DX9MT_SM_REG_OUTPUT) continue;
+      if (d->usage == DX9MT_SM_USAGE_POSITION && d->usage_index == 0) continue;
+      emit(&ctx, "  out.o%u = float4(0.0);\n", d->reg_number);
+    }
+  } else {
+    for (int i = 0; i < 2; ++i) {
+      if (prog->color_output_mask & (1u << i))
+        emit(&ctx, "  out.oD%d = float4(0.0);\n", i);
+    }
+    for (int i = 0; i < 8; ++i) {
+      if (prog->output_mask & (1u << i))
+        emit(&ctx, "  out.oT%d = float4(0.0);\n", i);
+    }
+  }
   emit(&ctx, "\n");
 
   /* Emit instructions */
@@ -865,33 +1140,27 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   emit(&ctx, "struct PS_In_%08x {\n", bytecode_hash);
   emit(&ctx, "  float4 position [[position]];\n");
 
-  /* PS 3.0: v# inputs with dcl semantics */
+  /* PS inputs. For PS 1.x/2.x, DCL semantics on inputs are not reliable;
+   * link by fixed-function register role instead:
+   *   v# -> color#
+   *   t# -> texcoord#
+   */
   for (uint32_t i = 0; i < prog->dcl_count; ++i) {
     const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
-    if (d->reg_type != DX9MT_SM_REG_INPUT) continue;
-
-    int mc = mask_count(d->write_mask);
-    const char *type = "float4";
-    if (mc == 1) type = "float";
-    else if (mc == 2) type = "float2";
-    else if (mc == 3) type = "float3";
-
-    const char *uname = "attr";
-    if (d->usage == DX9MT_SM_USAGE_TEXCOORD) uname = "texcoord";
-    else if (d->usage == DX9MT_SM_USAGE_COLOR) uname = "color";
-    else if (d->usage == DX9MT_SM_USAGE_NORMAL) uname = "normal";
-    else if (d->usage == DX9MT_SM_USAGE_FOG) uname = "fog";
-
-    emit(&ctx, "  %s v%u [[user(%s%u)]];\n", type, d->reg_number,
-         uname, d->usage_index);
-  }
-
-  /* PS 1.x/2.x: t# texture coordinate inputs (register type ADDR/TEXTURE = 3) */
-  for (uint32_t i = 0; i < prog->dcl_count; ++i) {
-    const dx9mt_sm_dcl_entry *d = &prog->dcls[i];
-    if (d->reg_type != DX9MT_SM_REG_ADDR) continue;
-    emit(&ctx, "  float4 t%u [[user(texcoord%u)]];\n",
-         d->reg_number, d->reg_number);
+    if (prog->major_version < 3) {
+      if (d->reg_type == DX9MT_SM_REG_INPUT) {
+        emit(&ctx, "  float4 v%u [[user(color%u)]];\n", d->reg_number,
+             d->reg_number);
+      } else if (d->reg_type == DX9MT_SM_REG_ADDR) {
+        emit(&ctx, "  float4 t%u [[user(texcoord%u)]];\n", d->reg_number,
+             d->reg_number);
+      }
+    } else if (d->reg_type == DX9MT_SM_REG_INPUT) {
+      const char *type = "float4";
+      char uname[64];
+      semantic_user_name(uname, sizeof(uname), d);
+      emit(&ctx, "  %s v%u [[user(%s)]];\n", type, d->reg_number, uname);
+    }
   }
 
   /* vPos/vFace if used */

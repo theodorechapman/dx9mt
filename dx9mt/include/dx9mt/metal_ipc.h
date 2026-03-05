@@ -24,7 +24,13 @@
 #define DX9MT_METAL_IPC_SIZE (256u * 1024u * 1024u)
 #define DX9MT_METAL_IPC_MAX_DRAWS 2048u
 
+enum dx9mt_metal_ipc_command_type {
+  DX9MT_METAL_IPC_COMMAND_DRAW = 0,
+  DX9MT_METAL_IPC_COMMAND_STRETCH_RECT = 1,
+};
+
 typedef struct dx9mt_metal_ipc_draw {
+  uint32_t command_type;
   uint32_t primitive_type;
   int32_t base_vertex;
   uint32_t min_vertex_index;
@@ -36,6 +42,20 @@ typedef struct dx9mt_metal_ipc_draw {
   uint32_t render_target_width;
   uint32_t render_target_height;
   uint32_t render_target_format;
+  uint32_t src_surface_id;
+  uint32_t src_texture_id;
+  uint32_t src_width;
+  uint32_t src_height;
+  uint32_t src_format;
+  int32_t src_left;
+  int32_t src_top;
+  int32_t src_right;
+  int32_t src_bottom;
+  int32_t dst_left;
+  int32_t dst_top;
+  int32_t dst_right;
+  int32_t dst_bottom;
+  uint32_t stretch_filter;
 
   uint32_t viewport_x;
   uint32_t viewport_y;

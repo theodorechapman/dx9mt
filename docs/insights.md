@@ -35,6 +35,10 @@ Hard-won lessons, common mistakes, and non-obvious behaviors. Read this before m
 - Even unchanged textures get periodically re-uploaded every 60 frames via `(frame_id + object_id) % 60 == 0`. This handles cases where GPU memory pressure or Wine translation might corrupt texture data.
 - Texture `sysmem` is the Lock target — it's a CPU-side copy. The upload arena copy is what the backend/viewer actually reads.
 - Only stage 0 is fully supported in the fixed-function TSS combiner path in the viewer. Stages 1-7 have texture data forwarded but the combiner ignores them.
+- A missing texture in the viewer is not automatically a frontend failure:
+  - The frontend may intentionally send `upload_size == 0` when the texture generation is unchanged and it is not time for the periodic refresh.
+  - If the viewer has not already cached that texture (or bound it as an RT override), the draw will still fail.
+  - The frontend now logs these cases through `dx9mt/texdiag` so you can distinguish "not dirty" from "no sysmem copy" or "upload copy failed".
 
 ## Shader Translation
 
@@ -42,6 +46,11 @@ Hard-won lessons, common mistakes, and non-obvious behaviors. Read this before m
 - The MSL emitter produces up to 32KB of source per shader. If exceeded, it silently truncates — this hasn't been hit with FNV shaders but could be an issue with modded content.
 - Attribute index mapping (POSITION→0, COLOR0→1, TEXCOORD0→2, etc.) must match between the MSL emitter and the viewer's vertex descriptor builder. These are hardcoded in both places.
 - `dx9mt_sm_parse()` handles SM 1.0 through 3.0 but some SM 3.0 features (predication, gradient instructions) are parsed but not fully translated to MSL.
+- Recent real-world failures showed three concrete translator/interface bugs:
+  - Some generated fragment inputs reused the same `[[user(attrN)]]` semantic name more than once.
+  - Some generated expressions fed `select()` with mismatched vector/scalar widths.
+  - Some translated vertex shaders expected inputs (for example `v1`) that were not declared in the emitted input struct because the D3D declaration/semantic mapping was incomplete.
+- Shader failures are now persisted as `dx9mt_shader_fail_*.txt` and PSO interface failures as `dx9mt_pso_fail_*.txt` in the session output directory.
 
 ## IPC Shared Memory
 
@@ -62,6 +71,25 @@ Hard-won lessons, common mistakes, and non-obvious behaviors. Read this before m
 - `DX9MT_BACKEND_TRACE_PACKETS=1` logs every packet received by the backend.
 - The viewer supports keyboard-triggered frame dumps ('D' key) that write draw state + raw texture data to the session output directory.
 - The replay hash (visible as the overlay bar color in the viewer) changes whenever frame content changes. If the hash is stable, the game is rendering the same content.
+- The most useful current logs are:
+  - `dx9mt_runtime.log`: frontend/backend packet flow, RT lifecycle (`dx9mt/rttrace`), and texture upload skip reasons (`dx9mt/texdiag`)
+  - `dx9mt_viewer.log`: viewer draw skips, render-target format failures, shader compile failures, and per-frame cohort summaries
+  - `dx9mt_shader_fail_*.txt` / `dx9mt_pso_fail_*.txt`: one-file reproductions for unique shader or PSO failures
+
+## Current Investigation Results
+
+- The initial blank-world symptom is not a crash or `Present()` failure. The clear color and HUD can still reach the drawable.
+- The dominant blocker identified so far is unsupported HDR render-target replay:
+  - FNV heavily uses render targets with format `113` (`0x71`), `D3DFMT_A16B16G16R16F`.
+  - When the viewer cannot materialize those render targets, hundreds of world draws are skipped per frame and the final scene composite never appears.
+- Additional blockers remain even after HDR RT support is added:
+  - repeated shader translation failures for several VS/PS hashes
+  - at least one repeated translated-PSO interface mismatch
+  - repeated texture cache misses for textures that arrive with metadata but no upload payload
+- A diagnostics-only viewer crash was introduced during investigation:
+  - the cohort logger originally hashed shader bytecode without validating the IPC bulk range first
+  - this caused a viewer-side `EXC_BAD_ACCESS`
+  - the crash was in the diagnostics path, not the render path, and has been fixed
 
 ## Common Mistakes
 

@@ -39,6 +39,9 @@ void dx9mt_runtime_ensure_initialized(void) {
   init_desc.ring_capacity_bytes = 1u << 20;
   init_desc.upload_desc.slot_count = DX9MT_UPLOAD_ARENA_SLOTS;
   init_desc.upload_desc.bytes_per_slot = DX9MT_UPLOAD_ARENA_BYTES_PER_SLOT;
+  dx9mt_logf("runtime", "upload arena config slots=%u bytes_per_slot=%u",
+             init_desc.upload_desc.slot_count,
+             init_desc.upload_desc.bytes_per_slot);
 
   if (dx9mt_backend_bridge_init(&init_desc) == 0) {
     dx9mt_packet_init packet;

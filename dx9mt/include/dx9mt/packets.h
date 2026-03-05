@@ -15,6 +15,7 @@ enum dx9mt_packet_type {
   DX9MT_PACKET_PRESENT = 4,
   DX9MT_PACKET_SHUTDOWN = 5,
   DX9MT_PACKET_CLEAR = 6,
+  DX9MT_PACKET_STRETCH_RECT = 7,
 };
 
 typedef struct dx9mt_packet_header {
@@ -173,6 +174,30 @@ typedef struct dx9mt_packet_clear {
   uint32_t stencil;
 } dx9mt_packet_clear;
 
+typedef struct dx9mt_packet_stretch_rect {
+  dx9mt_packet_header header;
+  uint32_t frame_id;
+  uint32_t src_surface_id;
+  uint32_t src_texture_id;
+  uint32_t src_width;
+  uint32_t src_height;
+  uint32_t src_format;
+  int32_t src_left;
+  int32_t src_top;
+  int32_t src_right;
+  int32_t src_bottom;
+  uint32_t dst_surface_id;
+  uint32_t dst_texture_id;
+  uint32_t dst_width;
+  uint32_t dst_height;
+  uint32_t dst_format;
+  int32_t dst_left;
+  int32_t dst_top;
+  int32_t dst_right;
+  int32_t dst_bottom;
+  uint32_t filter;
+} dx9mt_packet_stretch_rect;
+
 /*
  * header.size is uint16_t, so every packet struct must fit in 65535 bytes.
  * The (uint16_t)sizeof(packet) casts in the frontend silently truncate if
@@ -188,5 +213,7 @@ _Static_assert(sizeof(dx9mt_packet_present) <= UINT16_MAX,
                "packet_present exceeds uint16 size field");
 _Static_assert(sizeof(dx9mt_packet_clear) <= UINT16_MAX,
                "packet_clear exceeds uint16 size field");
+_Static_assert(sizeof(dx9mt_packet_stretch_rect) <= UINT16_MAX,
+               "packet_stretch_rect exceeds uint16 size field");
 
 #endif
