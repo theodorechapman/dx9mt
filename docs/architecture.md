@@ -1,370 +1,470 @@
 # dx9mt Architecture
 
-A DirectX 9 to Metal translation layer for running Fallout: New Vegas on macOS via Wine. Intercepts D3D9 API calls, captures all rendering state into packets, and replays them through Apple Metal for native GPU rendering.
+A Direct3D 9 to Metal translation layer for running Fallout: New Vegas on macOS
+via Wine. The frontend captures D3D9 state and bulk payloads inside Wine, a
+shared backend bridge validates and serializes that state into IPC, and a
+native Metal viewer replays the frame.
 
 ## High-Level Architecture
 
-```
-FalloutNV.exe (i686/Wine)
-    │
-    ▼
-┌─────────────────────────────────────────────┐
-│  d3d9.dll  (PE32, cross-compiled MinGW)     │
-│  "Frontend" — implements IDirect3D9 +       │
-│  IDirect3DDevice9 COM interfaces            │
-│                                             │
-│  Captures all D3D9 state into packets,      │
-│  uploads geometry/textures/constants to a   │
-│  triple-buffered upload arena               │
-└──────────────┬──────────────────────────────┘
-               │ packets + upload refs
-               ▼
-┌─────────────────────────────────────────────┐
-│  backend_bridge_stub.c  (compiled twice:    │
-│  once as PE32 for the DLL, once as ARM64    │
-│  for libdx9mt_unixlib.dylib)               │
-│                                             │
-│  Receives packets, validates, records draw  │
-│  commands, assembles frame data into IPC    │
-│  shared memory on present()                 │
-└──────────────┬──────────────────────────────┘
-               │ 256MB mmap'd file (/tmp/dx9mt_metal_frame.bin)
-               ▼
-┌─────────────────────────────────────────────┐
-│  dx9mt_metal_viewer  (native ARM64 macOS)   │
-│                                             │
-│  Polls IPC sequence number, reads frame     │
-│  draws, translates D3D9 shaders to MSL,     │
-│  renders via Metal into a native NSWindow   │
-└─────────────────────────────────────────────┘
+```text
+FalloutNV.exe (i686 / Wine)
+    |
+    v
++--------------------------------------------------+
+| d3d9.dll (PE32, MinGW)                           |
+| "Frontend"                                       |
+| - Implements IDirect3D9 and IDirect3DDevice9     |
+| - Captures draws, clears, shaders, textures      |
+| - Emits packets and upload-arena refs            |
++----------------------+---------------------------+
+                       | packets + upload refs
+                       v
++--------------------------------------------------+
+| backend_bridge_stub.c                            |
+| (compiled twice: PE32 in the DLL, ARM64 in the   |
+| dylib)                                           |
+| - Validates packets                              |
+| - Records draw and StretchRect commands          |
+| - Assembles frame IPC on Present()               |
++----------------------+---------------------------+
+                       | 256MB IPC file
+                       v
++--------------------------------------------------+
+| dx9mt_metal_viewer (native ARM64 macOS app)      |
+| - Snapshots the shared frame                     |
+| - Replays draws and StretchRect                  |
+| - Translates D3D9 shader bytecode to MSL         |
+| - Renders via Metal into an NSWindow             |
++--------------------------------------------------+
 ```
 
 ## Directory Layout
 
-```
-dx9mt/                      # Root
-├── Makefile                # Top-level: build, install DLL into Wine prefix, run FNV
-├── CLAUDE_soon.md          # Will become CLAUDE.md — workflow instructions
-├── docs/
-│   ├── architecture.md     # This file
-│   ├── insights.md         # Lessons learned, common mistakes
-│   └── rendering_findings.md # Current rendering investigation and evidence
-├── dx9mt/                  # All source code
-│   ├── Makefile            # Inner build: d3d9.dll + libdx9mt_unixlib.dylib + viewer + tests
-│   ├── include/dx9mt/      # Shared headers (frontend ↔ backend contract)
-│   ├── src/
-│   │   ├── common/         # Shared code (logging)
-│   │   ├── frontend/       # PE32 DLL sources (D3D9 API implementation)
-│   │   ├── backend/        # Bridge + Metal presenter
-│   │   └── tools/          # Shader parser, MSL emitter, Metal viewer
-│   ├── tests/              # Contract tests
-│   └── build/              # Build artifacts (gitignored)
-├── dx9mt-output/           # Runtime logs + frame dumps (gitignored)
-│   └── session-*/
-│       ├── dx9mt_runtime.log
-│       ├── dx9mt_viewer.log
-│       ├── dx9mt_frame_dump_NNNN.txt
-│       ├── dx9mt_shader_fail_*.txt
-│       ├── dx9mt_pso_fail_*.txt
-│       └── dx9mt_tex_*.raw
-└── wineprefix/             # Wine prefix with FNV installed (gitignored)
+```text
+dx9mt/                      # Repository root
+|-- Makefile                # Top-level orchestration
+|-- README.md               # Project overview and current status
+|-- docs/
+|   |-- architecture.md     # This file
+|   |-- insights.md         # Gotchas and debugging notes
+|   `-- rendering_findings.md # Current visual state and bug buckets
+|-- assets/
+|   `-- images/             # Current and historical screenshots
+|-- dx9mt/                  # Source tree
+|   |-- Makefile            # Inner build for DLL, dylib, viewer, tests
+|   |-- include/dx9mt/      # Shared headers and binary contracts
+|   |-- src/
+|   |   |-- common/         # Shared logging support
+|   |   |-- frontend/       # PE32 D3D9 implementation
+|   |   |-- backend/        # Shared bridge + in-process Metal presenter
+|   |   `-- tools/          # Shader parser/emitter + standalone viewer
+|   `-- tests/              # Native contract tests
+|-- dx9mt-output/           # Runtime logs and dump artifacts (gitignored)
+|   `-- session-*/
+|       |-- dx9mt_runtime.log
+|       |-- dx9mt_viewer.log
+|       |-- dx9mt_frame_dump*.txt
+|       |-- dx9mt_shader_fail_*.txt
+|       |-- dx9mt_pso_fail_*.txt
+|       `-- dx9mt_tex_*.raw
+`-- wineprefix/             # Wine prefix with the game installed (gitignored)
 ```
 
 ## Build System
 
-Two Makefiles:
+Two Makefiles matter:
 
-**Root Makefile** — orchestration:
-- `make run` (default): builds DLL → installs into Wine prefix → sets DLL override → launches FNV via NVSE, plus starts the Metal viewer
-- `make test`: runs native contract tests
-- `make clear`: kill viewer + wineserver
+- Root `Makefile`
+  - `make run`: build, install the DLL into the Wine prefix, launch FNV, and
+    launch the Metal viewer
+  - `make test`: run native contract tests
+  - `make clear`: stop the viewer and Wine runtime
+- `dx9mt/Makefile`
+  - Frontend: `i686-w64-mingw32-gcc` -> `build/d3d9.dll`
+  - Backend dylib: `clang` -> `build/libdx9mt_unixlib.dylib`
+  - Viewer: `clang` -> `build/dx9mt_metal_viewer`
+  - Tests: `clang -DDX9MT_NO_METAL` -> `build/backend_bridge_contract_test`
 
-**dx9mt/Makefile** — compilation:
-- Frontend: `i686-w64-mingw32-gcc` → `build/d3d9.dll` (PE32, links log.c + backend_bridge_stub.c + all frontend sources)
-- Backend: `clang` → `build/libdx9mt_unixlib.dylib` (ARM64, links log.c + backend_bridge_stub.c + metal_presenter.m)
-- Viewer: `clang` → `build/dx9mt_metal_viewer` (ARM64 Obj-C app, links metal_viewer.m + shader parser/emitter)
-- Tests: `clang -DDX9MT_NO_METAL` → `build/backend_bridge_contract_test`
+Important detail: `backend_bridge_stub.c` is compiled into both the PE32 DLL
+and the ARM64 dylib. It is shared bridge logic, not a shim with two unrelated
+implementations.
 
-Note: `backend_bridge_stub.c` is compiled into BOTH the frontend DLL and the backend dylib. This is the bridge — same code, different compilers/ABIs.
-
-## Frontend (d3d9.dll)
+## Frontend (`dx9mt/src/frontend`)
 
 ### Entry Points
 
-`dllmain.c` — DLL lifecycle:
-- `DLL_PROCESS_ATTACH`: init logging, register vectored exception handler (crash handler with BSShader NULL-return patch for FNV-specific crash)
-- `DLL_PROCESS_DETACH`: shutdown runtime
+- `dllmain.c`
+  - runtime init and shutdown
+  - logging init
+  - vectored exception handler for the FNV BSShader NULL crash
+- `d3d9.c`
+  - `Direct3DCreate9()`
+  - adapter and capability probes
+  - `CreateDevice()`
+- `d3d9_device.c`
+  - full `IDirect3DDevice9` implementation
+  - resource lifetime
+  - state tracking
+  - packet emission
 
-`d3d9.c` — IDirect3D9 implementation:
-- `Direct3DCreate9()`: creates `dx9mt_d3d9` object, returns vtable
-- Implements capability queries (GetDeviceCaps, CheckDeviceFormat, etc.) with hardcoded GTX 280–like caps
-- `CreateDevice()` → delegates to `dx9mt_device_create()`
+### Device State Model
 
-`d3d9_perf.c` — stub exports (D3DPERF_*, DebugSetMute, etc.) required by the DLL export table (`d3d9.def`)
+`dx9mt_device` tracks enough state to snapshot a draw without relying on
+incremental deltas:
 
-`d3d9_device_methods.inc` — X-macro listing all 119 IDirect3DDevice9 vtable methods
+- render states
+- sampler states
+- texture-stage states
+- render targets and depth-stencil surface
+- bound textures
+- stream bindings and strides
+- vertex declaration, shaders, and FVF
+- shader constants
+- transforms, viewport, scissor, frame ID
 
-### Device Implementation (d3d9_device.c) — ~5500 lines
+### `DrawIndexedPrimitive()` Flow
 
-The core of the frontend. Implements every IDirect3DDevice9 method.
+Each indexed draw emits a full-state packet plus upload refs for bulk payloads.
+The packet captures:
 
-**Resource types** (each has COM vtable, refcount, object_id, device backpointer):
+- primitive topology and indices
+- render target and depth-stencil IDs
+- render target dimensions, format, and linked texture ID
+- vertex declaration or FVF-derived layout
+- VB and IB upload refs
+- VS and PS bytecode upload refs
+- VS and PS constant upload refs
+- up to 8 texture stages with metadata, sampler state, and optional upload refs
+- current render states such as depth, stencil, blend, fog, cull, viewport, and
+  scissor
 
-| Type | Struct | Key Fields |
-|------|--------|------------|
-| Surface | `dx9mt_surface` | desc, lockable, sysmem buffer, pitch |
-| Texture | `dx9mt_texture` | width/height/format/levels, generation counter, surface array |
-| Vertex Buffer | `dx9mt_vertex_buffer` | desc, HeapAlloc'd data |
-| Index Buffer | `dx9mt_index_buffer` | desc, HeapAlloc'd data |
-| Vertex Decl | `dx9mt_vertex_decl` | D3DVERTEXELEMENT9 array, count |
-| Vertex Shader | `dx9mt_vertex_shader` | bytecode (DWORD*), dword_count |
-| Pixel Shader | `dx9mt_pixel_shader` | bytecode (DWORD*), dword_count |
-| Swap Chain | `dx9mt_swapchain` | params, backbuffer surface, present_count |
-| Query | `dx9mt_query` | type, data_size, issue_flags |
+### `StretchRect()` Flow
 
-**Device state tracking** (`dx9mt_device` struct):
-- `render_states[256]` — indexed by D3DRENDERSTATETYPE
-- `sampler_states[20][16]` — per-sampler state
-- `tex_stage_states[16][32]` — per-stage texture stage state
-- `render_targets[4]` + `depth_stencil` — MRT support
-- `textures[16]` — bound texture per stage
-- `streams[16]` + offsets/strides + `indices` — input assembly
-- `vertex_decl`, `vertex_shader`, `pixel_shader` — pipeline state
-- `vs_const_f[256][4]`, `ps_const_f[256][4]` — float shader constants (+ int/bool)
-- `vs_const_dirty`, `ps_const_dirty` — dirty flags to avoid redundant uploads
-- `transforms[512]` — world/view/projection matrices
-- `viewport`, `scissor_rect`, `fvf`, `frame_id`
+`StretchRect()` now emits its own packet instead of being treated as a purely
+local helper. The packet includes:
 
-**Object ID allocation**: atomic per-kind counters, format `(kind << 24) | serial`. Kinds defined in `object_ids.h`.
+- source surface and linked texture IDs
+- source dimensions and format
+- source rect
+- destination surface and linked texture IDs
+- destination dimensions and format
+- destination rect
+- filter mode
 
-### DrawIndexedPrimitive Flow
+This matters because FNV uses blits as part of the scene-composite chain.
 
-1. Build `dx9mt_packet_draw_indexed` (~800 bytes)
-2. Snapshot all current device state into the packet:
-   - Render target/depth-stencil IDs, dimensions, format
-   - Buffer/shader/decl IDs, FVF, stream config
-   - FNV-1a hashes of viewport, scissor, texture stages, samplers, streams
-   - Upload shader constants to arena (if dirty)
-   - Upload shader bytecodes to arena
-   - Upload VB/IB data to arena (full buffer each draw)
-   - Upload vertex declaration elements to arena
-   - Fill 8 texture stages: IDs, metadata, sampler states, pixel data
-   - Copy all render states (blend, alpha test, z/stencil, cull, scissor, fog)
-3. Compute state_block_hash (FNV-1a over entire packet)
-4. Submit packet to backend bridge
+### `Present()` Flow
 
-### Present Flow
+`Present()`:
 
-1. Build `dx9mt_packet_present` with frame_id + render_target_id
-2. Submit packet
-3. Call `dx9mt_backend_bridge_present(frame_id)` — synchronous
-4. Soft-present (Win32 GDI blit to window)
-5. Increment `frame_id`, rotate upload arena slot, mark constants dirty
+1. emits a `PRESENT` packet with the current frame ID and present target
+2. calls the backend bridge synchronously
+3. advances the frame ID
+4. rotates the upload-arena slot
+5. marks shader constants dirty for the next frame
+
+The frontend also samples render-target lifecycle through `dx9mt/rttrace`, which
+is now one of the fastest ways to verify whether the game is actually presenting
+the target you think it is.
 
 ### Upload Arena
 
-Triple-buffered memory region for passing bulk data (VB, IB, textures, constants, bytecode) from frontend to backend.
+Bulk data is staged through a rotating upload arena:
 
-- 3 slots × 128MB each, allocated via VirtualAlloc
-- Slot rotates each frame: `slot_index = frame_id % 3`
-- `dx9mt_frontend_upload_copy()`: memcpy data, return `dx9mt_upload_ref {arena_index, offset, size}`
-- Refs are 12-byte structs with explicit padding for cross-ABI compatibility (PE32 ↔ ARM64)
-- Backend resolves refs via `dx9mt_frontend_upload_resolve()`
+- 3 slots
+- 256 MB per slot
+- 768 MB total
+- frame N writes to slot `N % 3`
+
+Upload refs are small ABI-stable structs shared between the PE32 frontend and
+the ARM64 backend. If a copy fails because a slot is exhausted, the ref is zero
+and downstream code must treat it as missing data.
 
 ### Texture Upload Strategy
 
-- Each texture has a `generation` counter (incremented on Lock/Unlock)
-- Upload occurs when: generation changed OR periodic refresh every 60 frames
-- Refresh is deterministic: `(frame_id + object_id) % 60 == 0`
+The current policy is:
 
-## Backend Bridge (backend_bridge_stub.c) — ~1400 lines
+- upload immediately when the texture generation changes
+- upload if there has never been a successful upload
+- upload if frame tracking wrapped or regressed
+- otherwise refresh if at least 8 frames have passed since the last upload
 
-Compiled into both DLL and dylib. Receives packets, records draw commands, writes IPC.
+This is intentionally more aggressive than the earlier "every 60 frames"
+behavior because it reduces stale-texture failures during replay.
+
+## Backend Bridge (`dx9mt/src/backend/backend_bridge_stub.c`)
+
+The backend bridge owns packet validation, frame recording, and IPC assembly.
+
+### Packet Types
+
+Current packet types include:
+
+- `BEGIN_FRAME`
+- `DRAW_INDEXED`
+- `PRESENT`
+- `CLEAR`
+- `STRETCH_RECT`
 
 ### Packet Processing
 
-`dx9mt_backend_bridge_submit_packets()`:
-- Linear parse of packet buffer
-- Validates: size bounds, sequence monotonicity, state IDs, upload refs
-- Per packet type:
-  - `DRAW_INDEXED`: validates state, records into `dx9mt_backend_draw_command` array (up to 8192 per frame)
-  - `CLEAR`: stores clear color/flags/z/stencil
-  - `BEGIN_FRAME`: resets frame counters
-  - `PRESENT`: stores frame_id + render_target_id
+`dx9mt_backend_bridge_submit_packets()` performs linear packet parsing and
+validates:
 
-### Present (IPC Assembly)
+- packet sizes
+- packet sequence monotonicity
+- upload refs for geometry, constants, declarations, bytecode, and textures
+- present target metadata
 
-`dx9mt_backend_bridge_present()`:
-1. Capture frame snapshot (stats, hashes)
-2. If Metal available (macOS): call `dx9mt_metal_present()` for overlay rendering
-3. If soft-present enabled (Win32): draw debug visualization via GDI
-4. If IPC mapped: serialize all draw commands into shared memory:
-   - Write header (magic, dimensions, clear state, draw count, replay hash)
-   - Write `dx9mt_metal_ipc_draw` array
-   - Pack bulk data region (VB, IB, decl, constants, textures, bytecodes) with 16-byte alignment
-   - Atomic store sequence number with release semantics (viewer polls with acquire)
+Validated draw and blit packets are stored as backend replay commands for the
+current frame.
 
-### Frame Replay Hash
+### Frame Snapshot And Replay Hash
 
-FNV-1a hash over all draw commands' hashed state. Used by viewer to detect frame changes and for debugging.
+At `Present()`, the backend captures a small frame summary:
 
-### Environment Variables
-- `DX9MT_BACKEND_TRACE_PACKETS`: log every packet
-- `DX9MT_BACKEND_SOFT_PRESENT`: enable Win32 debug window
-- `DX9MT_BACKEND_METAL_PRESENT`: enable/disable direct Metal (default on)
+- frame ID
+- packet count
+- draw count
+- clear count
+- last clear color, flags, depth, stencil
+- last draw state hash
+- replay hash over the stored replay commands
 
-## Metal Presenter (metal_presenter.m)
+The replay hash is useful both for debugging and for the viewer overlay.
 
-Minimal Metal rendering surface used by the backend dylib directly. Creates NSWindow + CAMetalLayer, renders clear color + draw-count overlay bar. This is the "in-process" Metal path, separate from the standalone viewer.
+### IPC Assembly
 
-## Metal Viewer (metal_viewer.m) — ~2800 lines
+The backend writes:
 
-Standalone native macOS app that reads IPC shared memory and renders D3D9 frames via Metal.
+1. IPC header
+2. fixed-size draw-command array
+3. packed bulk-data region
 
-### Rendering Pipeline
+The IPC file is 256 MB and lives at `/tmp/dx9mt_metal_frame.bin`.
 
-1. **Poll**: atomic-acquire read of IPC sequence number
-2. **Per draw** (up to 2048):
-   - Load VB/IB from bulk data
-   - Build Metal vertex descriptor from D3D9 vertex declaration
-   - Route to correct render target (drawable or offscreen texture)
-   - Set viewport, scissor, cull, depth/stencil, blend state
-   - Select rendering path:
-     - **Hardcoded shaders**: embedded geo_vertex/geo_fragment with TSS combiner (stage 0 only)
-     - **Translated shaders**: parse D3D9 bytecode → MSL → compile → cache by hash
-3. **Present**: commit command buffer
+Important synchronization detail:
+
+- before mutating any IPC-visible data, the backend writes `sequence = 0`
+- after the frame is fully assembled, it publishes the real sequence with
+  release semantics
+
+That lets the viewer ignore in-progress frames.
+
+## Metal Presenter (`dx9mt/src/backend/metal_presenter.m`)
+
+The backend still has a minimal in-process Metal presenter used for debug
+overlay rendering. It is not the main replay path. The standalone viewer is the
+authoritative renderer for current bring-up work.
+
+## Metal Viewer (`dx9mt/src/tools/metal_viewer.m`)
+
+The standalone viewer is currently the most important runtime component. It is
+about 3900 lines and handles:
+
+- IPC snapshotting
+- render-target materialization
+- texture resolution
+- shader translation and Metal compilation
+- draw replay
+- `StretchRect` replay
+- diagnostics and artifact dumping
+
+### Frame Snapshot
+
+The viewer no longer renders directly from the live shared mapping. For each new
+sequence number it:
+
+1. loads the sequence with acquire semantics
+2. copies the header
+3. validates header bounds and bulk layout
+4. copies the full frame into a private snapshot buffer
+5. re-checks the sequence
+6. renders from the snapshot
+
+This prevents diagnostics and replay from racing a writer mutating the shared
+buffer underneath them.
+
+### Replay Command Types
+
+The viewer consumes two IPC command types:
+
+- draw replay
+- `StretchRect` replay
+
+`StretchRect` is implemented as a small full-screen style draw using a blit
+vertex and fragment pair plus a sampler derived from the D3D9 filter mode.
+
+### Render-Target Routing
+
+Each replay command carries:
+
+- destination render target ID
+- linked destination texture ID
+- render-target dimensions
+- render-target format
+
+The viewer routes a command either to:
+
+- the drawable texture, when the command target matches
+  `present_render_target_id`
+- or a cached offscreen Metal texture for that RT description
+
+Current important format support includes:
+
+- `A8R8G8B8`
+- `X8R8G8B8`
+- `A8`
+- `R32F`
+- `A16B16G16R16F`
+- `DXT1`, `DXT3`, `DXT5` for sampled textures
+
+`D3DFMT_A16B16G16R16F` support is what moved the project out of the earlier
+blank-world phase.
+
+### RT-To-Texture Linking
+
+When an offscreen target finishes drawing, the viewer records the resulting
+Metal texture under `render_target_texture_id`. Later passes can resolve stage
+textures from:
+
+1. RT override
+2. existing texture cache
+3. fresh IPC upload
+
+That is the mechanism that lets a later composite pass sample a previously
+rendered offscreen target.
+
+### Shader Translation Pipeline
+
+The viewer parses D3D9 bytecode, emits MSL, compiles Metal functions, and caches
+the results by bytecode hash.
+
+Current translator features and expectations:
+
+- shader model 1.x through 3.0 bytecode parsing
+- width-aware source expression emission
+- semantic-aware `[[user(...)]]` naming
+- vertex POSITION output mapped to `[[position]]`
+- translated PSOs keyed by shader hashes, declaration layout, blend state, and
+  target pixel format
+
+The viewer now treats translated bytecode as the main path. If required bytecode
+is missing or invalid, the draw is skipped. There is still a narrow compatibility
+fallback for a few known hashes, but it is intentionally limited.
+
+### State Translation
+
+For each draw, the viewer sets:
+
+- viewport
+- scissor, with explicit full-target reset when D3D9 scissor is disabled
+- depth and stencil state
+- blend state through the PSO
+- cull mode
+- vertex and fragment constants
+- stage textures and samplers
+
+Blit and overlay passes explicitly force `MTLCullModeNone`.
 
 ### Caches
 
-- Texture cache: keyed by (id, generation, format, width, height)
-- Sampler cache: keyed by (min/mag/mip filter, address modes)
-- Render target cache: keyed by (id, width, height, format)
-- Depth/stencil state cache: keyed by state bits
-- Shader function cache: keyed by bytecode hash
-- PSO cache: keyed by (VS hash, PS hash, vertex descriptor, pixel format, blend/depth state)
+Current viewer caches include:
 
-### Diagnostics and Artifacts
+- texture cache
+- texture generation table
+- RT override table
+- render-target cache
+- depth texture cache
+- sampler cache
+- shader-function caches for VS and PS
+- translated PSO cache
+- blit PSO cache
 
-The current investigation uses three log streams:
+### Diagnostics And Artifacts
+
+The current investigation relies on three output groups:
 
 - `dx9mt_runtime.log`
-  - Frontend and backend logs
-  - `dx9mt/rttrace` for render-target creation/binding/present summaries
-  - `dx9mt/texdiag` for texture upload skip reasons
+  - frontend and backend logging
+  - `rttrace`
+  - `texdiag`
 - `dx9mt_viewer.log`
-  - Viewer-side draw skip reasons, shader compile failures, RT format failures
-  - Per-frame cohort summaries grouped by RT, shader pair, and texture-stage mask
-- Failure artifacts
+  - draw skips
+  - unsupported or missing target logs
+  - texture resolution logs
+  - RT-link establishment logs
+  - per-frame diagnostics totals
+  - cohort summaries grouped by RT, shader hashes, and texture-stage mask
+- artifacts
   - `dx9mt_shader_fail_vs_<hash>.txt`
   - `dx9mt_shader_fail_ps_<hash>.txt`
   - `dx9mt_pso_fail_<key>.txt`
+  - `dx9mt_frame_dump*.txt`
 
-Each shader failure artifact contains the parsed shader summary, generated MSL,
-compiler error text, and raw bytecode. Each PSO failure artifact contains the
-vertex descriptor summary plus the cached VS/PS interface summaries used during
-pipeline creation.
+Each shader artifact includes the parsed shader summary, generated MSL, compile
+error text, and raw bytecode. Each PSO artifact includes the declaration summary
+and the VS/PS interface context used during pipeline creation.
 
 ### Frame Dumps
 
-Keyboard-triggered ('D' key): writes frame_dump txt + raw texture files to session output directory.
+The viewer still supports keyboard-triggered dumps with the `D` key. Dumps now
+include enough information to reason about both translated draws and
+`StretchRect`-driven composite steps.
 
-## Shader Translation Pipeline
-
-### Parser (d3d9_shader_parse.c)
-
-Parses D3D9 shader model 1.0–3.0 bytecode into `dx9mt_sm_program` IR:
-- Version token → shader type (VS/PS) + version
-- Instructions (up to 512): opcode, dst register, up to 4 source registers
-- Declarations: input/output semantics, sampler types
-- Inline constants: DEF/DEFI/DEFB
-- Register usage analysis: max temp/const, sampler/input/output masks
-
-Supported: 43 opcodes (arithmetic, matrix, texture, flow control).
-
-### MSL Emitter (d3d9_shader_emit_msl.c)
-
-Translates parsed program to Metal Shading Language source (up to 32KB):
-- Generates input/output structs with `[[attribute(N)]]` / `[[user(...)]]` annotations
-- Maps D3D9 registers to MSL variables (r# → float4 locals, c[] → constant buffer, v# → input, o# → output)
-- Handles swizzle, write mask, source modifiers (negate, abs, bias, x2, complement), saturate
-- Special instruction handling: LIT (lighting calc), NRM (normalize), matrix ops (unrolled dots), TEXLD/TEXKILL
-- Attribute index mapping: POSITION→0, COLOR0→1, TEXCOORD0→2, NORMAL→3, TEXCOORD1→4, COLOR1→5, etc.
-
-## Shared Headers (include/dx9mt/)
+## Shared Headers (`dx9mt/include/dx9mt`)
 
 | Header | Purpose |
 |--------|---------|
-| `packets.h` | Packet structs: init, begin_frame, draw_indexed, present, clear. Static asserts on size. |
-| `upload_arena.h` | Upload ref struct + arena descriptor. Triple-buffer constants (3 slots, 128MB each). |
-| `metal_ipc.h` | IPC layout: header + draw array + bulk data. Magic 0xDEAD9001, 256MB region, max 2048 draws. |
-| `object_ids.h` | Object kind enum (device, swapchain, buffer, texture, surface, shaders, state_block, query, vertex_decl). |
-| `backend_bridge.h` | Bridge API: init, update_present_target, submit_packets, begin_frame, present, shutdown. |
-| `d3d9_device.h` | `dx9mt_device_create()` prototype. |
-| `runtime.h` | Runtime init/shutdown + packet sequence counter. |
-| `log.h` | `dx9mt_logf(tag, fmt, ...)` — writes to DX9MT_LOG_PATH or stderr. |
+| `packets.h` | Frontend packet structs including `DRAW_INDEXED`, `CLEAR`, `PRESENT`, and `STRETCH_RECT` |
+| `upload_arena.h` | Upload-ref layout and upload-arena sizing constants |
+| `metal_ipc.h` | IPC wire format for header and replay commands |
+| `backend_bridge.h` | Shared backend bridge API |
+| `object_ids.h` | Object kind encoding for stable IDs |
+| `runtime.h` | Frontend runtime init and packet sequence control |
+| `log.h` | Shared logging API |
 
 ## Tests
 
-`backend_bridge_contract_test.c` — 10 test cases validating the backend contract:
-- Valid packet stream acceptance
-- Truncated/wrong-size packet rejection
-- Non-monotonic sequence rejection
-- Missing state ID rejection
-- Present without target metadata rejection
-- Frame ID mismatch rejection
-- Draw capture overflow handling (8256 draws)
-- Replay hash sensitivity to draw payload changes
-- BEGIN_FRAME via packet stream
+`backend_bridge_contract_test.c` validates the shared bridge contract, including:
 
-Run: `make test` (from root) or `make test-native` (from dx9mt/).
+- valid packet stream acceptance
+- bad size rejection
+- non-monotonic sequence rejection
+- missing target metadata rejection
+- draw overflow handling
+- replay-hash sensitivity
+
+Run:
+
+- `make test`
+- `make -C dx9mt test-native`
 
 ## Runtime Flow Summary
 
-1. FNV loads `d3d9.dll` → `DllMain` inits logging + crash handler
-2. Game calls `Direct3DCreate9()` → runtime init → backend bridge init → IPC file open
-3. Game calls `CreateDevice()` → device state initialized, present target registered
-4. Per frame:
-   - `BeginScene()` / `EndScene()` — tracked but no-op
-   - `Clear()` → CLEAR packet
-   - `SetRenderState/Texture/Shader/etc.` → state stored in device arrays
-   - `DrawIndexedPrimitive()` → full state snapshot → upload arena → DRAW_INDEXED packet
-   - `Present()` → PRESENT packet → backend assembles IPC → viewer renders via Metal
-5. Frame ID increments, upload slot rotates, constants marked dirty
-6. `DLL_PROCESS_DETACH` → shutdown
+1. FNV loads `d3d9.dll`.
+2. `DllMain` initializes logging, runtime, and the crash handler.
+3. `Direct3DCreate9()` and `CreateDevice()` initialize the frontend device and
+   backend bridge.
+4. During gameplay:
+   - `Clear()` emits a clear packet
+   - indexed draws emit full-state draw packets
+   - `StretchRect()` emits explicit blit packets
+   - `Present()` triggers IPC assembly
+5. The viewer snapshots the latest frame and replays it into Metal.
+6. The frame ID advances, the upload slot rotates, and constants are marked
+   dirty for the next frame.
 
-## Key Design Decisions
+## Current Rendering State
 
-- **Full-state packets**: each draw carries ALL state (no incremental deltas). Simplifies backend at cost of bandwidth.
-- **Upload arena triple-buffering**: prevents frontend/backend data races without locks.
-- **FNV-1a hashing**: fast content-addressable state deduplication (PSO cache, replay hash).
-- **Cross-ABI structs**: explicit padding in upload_ref for PE32 ↔ ARM64 layout agreement.
-- **Generation tracking**: textures only re-uploaded when modified (or periodic refresh every 60 frames).
-- **Crash patching**: vectored exception handler catches BSShader factory NULL in FNV, patches EIP to skip vtable calls.
-- **Hardcoded + translated shader paths**: hardcoded shaders for fallback; bytecode→MSL translation for full fidelity.
+As of March 5, 2026:
 
-## Current Rendering Findings
+- main menu rendering is stable
+- in-game 3D world rendering is now visible
+- HUD, weapon, and broad scene structure survive replay
+- large planar corruption, billboard or foliage spikes, and remaining composite
+  mistakes still prevent visually correct output
 
-The current in-game blank-world symptom has been narrowed down to multiple
-independent issues:
-
-- The frame clear and HUD are reaching the drawable correctly. `Present()` is
-  not the main failure.
-- The dominant failure is offscreen render-target replay:
-  - Many world draws target render targets with format `113` (`0x71`),
-    `D3DFMT_A16B16G16R16F`.
-  - Before support for this format existed in the viewer, those render targets
-    were rejected as unsupported and the world composite path never reached the
-    drawable.
-- Shader translation is a second blocker:
-  - Several VS/PS pairs compile successfully and render.
-  - Several others fail due to malformed VS inputs, duplicated PS user
-    semantics, vector/scalar type mismatches, or VS/PS interface mismatches.
-- Texture availability is a third blocker:
-  - Some draws reference textures with `upload_size == 0` and no cache/RT
-    override entry in the viewer, so they fail even when the texture metadata is
-    present.
-- Upload-arena overflow remains a later heavy-frame failure mode, but it is not
-  the root cause of the initial blank-world symptom.
-
-See [`docs/rendering_findings.md`](rendering_findings.md) for the current
-evidence and log signatures.
+For the current evidence and active bug buckets, see
+[`docs/rendering_findings.md`](rendering_findings.md).

@@ -1,114 +1,157 @@
 # Rendering Findings
 
-Current evidence from the in-game blank-world investigation.
+Current evidence for the in-game rendering state as of March 5, 2026.
 
-## Symptom
+![Current gameplay state on March 5, 2026](../assets/images/current_gameplay_2026-03-05.png)
 
-- Loading into the game shows a light-blue/clear-colored scene.
-- HUD elements render correctly on top.
-- The process can remain stable for a long time with no crash or immediate runtime failure.
+## Summary
 
-## Primary Root Cause Identified So Far
+The project has moved past the earlier blank-world phase. The Metal viewer now
+shows the world, sky, terrain, props, HUD, and first-person weapon. The core
+problem is no longer "can the frame reach the drawable?" but "how correct is
+the replay once it gets there?"
 
-The dominant failure is offscreen render-target replay, not `Present()`.
+The current image is still badly corrupted. Large white or light-blue planar
+bands cut through the frame, billboard or foliage-heavy geometry spikes upward
+into dense columns, and some scene-composite passes are still clearly wrong or
+missing.
 
-- Viewer cohort logs show most world draws targeting `rt=83886199` with
-  `fmt=113 (0x71)`.
-- `113` is `D3DFMT_A16B16G16R16F`.
-- Before support for this format existed in the viewer, these targets were
-  rejected as unsupported, producing hundreds to more than a thousand skipped
-  draws per frame.
-- This matches the visible symptom:
-  - scene clear reaches the drawable
-  - HUD reaches the drawable
-  - world scene, rendered through HDR offscreen targets, does not
-- The viewer now maps `D3DFMT_A16B16G16R16F` to `MTLPixelFormatRGBA16Float`
-  and keys translated PSOs by the actual render-target pixel format.
-  The next run should show how much blank-world behavior remains once HDR RT
-  replay is no longer blocked at format creation time.
+## What Changed Since The Blank-World Phase
 
-Representative viewer diagnostics:
+- HDR offscreen render targets are now replayable:
+  - The viewer maps `D3DFMT_A16B16G16R16F` (`113`, `0x71`) to
+    `MTLPixelFormatRGBA16Float`.
+  - Translated PSOs are keyed by the actual render-target pixel format, so the
+    same shader pair can compile distinct pipelines for drawable and HDR paths.
+- `StretchRect` is now a first-class packet and IPC command:
+  - The frontend emits explicit blit metadata.
+  - The backend records it alongside draw commands.
+  - The viewer replays it through a dedicated full-screen blit path.
+- Offscreen RT output is linked back into later sampling stages:
+  - `render_target_texture_id` is forwarded through packets and IPC.
+  - The viewer records RT-to-texture overrides so later passes can sample prior
+    offscreen output.
+- IPC replay is safer:
+  - The backend writes `sequence = 0` before mutating shared frame data.
+  - The viewer validates the header, snapshots the frame, then re-checks the
+    sequence before replay.
+- Upload pressure is reduced and texture behavior is more observable:
+  - Upload arena slots increased from 128 MB to 256 MB each.
+  - Texture refresh is now more aggressive.
+  - Frontend and viewer both log why a texture did or did not resolve.
 
-```text
-dx9mt_metal_viewer: ERROR: frame 1777 diagnostics: translated=57 skipped=1213 missing_target_texture=1206 ...
-dx9mt_metal_viewer: INFO: frame 1777 cohort[0] count=604 rt=83886199 fmt=113(0x00000071) ...
-```
+## What The Current Screenshot Confirms
 
-Representative format error:
+Positive signals:
 
-```text
-dx9mt_metal_viewer: ERROR: render target format unsupported rt_id=83886199 size=800x450 fmt_dec=113 fmt_hex=0x00000071 fmt_name=?
-```
+- The world scene is no longer missing entirely.
+- Depth cues, sky, terrain, buildings, and the held weapon all appear.
+- HUD composition on top of the 3D scene is still intact.
+- Broad scene lighting survives the replay path.
 
-## Secondary Issues Still Present
+Visible failures:
 
-These are real bugs, but they are not the first-order explanation for the blank
-world scene:
+- Large white or light-blue bands still span major parts of the screen.
+- Some billboard or vegetation draws explode into vertical spikes or dense point
+  clouds.
+- Ground and distant scene composition still look partially wrong.
+- Some surfaces appear to be sampling the wrong source, an uninitialized source,
+  or a partially correct source.
 
-- Shader translation failures
-  - Example hashes:
-    - `VS 0xdf77824a`
-    - `PS 0x6ec1c3f7`
-    - `PS 0xe881b8fb`
-- Translated PSO interface mismatches
-  - Example:
-    - `Vertex attribute v0(0) is missing from the vertex descriptor`
-    - `Fragment input(s) user(attr0) mismatching vertex shader output type(s) or not written by vertex shader`
-- Texture cache misses with `upload_size == 0`
-  - Some textures arrive only as metadata references, relying on the viewer to
-    already have them cached.
-  - If the viewer has not seen them before, the draw fails.
-- Upload-arena overflow on later heavy frames
-  - This causes missing constant uploads and rejected draw packets.
-  - It happens later and is not the initial blank-world cause.
+## Remaining Bug Buckets
 
-## Diagnostics Added
+### 1. Scene-composite and blit correctness
 
-Frontend/runtime:
+The world is visible now, which strongly suggests that HDR RT creation and
+offscreen replay are no longer the first-order blocker. The remaining planar
+artifacts likely point to one or more of:
 
-- `dx9mt/rttrace`
-  - `CreateTexture`
-  - `CreateRenderTarget`
-  - `CreateDepthStencilSurface`
-  - `SetRenderTarget`
-  - `GetRenderTarget`
-  - `SetDepthStencilSurface`
-  - sampled `Present()` summaries
-- `dx9mt/texdiag`
-  - unsupported type
-  - missing metadata
-  - missing level surface
-  - no sysmem copy
-  - zero upload size
-  - not dirty / not in refresh window
-  - upload copy failure
+- incorrect `StretchRect` source or destination rect normalization
+- wrong load or clear ordering when switching render targets
+- wrong source texture chosen for a later full-screen composite pass
+- a translated shader pair that compiles but still computes the wrong composite
 
-Viewer:
+This section is still partly inference from the screenshot and the code paths.
 
-- `dx9mt_viewer.log`
-  - unsupported RT formats
-  - RT materialization success/failure
-  - RT-to-texture override linkage
-  - texture resolution source: `rt_override`, `cache`, `upload`, `cache_miss`
-  - per-frame draw skip summaries
-  - per-frame cohort summaries
+### 2. Translated shader and PSO failures
+
+The latest commit fixed several translator issues, but not all translated
+programs are correct yet. Remaining failures still fall into familiar buckets:
+
+- missing or mismapped VS inputs
+- VS/PS interface mismatches at PSO creation time
+- semantic mismatches between emitted `[[user(...)]]` attributes
+- shader pairs that compile but still render incorrectly
+
+Artifacts are now dumped as:
+
 - `dx9mt_shader_fail_vs_<hash>.txt`
 - `dx9mt_shader_fail_ps_<hash>.txt`
 - `dx9mt_pso_fail_<key>.txt`
 
-## Diagnostics Crash
+### 3. Billboard, alpha-test, or foliage replay issues
 
-A viewer crash was introduced by the investigation tooling:
+The screenshot shows several geometry classes stretching into long vertical
+spikes. Plausible sources include:
 
-- The cohort logger hashed shader bytecode using IPC offsets without validating
-  the bulk-data range first.
-- That caused `EXC_BAD_ACCESS` in `dx9mt_cohort_add -> dx9mt_sm_bytecode_hash`.
-- This was a diagnostics-path bug and has been fixed by validating IPC bulk
-  ranges before hashing bytecode.
+- vertex declaration or attribute-width mismatches
+- remaining POSITION or POSITIONT handling errors
+- depth, cull, or alpha-tested billboard state not matching D3D9 behavior
+- fallback rendering paths being "good enough" to show content but not correct
+  enough to preserve the intended shape
+
+### 4. Texture availability and cache seeding
+
+Some draws still arrive with texture metadata but no upload payload:
+
+- `upload_size == 0` is not automatically wrong if the viewer already has the
+  texture cached.
+- It is still wrong for first use if the viewer has neither a cache entry nor
+  an RT override for that texture ID.
+- The viewer now logs whether a texture resolved via `rt_override`, `cache`,
+  `upload`, `cache_miss`, or invalid bulk range.
+
+### 5. Heavy-frame upload pressure
+
+The larger upload arena moves the failure point later, but it does not remove
+the problem entirely. Heavy frames can still fail due to:
+
+- upload-copy failure in the frontend
+- missing constants or geometry payloads in IPC
+- invalid bulk ranges discovered by the viewer during replay
+
+## Diagnostics That Matter Most Now
+
+Frontend/runtime:
+
+- `dx9mt_runtime.log`
+  - `dx9mt/rttrace` for render-target lifecycle and sampled `Present()` routing
+  - `dx9mt/texdiag` for texture upload skip reasons
+
+Viewer:
+
+- `dx9mt_viewer.log`
+  - draw skip reasons
+  - texture resolution source
+  - render-target materialization and RT-link logging
+  - per-frame diagnostics totals
+  - per-frame cohort summaries grouped by RT, shader hashes, and texture mask
+
+Artifacts:
+
+- `dx9mt_shader_fail_vs_<hash>.txt`
+- `dx9mt_shader_fail_ps_<hash>.txt`
+- `dx9mt_pso_fail_<key>.txt`
+- `dx9mt_frame_dump*.txt`
 
 ## Current Priorities
 
-1. Support `D3DFMT_A16B16G16R16F` in the viewer render-target path.
-2. Re-run and see how much of the blank-world symptom remains.
-3. Then fix the remaining translated shader / PSO interface failures.
-4. Then address missing texture cache seeding and later upload-arena overflow.
+1. Correlate the current visual artifacts with the new `dx9mt_viewer.log`
+   cohorts instead of relying on the older blank-world signatures.
+2. Audit `StretchRect` replay and later scene-composite passes first, because
+   the large planar bands look like blit or post-process mistakes.
+3. Continue fixing translated VS input, semantic, and PSO interface mismatches.
+4. Audit billboard, alpha-test, and foliage-heavy draws for declaration-width,
+   cull, depth, or fallback-path issues.
+5. Keep reducing texture cache misses and heavy-frame upload failures once the
+   main on-screen corruption is better classified.
