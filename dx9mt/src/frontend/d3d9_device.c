@@ -4,6 +4,7 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "dx9mt/backend_bridge.h"
@@ -24,7 +25,7 @@
 #define DX9MT_MAX_SHADER_INT_CONSTANTS 16
 #define DX9MT_MAX_SHADER_BOOL_CONSTANTS 16
 #define DX9MT_UPLOAD_BYTES_PER_SLOT DX9MT_UPLOAD_ARENA_BYTES_PER_SLOT
-#define DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL 60u
+#define DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL 8u
 #define DX9MT_DRAW_SHADER_CONSTANT_BYTES                                          \
   (DX9MT_MAX_SHADER_FLOAT_CONSTANTS * 4u * sizeof(float))
 
@@ -50,6 +51,28 @@ static WINBOOL dx9mt_should_log_method_sample(LONG *counter, LONG first_n,
 }
 
 static LONG g_object_id_counters[DX9MT_OBJECT_KIND_VERTEX_DECL + 1];
+
+#define DX9MT_LOG_ONCE_CAPACITY 1024u
+static uint64_t g_log_once_keys[DX9MT_LOG_ONCE_CAPACITY];
+static uint32_t g_log_once_cursor;
+
+static WINBOOL dx9mt_log_once_u64(uint64_t key) {
+  uint32_t i;
+
+  if (key == 0) {
+    return TRUE;
+  }
+
+  for (i = 0; i < DX9MT_LOG_ONCE_CAPACITY; ++i) {
+    if (g_log_once_keys[i] == key) {
+      return FALSE;
+    }
+  }
+
+  g_log_once_keys[g_log_once_cursor % DX9MT_LOG_ONCE_CAPACITY] = key;
+  ++g_log_once_cursor;
+  return TRUE;
+}
 
 typedef struct dx9mt_frontend_upload_state {
   uint32_t frame_id;
@@ -431,6 +454,106 @@ dx9mt_surface_container_texture_id(const dx9mt_surface *surface) {
   texture_id = dx9mt_texture_object_id_from_base_iface(base_texture);
   IDirect3DBaseTexture9_Release(base_texture);
   return texture_id;
+}
+
+static void dx9mt_resolve_rect(const D3DSURFACE_DESC *desc, const RECT *input,
+                               RECT *resolved);
+static WINBOOL dx9mt_rect_valid_for_surface(const RECT *rect,
+                                            const D3DSURFACE_DESC *desc);
+
+static void dx9mt_log_surface_event(const char *tag, const dx9mt_surface *surface,
+                                    DWORD index, const char *extra) {
+  dx9mt_object_id texture_id = dx9mt_surface_container_texture_id(surface);
+
+  if (!surface) {
+    dx9mt_logf(tag, "rt index=%u surface=<null>%s%s", (unsigned)index,
+               extra ? " " : "", extra ? extra : "");
+    return;
+  }
+
+  dx9mt_logf(tag,
+             "rt index=%u surf_id=%u tex_id=%u usage=0x%08x fmt=%u size=%ux%u pool=%u%s%s",
+             (unsigned)index, surface->object_id, texture_id,
+             (unsigned)surface->desc.Usage, (unsigned)surface->desc.Format,
+             surface->desc.Width, surface->desc.Height,
+             (unsigned)surface->desc.Pool, extra ? " " : "",
+             extra ? extra : "");
+}
+
+static void dx9mt_device_emit_stretch_rect(dx9mt_device *self,
+                                           const dx9mt_surface *src,
+                                           const RECT *src_rect,
+                                           const dx9mt_surface *dst,
+                                           const RECT *dst_rect,
+                                           D3DTEXTUREFILTERTYPE filter) {
+  dx9mt_packet_stretch_rect packet;
+  RECT resolved_src;
+  RECT resolved_dst;
+
+  if (!self || !src || !dst) {
+    return;
+  }
+
+  dx9mt_resolve_rect(&src->desc, src_rect, &resolved_src);
+  dx9mt_resolve_rect(&dst->desc, dst_rect, &resolved_dst);
+  if (!dx9mt_rect_valid_for_surface(&resolved_src, &src->desc) ||
+      !dx9mt_rect_valid_for_surface(&resolved_dst, &dst->desc)) {
+    return;
+  }
+
+  memset(&packet, 0, sizeof(packet));
+  packet.header.type = DX9MT_PACKET_STRETCH_RECT;
+  packet.header.size = (uint16_t)sizeof(packet);
+  packet.header.sequence = dx9mt_runtime_next_packet_sequence();
+  packet.frame_id = self->frame_id;
+  packet.src_surface_id = src->object_id;
+  packet.src_texture_id = dx9mt_surface_container_texture_id(src);
+  packet.src_width = src->desc.Width;
+  packet.src_height = src->desc.Height;
+  packet.src_format = (uint32_t)src->desc.Format;
+  packet.src_left = resolved_src.left;
+  packet.src_top = resolved_src.top;
+  packet.src_right = resolved_src.right;
+  packet.src_bottom = resolved_src.bottom;
+  packet.dst_surface_id = dst->object_id;
+  packet.dst_texture_id = dx9mt_surface_container_texture_id(dst);
+  packet.dst_width = dst->desc.Width;
+  packet.dst_height = dst->desc.Height;
+  packet.dst_format = (uint32_t)dst->desc.Format;
+  packet.dst_left = resolved_dst.left;
+  packet.dst_top = resolved_dst.top;
+  packet.dst_right = resolved_dst.right;
+  packet.dst_bottom = resolved_dst.bottom;
+  packet.filter = (uint32_t)filter;
+  dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
+}
+
+enum dx9mt_texture_upload_skip_reason {
+  DX9MT_TEX_SKIP_UNSUPPORTED_TYPE = 1,
+  DX9MT_TEX_SKIP_MISSING_METADATA = 2,
+  DX9MT_TEX_SKIP_MISSING_LEVEL_SURFACE = 3,
+  DX9MT_TEX_SKIP_NO_SYSMEM = 4,
+  DX9MT_TEX_SKIP_ZERO_UPLOAD_SIZE = 5,
+  DX9MT_TEX_SKIP_NOT_DIRTY = 6,
+  DX9MT_TEX_SKIP_UPLOAD_COPY_FAILED = 7,
+};
+
+static void dx9mt_log_texture_upload_skip(
+    uint32_t stage, dx9mt_object_id texture_id, uint32_t generation,
+    enum dx9mt_texture_upload_skip_reason reason, const char *detail) {
+  uint64_t key;
+
+  key = ((uint64_t)texture_id << 16) ^ ((uint64_t)generation << 4) ^
+        (uint64_t)reason;
+  if (!dx9mt_log_once_u64(key)) {
+    return;
+  }
+
+  dx9mt_logf(
+      "texdiag",
+      "stage=%u tex_id=%u generation=%u reason=%u %s",
+      stage, texture_id, generation, (unsigned)reason,
+      detail ? detail : "");
 }
 
 static uint32_t dx9mt_hash_u32(uint32_t hash, uint32_t value) {
@@ -4118,6 +4241,7 @@ static HRESULT WINAPI dx9mt_device_Present(IDirect3DDevice9 *iface,
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   HRESULT hr;
   dx9mt_packet_present packet;
+  static LONG log_counter = 0;
 
   (void)src_rect;
   (void)dst_rect;
@@ -4130,6 +4254,20 @@ static HRESULT WINAPI dx9mt_device_Present(IDirect3DDevice9 *iface,
   packet.frame_id = self->frame_id;
   packet.render_target_id =
       dx9mt_surface_object_id_from_iface(self->render_targets[0]);
+
+  if (dx9mt_should_log_method_sample(&log_counter, 16, 240)) {
+    dx9mt_surface *rt0 =
+        self->render_targets[0] ? dx9mt_surface_from_iface(self->render_targets[0])
+                                : NULL;
+    dx9mt_logf(
+        "rttrace",
+        "Present frame=%u rt0_id=%u rt0_tex_id=%u depth_id=%u viewport=%ux%u window=%p",
+        self->frame_id, packet.render_target_id,
+        rt0 ? dx9mt_surface_container_texture_id(rt0) : 0u,
+        dx9mt_surface_object_id_from_iface(self->depth_stencil),
+        self->viewport.Width, self->viewport.Height,
+        dx9mt_device_resolve_present_window(self, dst_window_override));
+  }
 
   dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
   hr = dx9mt_backend_bridge_present(self->frame_id) == 0 ? D3D_OK : D3DERR_DEVICELOST;
@@ -4206,11 +4344,16 @@ static HRESULT WINAPI dx9mt_device_CreateTexture(
     HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   HRESULT hr;
+  dx9mt_object_id tex_id = 0;
   (void)shared_handle;
   hr = dx9mt_texture_create(self, width, height, levels, usage, format, pool,
                             texture);
+  if (SUCCEEDED(hr) && texture && *texture) {
+    tex_id = dx9mt_texture_from_iface(*texture)->object_id;
+  }
   dx9mt_logf("device",
-             "CreateTexture %ux%u levels=%u usage=0x%08x fmt=%u pool=%u -> hr=0x%08x",
+             "CreateTexture tex_id=%u %ux%u levels=%u usage=0x%08x fmt=%u pool=%u -> hr=0x%08x",
+             tex_id,
              width, height, levels, (unsigned)usage, (unsigned)format,
              (unsigned)pool, (unsigned)hr);
   return hr;
@@ -4292,10 +4435,17 @@ static HRESULT WINAPI dx9mt_device_CreateRenderTarget(
     D3DMULTISAMPLE_TYPE multisample, DWORD quality, WINBOOL lockable,
     IDirect3DSurface9 **surface, HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)shared_handle;
-  return dx9mt_surface_create(self, width, height, format, D3DPOOL_DEFAULT,
-                              D3DUSAGE_RENDERTARGET, multisample, quality,
-                              lockable, NULL, surface);
+  hr = dx9mt_surface_create(self, width, height, format, D3DPOOL_DEFAULT,
+                            D3DUSAGE_RENDERTARGET, multisample, quality,
+                            lockable, NULL, surface);
+  if (SUCCEEDED(hr) && surface && *surface) {
+    dx9mt_surface *rt = dx9mt_surface_from_iface(*surface);
+    dx9mt_log_surface_event("rttrace", rt, 0,
+                            "CreateRenderTarget");
+  }
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateDepthStencilSurface(
@@ -4303,11 +4453,18 @@ static HRESULT WINAPI dx9mt_device_CreateDepthStencilSurface(
     D3DMULTISAMPLE_TYPE multisample, DWORD quality, WINBOOL discard,
     IDirect3DSurface9 **surface, HANDLE *shared_handle) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  HRESULT hr;
   (void)discard;
   (void)shared_handle;
-  return dx9mt_surface_create(self, width, height, format, D3DPOOL_DEFAULT,
-                              D3DUSAGE_DEPTHSTENCIL, multisample, quality,
-                              FALSE, NULL, surface);
+  hr = dx9mt_surface_create(self, width, height, format, D3DPOOL_DEFAULT,
+                            D3DUSAGE_DEPTHSTENCIL, multisample, quality,
+                            FALSE, NULL, surface);
+  if (SUCCEEDED(hr) && surface && *surface) {
+    dx9mt_surface *ds = dx9mt_surface_from_iface(*surface);
+    dx9mt_log_surface_event("rttrace", ds, 0,
+                            "CreateDepthStencilSurface");
+  }
+  return hr;
 }
 
 static HRESULT WINAPI dx9mt_device_CreateOffscreenPlainSurface(
@@ -4442,12 +4599,18 @@ static HRESULT WINAPI dx9mt_device_StretchRect(
     IDirect3DDevice9 *iface, IDirect3DSurface9 *src_surface,
     const RECT *src_rect, IDirect3DSurface9 *dst_surface, const RECT *dst_rect,
     D3DTEXTUREFILTERTYPE filter) {
+  dx9mt_device *self = dx9mt_device_from_iface(iface);
   dx9mt_surface *src = dx9mt_surface_from_iface(src_surface);
   dx9mt_surface *dst = dx9mt_surface_from_iface(dst_surface);
-  (void)iface;
-  (void)filter;
   if (!src_surface || !dst_surface) {
     return D3DERR_INVALIDCALL;
+  }
+  if (self) {
+    dx9mt_device_emit_stretch_rect(self, src, src_rect, dst, dst_rect, filter);
+  }
+  if ((src->desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0 ||
+      (dst->desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0) {
+    return D3D_OK;
   }
   return dx9mt_surface_copy_rect(dst, dst_rect, src, src_rect, TRUE);
 }
@@ -4466,6 +4629,7 @@ static HRESULT WINAPI dx9mt_device_SetRenderTarget(IDirect3DDevice9 *iface,
                                                     DWORD index,
                                                     IDirect3DSurface9 *surface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (index >= DX9MT_MAX_RENDER_TARGETS) {
     return D3DERR_INVALIDCALL;
   }
@@ -4477,6 +4641,11 @@ static HRESULT WINAPI dx9mt_device_SetRenderTarget(IDirect3DDevice9 *iface,
   dx9mt_safe_addref((IUnknown *)surface);
   dx9mt_safe_release((IUnknown *)self->render_targets[index]);
   self->render_targets[index] = surface;
+  if (dx9mt_should_log_method_sample(&log_counter, 64, 512)) {
+    dx9mt_log_surface_event("rttrace",
+                            surface ? dx9mt_surface_from_iface(surface) : NULL,
+                            index, "SetRenderTarget");
+  }
   return D3D_OK;
 }
 
@@ -4484,6 +4653,7 @@ static HRESULT WINAPI dx9mt_device_GetRenderTarget(IDirect3DDevice9 *iface,
                                                     DWORD index,
                                                     IDirect3DSurface9 **surface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (!surface || index >= DX9MT_MAX_RENDER_TARGETS) {
     return D3DERR_INVALIDCALL;
   }
@@ -4492,12 +4662,18 @@ static HRESULT WINAPI dx9mt_device_GetRenderTarget(IDirect3DDevice9 *iface,
   if (*surface) {
     IDirect3DSurface9_AddRef(*surface);
   }
+  if (dx9mt_should_log_method_sample(&log_counter, 16, 256)) {
+    dx9mt_log_surface_event(
+        "rttrace", *surface ? dx9mt_surface_from_iface(*surface) : NULL, index,
+        "GetRenderTarget");
+  }
   return D3D_OK;
 }
 
 static HRESULT WINAPI dx9mt_device_SetDepthStencilSurface(
     IDirect3DDevice9 *iface, IDirect3DSurface9 *surface) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
+  static LONG log_counter = 0;
   if (self->depth_stencil == surface) {
     return D3D_OK;
   }
@@ -4505,6 +4681,11 @@ static HRESULT WINAPI dx9mt_device_SetDepthStencilSurface(
   dx9mt_safe_addref((IUnknown *)surface);
   dx9mt_safe_release((IUnknown *)self->depth_stencil);
   self->depth_stencil = surface;
+  if (dx9mt_should_log_method_sample(&log_counter, 32, 256)) {
+    dx9mt_log_surface_event(
+        "rttrace", surface ? dx9mt_surface_from_iface(surface) : NULL, 0,
+        "SetDepthStencilSurface");
+  }
   return D3D_OK;
 }
 
@@ -5071,10 +5252,12 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
     IDirect3DBaseTexture9 *base_texture;
     D3DRESOURCETYPE type;
     dx9mt_texture *texture;
+    dx9mt_object_id texture_id;
     uint32_t level;
     dx9mt_surface *surface;
     uint32_t upload_size;
     WINBOOL should_upload;
+    char detail[256];
 
     packet->sampler_min_filter[stage] = self->sampler_states[stage][D3DSAMP_MINFILTER];
     packet->sampler_mag_filter[stage] = self->sampler_states[stage][D3DSAMP_MAGFILTER];
@@ -5087,14 +5270,25 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
     if (!base_texture) {
       continue;
     }
+    texture_id = dx9mt_texture_object_id_from_base_iface(base_texture);
 
     type = IDirect3DBaseTexture9_GetType(base_texture);
     if (type != D3DRTYPE_TEXTURE) {
+      snprintf(detail, sizeof(detail),
+               "unsupported texture type=%u stage=%u", (unsigned)type, stage);
+      dx9mt_log_texture_upload_skip(stage, texture_id, 0,
+                                    DX9MT_TEX_SKIP_UNSUPPORTED_TYPE, detail);
       continue;
     }
 
     texture = dx9mt_texture_from_iface((IDirect3DTexture9 *)base_texture);
     if (!texture || texture->levels == 0 || !texture->surfaces) {
+      snprintf(detail, sizeof(detail),
+               "missing metadata levels=%u surfaces=%s stage=%u",
+               texture ? texture->levels : 0u,
+               (texture && texture->surfaces) ? "yes" : "no", stage);
+      dx9mt_log_texture_upload_skip(stage, texture_id, texture ? texture->generation : 0,
+                                    DX9MT_TEX_SKIP_MISSING_METADATA, detail);
       continue;
     }
 
@@ -5103,6 +5297,13 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
       level = 0;
     }
     if (!texture->surfaces[level]) {
+      snprintf(detail, sizeof(detail),
+               "missing level surface level=%u levels=%u stage=%u", level,
+               texture->levels, stage);
+      dx9mt_log_texture_upload_skip(stage, texture->object_id,
+                                    texture->generation,
+                                    DX9MT_TEX_SKIP_MISSING_LEVEL_SURFACE,
+                                    detail);
       continue;
     }
     surface = dx9mt_surface_from_iface(texture->surfaces[level]);
@@ -5121,24 +5322,45 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
     packet->tex_pitch[stage] = surface->pitch;
 
     if (!surface->sysmem) {
+      snprintf(detail, sizeof(detail),
+               "no sysmem copy level=%u usage=0x%08x fmt=%u stage=%u surf_id=%u",
+               level, (unsigned)surface->desc.Usage,
+               (unsigned)surface->desc.Format, stage, surface->object_id);
+      dx9mt_log_texture_upload_skip(stage, texture->object_id,
+                                    texture->generation,
+                                    DX9MT_TEX_SKIP_NO_SYSMEM, detail);
       continue;
     }
 
     upload_size = dx9mt_surface_upload_size(surface);
     if (upload_size == 0) {
+      snprintf(detail, sizeof(detail),
+               "zero upload size level=%u pitch=%u size=%ux%u stage=%u",
+               level, surface->pitch, surface->desc.Width, surface->desc.Height,
+               stage);
+      dx9mt_log_texture_upload_skip(stage, texture->object_id,
+                                    texture->generation,
+                                    DX9MT_TEX_SKIP_ZERO_UPLOAD_SIZE, detail);
       continue;
     }
 
     should_upload = FALSE;
-    if (texture->last_upload_generation != texture->generation) {
+    if (texture->last_upload_generation != texture->generation ||
+        texture->last_upload_frame_id == 0 ||
+        texture->last_upload_frame_id > self->frame_id ||
+        (self->frame_id - texture->last_upload_frame_id) >=
+            DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL) {
       should_upload = TRUE;
-    } else if (texture->last_upload_frame_id != self->frame_id) {
-      if (((self->frame_id + texture->object_id) %
-           DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL) == 0u) {
-        should_upload = TRUE;
-      }
     }
     if (!should_upload) {
+      snprintf(detail, sizeof(detail),
+               "no upload this frame stage=%u last_gen=%u current_gen=%u last_frame=%u current_frame=%u refresh_interval=%u",
+               stage, texture->last_upload_generation, texture->generation,
+               texture->last_upload_frame_id, self->frame_id,
+               DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL);
+      dx9mt_log_texture_upload_skip(stage, texture->object_id,
+                                    texture->generation,
+                                    DX9MT_TEX_SKIP_NOT_DIRTY, detail);
       continue;
     }
 
@@ -5147,6 +5369,14 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
     if (packet->tex_data[stage].size > 0) {
       texture->last_upload_generation = texture->generation;
       texture->last_upload_frame_id = self->frame_id;
+    } else {
+      snprintf(detail, sizeof(detail),
+               "upload copy failed stage=%u size=%u frame=%u arena_slot=%u",
+               stage, upload_size, self->frame_id,
+               self->frame_id % DX9MT_UPLOAD_ARENA_SLOTS);
+      dx9mt_log_texture_upload_skip(stage, texture->object_id,
+                                    texture->generation,
+                                    DX9MT_TEX_SKIP_UPLOAD_COPY_FAILED, detail);
     }
   }
 }

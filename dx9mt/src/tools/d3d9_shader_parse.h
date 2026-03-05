@@ -83,7 +83,7 @@ enum dx9mt_sm_opcode {
   DX9MT_SM_OP_DEFI    = 82,
   DX9MT_SM_OP_DEFB    = 83,
   DX9MT_SM_OP_CMP     = 88,
-  DX9MT_SM_OP_DP2ADD  = 112,
+  DX9MT_SM_OP_DP2ADD  = 90,
   DX9MT_SM_OP_END     = 0xFFFF,
 };
 

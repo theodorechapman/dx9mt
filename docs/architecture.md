@@ -47,7 +47,8 @@ dx9mt/                      # Root
 ├── CLAUDE_soon.md          # Will become CLAUDE.md — workflow instructions
 ├── docs/
 │   ├── architecture.md     # This file
-│   └── insights.md         # Lessons learned, common mistakes
+│   ├── insights.md         # Lessons learned, common mistakes
+│   └── rendering_findings.md # Current rendering investigation and evidence
 ├── dx9mt/                  # All source code
 │   ├── Makefile            # Inner build: d3d9.dll + libdx9mt_unixlib.dylib + viewer + tests
 │   ├── include/dx9mt/      # Shared headers (frontend ↔ backend contract)
@@ -61,7 +62,10 @@ dx9mt/                      # Root
 ├── dx9mt-output/           # Runtime logs + frame dumps (gitignored)
 │   └── session-*/
 │       ├── dx9mt_runtime.log
+│       ├── dx9mt_viewer.log
 │       ├── dx9mt_frame_dump_NNNN.txt
+│       ├── dx9mt_shader_fail_*.txt
+│       ├── dx9mt_pso_fail_*.txt
 │       └── dx9mt_tex_*.raw
 └── wineprefix/             # Wine prefix with FNV installed (gitignored)
 ```
@@ -239,6 +243,27 @@ Standalone native macOS app that reads IPC shared memory and renders D3D9 frames
 - Shader function cache: keyed by bytecode hash
 - PSO cache: keyed by (VS hash, PS hash, vertex descriptor, pixel format, blend/depth state)
 
+### Diagnostics and Artifacts
+
+The current investigation uses three log streams:
+
+- `dx9mt_runtime.log`
+  - Frontend and backend logs
+  - `dx9mt/rttrace` for render-target creation/binding/present summaries
+  - `dx9mt/texdiag` for texture upload skip reasons
+- `dx9mt_viewer.log`
+  - Viewer-side draw skip reasons, shader compile failures, RT format failures
+  - Per-frame cohort summaries grouped by RT, shader pair, and texture-stage mask
+- Failure artifacts
+  - `dx9mt_shader_fail_vs_<hash>.txt`
+  - `dx9mt_shader_fail_ps_<hash>.txt`
+  - `dx9mt_pso_fail_<key>.txt`
+
+Each shader failure artifact contains the parsed shader summary, generated MSL,
+compiler error text, and raw bytecode. Each PSO failure artifact contains the
+vertex descriptor summary plus the cached VS/PS interface summaries used during
+pipeline creation.
+
 ### Frame Dumps
 
 Keyboard-triggered ('D' key): writes frame_dump txt + raw texture files to session output directory.
@@ -316,3 +341,30 @@ Run: `make test` (from root) or `make test-native` (from dx9mt/).
 - **Generation tracking**: textures only re-uploaded when modified (or periodic refresh every 60 frames).
 - **Crash patching**: vectored exception handler catches BSShader factory NULL in FNV, patches EIP to skip vtable calls.
 - **Hardcoded + translated shader paths**: hardcoded shaders for fallback; bytecode→MSL translation for full fidelity.
+
+## Current Rendering Findings
+
+The current in-game blank-world symptom has been narrowed down to multiple
+independent issues:
+
+- The frame clear and HUD are reaching the drawable correctly. `Present()` is
+  not the main failure.
+- The dominant failure is offscreen render-target replay:
+  - Many world draws target render targets with format `113` (`0x71`),
+    `D3DFMT_A16B16G16R16F`.
+  - Before support for this format existed in the viewer, those render targets
+    were rejected as unsupported and the world composite path never reached the
+    drawable.
+- Shader translation is a second blocker:
+  - Several VS/PS pairs compile successfully and render.
+  - Several others fail due to malformed VS inputs, duplicated PS user
+    semantics, vector/scalar type mismatches, or VS/PS interface mismatches.
+- Texture availability is a third blocker:
+  - Some draws reference textures with `upload_size == 0` and no cache/RT
+    override entry in the viewer, so they fail even when the texture metadata is
+    present.
+- Upload-arena overflow remains a later heavy-frame failure mode, but it is not
+  the root cause of the initial blank-world symptom.
+
+See [`docs/rendering_findings.md`](rendering_findings.md) for the current
+evidence and log signatures.

@@ -69,6 +69,7 @@ typedef struct dx9mt_backend_frame_snapshot {
 } dx9mt_backend_frame_snapshot;
 
 typedef struct dx9mt_backend_draw_command {
+  uint32_t command_type;
   uint32_t state_block_hash;
   uint32_t primitive_type;
   int32_t base_vertex;
@@ -82,6 +83,20 @@ typedef struct dx9mt_backend_draw_command {
   uint32_t render_target_width;
   uint32_t render_target_height;
   uint32_t render_target_format;
+  uint32_t src_surface_id;
+  uint32_t src_texture_id;
+  uint32_t src_width;
+  uint32_t src_height;
+  uint32_t src_format;
+  int32_t src_left;
+  int32_t src_top;
+  int32_t src_right;
+  int32_t src_bottom;
+  int32_t dst_left;
+  int32_t dst_top;
+  int32_t dst_right;
+  int32_t dst_bottom;
+  uint32_t stretch_filter;
   uint32_t vertex_buffer_id;
   uint32_t index_buffer_id;
   uint32_t vertex_decl_id;
@@ -233,6 +248,8 @@ static const char *dx9mt_packet_type_name(uint16_t type) {
     return "SHUTDOWN";
   case DX9MT_PACKET_CLEAR:
     return "CLEAR";
+  case DX9MT_PACKET_STRETCH_RECT:
+    return "STRETCH_RECT";
   default:
     return "UNKNOWN";
   }
@@ -264,6 +281,7 @@ dx9mt_backend_draw_command_hash(const dx9mt_backend_draw_command *command) {
     return 0;
   }
 
+  hash = dx9mt_backend_hash_u32(hash, command->command_type);
   hash = dx9mt_backend_hash_u32(hash, command->state_block_hash);
   hash = dx9mt_backend_hash_u32(hash, command->primitive_type);
   hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->base_vertex);
@@ -277,6 +295,20 @@ dx9mt_backend_draw_command_hash(const dx9mt_backend_draw_command *command) {
   hash = dx9mt_backend_hash_u32(hash, command->render_target_width);
   hash = dx9mt_backend_hash_u32(hash, command->render_target_height);
   hash = dx9mt_backend_hash_u32(hash, command->render_target_format);
+  hash = dx9mt_backend_hash_u32(hash, command->src_surface_id);
+  hash = dx9mt_backend_hash_u32(hash, command->src_texture_id);
+  hash = dx9mt_backend_hash_u32(hash, command->src_width);
+  hash = dx9mt_backend_hash_u32(hash, command->src_height);
+  hash = dx9mt_backend_hash_u32(hash, command->src_format);
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->src_left);
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->src_top);
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->src_right);
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->src_bottom);
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->dst_left);
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->dst_top);
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->dst_right);
+  hash = dx9mt_backend_hash_u32(hash, (uint32_t)command->dst_bottom);
+  hash = dx9mt_backend_hash_u32(hash, command->stretch_filter);
   hash = dx9mt_backend_hash_u32(hash, command->vertex_buffer_id);
   hash = dx9mt_backend_hash_u32(hash, command->index_buffer_id);
   hash = dx9mt_backend_hash_u32(hash, command->vertex_decl_id);
@@ -691,6 +723,7 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
 
   command = &g_frame_replay_state->draws[g_frame_replay_state->draw_stored++];
   memset(command, 0, sizeof(*command));
+  command->command_type = DX9MT_METAL_IPC_COMMAND_DRAW;
   command->state_block_hash = draw_packet->state_block_hash;
   command->primitive_type = draw_packet->primitive_type;
   command->base_vertex = draw_packet->base_vertex;
@@ -789,6 +822,45 @@ dx9mt_backend_record_draw_command(const dx9mt_packet_draw_indexed *draw_packet) 
   command->vs_bytecode_dwords = draw_packet->vs_bytecode_dwords;
   command->ps_bytecode = draw_packet->ps_bytecode;
   command->ps_bytecode_dwords = draw_packet->ps_bytecode_dwords;
+}
+
+static void dx9mt_backend_record_stretch_rect_command(
+    const dx9mt_packet_stretch_rect *stretch_packet) {
+  dx9mt_backend_draw_command *command;
+
+  if (!stretch_packet) {
+    return;
+  }
+
+  ++g_frame_replay_state->draw_total;
+  if (g_frame_replay_state->draw_stored >=
+      DX9MT_BACKEND_MAX_DRAW_COMMANDS_PER_FRAME) {
+    ++g_frame_replay_state->draw_dropped;
+    return;
+  }
+
+  command = &g_frame_replay_state->draws[g_frame_replay_state->draw_stored++];
+  memset(command, 0, sizeof(*command));
+  command->command_type = DX9MT_METAL_IPC_COMMAND_STRETCH_RECT;
+  command->render_target_id = stretch_packet->dst_surface_id;
+  command->render_target_texture_id = stretch_packet->dst_texture_id;
+  command->render_target_width = stretch_packet->dst_width;
+  command->render_target_height = stretch_packet->dst_height;
+  command->render_target_format = stretch_packet->dst_format;
+  command->src_surface_id = stretch_packet->src_surface_id;
+  command->src_texture_id = stretch_packet->src_texture_id;
+  command->src_width = stretch_packet->src_width;
+  command->src_height = stretch_packet->src_height;
+  command->src_format = stretch_packet->src_format;
+  command->src_left = stretch_packet->src_left;
+  command->src_top = stretch_packet->src_top;
+  command->src_right = stretch_packet->src_right;
+  command->src_bottom = stretch_packet->src_bottom;
+  command->dst_left = stretch_packet->dst_left;
+  command->dst_top = stretch_packet->dst_top;
+  command->dst_right = stretch_packet->dst_right;
+  command->dst_bottom = stretch_packet->dst_bottom;
+  command->stretch_filter = stretch_packet->filter;
 }
 
 int dx9mt_backend_bridge_init(const dx9mt_backend_init_desc *desc) {
@@ -936,7 +1008,7 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
       return -1;
     }
     if (header->type <= DX9MT_PACKET_INVALID ||
-        header->type > DX9MT_PACKET_CLEAR) {
+        header->type > DX9MT_PACKET_STRETCH_RECT) {
       dx9mt_logf("backend", "unsupported packet type=%u size=%u seq=%u",
                  header->type, header->size, header->sequence);
       return -1;
@@ -980,6 +1052,36 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
                                              header->sequence) ||
           !dx9mt_backend_validate_upload_ref(&draw_packet->constants_ps,
                                              "constants_ps",
+                                             header->sequence)) {
+        return -1;
+      }
+      if (draw_packet->vertex_data.size > 0 &&
+          !dx9mt_backend_validate_upload_ref(&draw_packet->vertex_data,
+                                             "vertex_data",
+                                             header->sequence)) {
+        return -1;
+      }
+      if (draw_packet->index_data.size > 0 &&
+          !dx9mt_backend_validate_upload_ref(&draw_packet->index_data,
+                                             "index_data",
+                                             header->sequence)) {
+        return -1;
+      }
+      if (draw_packet->vertex_decl_data.size > 0 &&
+          !dx9mt_backend_validate_upload_ref(&draw_packet->vertex_decl_data,
+                                             "vertex_decl_data",
+                                             header->sequence)) {
+        return -1;
+      }
+      if (draw_packet->vs_bytecode.size > 0 &&
+          !dx9mt_backend_validate_upload_ref(&draw_packet->vs_bytecode,
+                                             "vs_bytecode",
+                                             header->sequence)) {
+        return -1;
+      }
+      if (draw_packet->ps_bytecode.size > 0 &&
+          !dx9mt_backend_validate_upload_ref(&draw_packet->ps_bytecode,
+                                             "ps_bytecode",
                                              header->sequence)) {
         return -1;
       }
@@ -1041,6 +1143,16 @@ int dx9mt_backend_bridge_submit_packets(const dx9mt_packet_header *packets,
       g_frame_replay_state->present_packet_frame_id = present_packet->frame_id;
       g_frame_replay_state->present_render_target_id =
           present_packet->render_target_id;
+    } else if (header->type == DX9MT_PACKET_STRETCH_RECT) {
+      const dx9mt_packet_stretch_rect *stretch_packet =
+          (const dx9mt_packet_stretch_rect *)header;
+      if (header->size < sizeof(*stretch_packet)) {
+        dx9mt_logf("backend",
+                   "stretch_rect packet too small: size=%u expected=%u",
+                   header->size, (unsigned)sizeof(*stretch_packet));
+        return -1;
+      }
+      dx9mt_backend_record_stretch_rect_command(stretch_packet);
     }
 
     if (dx9mt_backend_trace_packets_enabled()) {
@@ -1176,6 +1288,13 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       draw_count = DX9MT_METAL_IPC_MAX_DRAWS;
     }
 
+    /*
+     * Mark the shared frame as in-progress before mutating any IPC-visible
+     * fields. The viewer ignores sequence 0 and retries if the sequence
+     * changes while it snapshots the frame.
+     */
+    __atomic_store_n(&g_metal_ipc_ptr->sequence, 0, __ATOMIC_RELEASE);
+
     bulk_offset = (uint32_t)(sizeof(dx9mt_metal_ipc_header) +
                              draw_count * sizeof(dx9mt_metal_ipc_draw));
     /* Align bulk data to 16 bytes */
@@ -1190,6 +1309,7 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       const void *data;
 
       memset(d, 0, sizeof(*d));
+      d->command_type = cmd->command_type;
       d->primitive_type = cmd->primitive_type;
       d->base_vertex = cmd->base_vertex;
       d->min_vertex_index = cmd->min_vertex_index;
@@ -1201,6 +1321,20 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
       d->render_target_width = cmd->render_target_width;
       d->render_target_height = cmd->render_target_height;
       d->render_target_format = cmd->render_target_format;
+      d->src_surface_id = cmd->src_surface_id;
+      d->src_texture_id = cmd->src_texture_id;
+      d->src_width = cmd->src_width;
+      d->src_height = cmd->src_height;
+      d->src_format = cmd->src_format;
+      d->src_left = cmd->src_left;
+      d->src_top = cmd->src_top;
+      d->src_right = cmd->src_right;
+      d->src_bottom = cmd->src_bottom;
+      d->dst_left = cmd->dst_left;
+      d->dst_top = cmd->dst_top;
+      d->dst_right = cmd->dst_right;
+      d->dst_bottom = cmd->dst_bottom;
+      d->stretch_filter = cmd->stretch_filter;
       d->viewport_x = cmd->viewport_x;
       d->viewport_y = cmd->viewport_y;
       d->viewport_width = cmd->viewport_width;

@@ -229,6 +229,21 @@ static void track_register_usage(dx9mt_sm_program *prog,
 /* Main parser                                                         */
 /* ------------------------------------------------------------------ */
 
+static dx9mt_sm_def_entry *find_or_alloc_def(dx9mt_sm_program *prog,
+                                             uint16_t reg_type,
+                                             uint16_t reg_number) {
+  for (uint32_t i = 0; i < prog->def_count; ++i) {
+    if (prog->defs[i].reg_type == reg_type &&
+        prog->defs[i].reg_number == reg_number) {
+      return &prog->defs[i];
+    }
+  }
+  if (prog->def_count >= DX9MT_SM_MAX_DEF) {
+    return NULL;
+  }
+  return &prog->defs[prog->def_count++];
+}
+
 int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
                    dx9mt_sm_program *out) {
   uint32_t pos = 0;
@@ -329,6 +344,10 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
             return -1;
           }
           out->output_mask |= (1u << dcl->reg_number);
+          if (dcl->usage == DX9MT_SM_USAGE_POSITION &&
+              dcl->usage_index == 0) {
+            out->writes_position = 1;
+          }
         }
       } else {
         snprintf(out->error_msg, sizeof(out->error_msg),
@@ -348,16 +367,19 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         return -1;
       }
       uint32_t dst_token = bytecode[pos++];
-      if (out->def_count < DX9MT_SM_MAX_DEF) {
-        dx9mt_sm_def_entry *def = &out->defs[out->def_count++];
+      {
+        dx9mt_sm_def_entry *def =
+            find_or_alloc_def(out, DX9MT_SM_REG_CONST,
+                              decode_reg_number(dst_token));
+        if (!def) {
+          snprintf(out->error_msg, sizeof(out->error_msg),
+                   "too many immediate defs (>%u)", DX9MT_SM_MAX_DEF);
+          out->has_error = 1;
+          return -1;
+        }
         def->reg_type = DX9MT_SM_REG_CONST;
         def->reg_number = decode_reg_number(dst_token);
         memcpy(def->values.f, &bytecode[pos], 16);
-      } else {
-        snprintf(out->error_msg, sizeof(out->error_msg),
-                 "too many immediate defs (>%u)", DX9MT_SM_MAX_DEF);
-        out->has_error = 1;
-        return -1;
       }
       pos += 4;
       continue;
@@ -372,16 +394,19 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         return -1;
       }
       uint32_t dst_token = bytecode[pos++];
-      if (out->def_count < DX9MT_SM_MAX_DEF) {
-        dx9mt_sm_def_entry *def = &out->defs[out->def_count++];
+      {
+        dx9mt_sm_def_entry *def =
+            find_or_alloc_def(out, DX9MT_SM_REG_CONSTINT,
+                              decode_reg_number(dst_token));
+        if (!def) {
+          snprintf(out->error_msg, sizeof(out->error_msg),
+                   "too many immediate defs (>%u)", DX9MT_SM_MAX_DEF);
+          out->has_error = 1;
+          return -1;
+        }
         def->reg_type = DX9MT_SM_REG_CONSTINT;
         def->reg_number = decode_reg_number(dst_token);
         memcpy(def->values.i, &bytecode[pos], 16);
-      } else {
-        snprintf(out->error_msg, sizeof(out->error_msg),
-                 "too many immediate defs (>%u)", DX9MT_SM_MAX_DEF);
-        out->has_error = 1;
-        return -1;
       }
       pos += 4;
       continue;
@@ -396,16 +421,19 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         return -1;
       }
       uint32_t dst_token = bytecode[pos++];
-      if (out->def_count < DX9MT_SM_MAX_DEF) {
-        dx9mt_sm_def_entry *def = &out->defs[out->def_count++];
+      {
+        dx9mt_sm_def_entry *def =
+            find_or_alloc_def(out, DX9MT_SM_REG_CONSTBOOL,
+                              decode_reg_number(dst_token));
+        if (!def) {
+          snprintf(out->error_msg, sizeof(out->error_msg),
+                   "too many immediate defs (>%u)", DX9MT_SM_MAX_DEF);
+          out->has_error = 1;
+          return -1;
+        }
         def->reg_type = DX9MT_SM_REG_CONSTBOOL;
         def->reg_number = decode_reg_number(dst_token);
         def->values.b = bytecode[pos];
-      } else {
-        snprintf(out->error_msg, sizeof(out->error_msg),
-                 "too many immediate defs (>%u)", DX9MT_SM_MAX_DEF);
-        out->has_error = 1;
-        return -1;
       }
       pos += 1;
       continue;
