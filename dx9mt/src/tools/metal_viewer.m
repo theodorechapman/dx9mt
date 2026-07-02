@@ -3599,8 +3599,20 @@ static void render_frame(const volatile unsigned char *ipc_base) {
             (const void *)(ipc_base + bulk_off + d->vs_constants_bulk_offset);
         const void *ps_data =
             (const void *)(ipc_base + bulk_off + d->ps_constants_bulk_offset);
+        /* Per-draw dynamic state for the emulated D3D9 alpha test; every
+         * translated PS declares this at fragment buffer(1). */
+        struct {
+          uint32_t alpha_test_enable;
+          uint32_t alpha_func;
+          float alpha_ref;
+        } dx_params = {
+            d->rs_alpha_test_enable ? 1u : 0u,
+            d->rs_alpha_func,
+            (float)(d->rs_alpha_ref & 0xFFu) / 255.0f,
+        };
         [encoder setVertexBytes:vs_data length:d->vs_constants_size atIndex:1];
         [encoder setFragmentBytes:ps_data length:d->ps_constants_size atIndex:0];
+        [encoder setFragmentBytes:&dx_params length:sizeof(dx_params) atIndex:1];
         for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
           [encoder setFragmentTexture:stage_textures[s] atIndex:s];
           [encoder setFragmentSamplerState:stage_samplers[s] atIndex:s];

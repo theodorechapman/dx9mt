@@ -1128,6 +1128,32 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   emit(&ctx, "#include <metal_stdlib>\n");
   emit(&ctx, "using namespace metal;\n\n");
 
+  /*
+   * D3D9 fixed-function alpha test has no Metal equivalent; emulate it in
+   * every translated PS. The enable/func/ref values are per-draw dynamic
+   * state supplied by the viewer at fragment buffer(1), so no PSO variants
+   * are needed. Without this, alpha-cutout geometry (SpeedTree leaf cards,
+   * grates, wires) renders as solid quads.
+   */
+  emit(&ctx, "struct dx9mt_ps_params {\n");
+  emit(&ctx, "  uint alpha_test_enable;\n");
+  emit(&ctx, "  uint alpha_func;\n");
+  emit(&ctx, "  float alpha_ref;\n");
+  emit(&ctx, "};\n");
+  emit(&ctx, "static inline bool dx9mt_alpha_pass(float a, uint func, float ref) {\n");
+  emit(&ctx, "  constexpr float eps = 1.0 / 255.0;\n");
+  emit(&ctx, "  switch (func) {\n");
+  emit(&ctx, "  case 1u: return false;\n");
+  emit(&ctx, "  case 2u: return a < ref;\n");
+  emit(&ctx, "  case 3u: return fabs(a - ref) <= eps;\n");
+  emit(&ctx, "  case 4u: return (a < ref) || (fabs(a - ref) <= eps);\n");
+  emit(&ctx, "  case 5u: return a > ref;\n");
+  emit(&ctx, "  case 6u: return fabs(a - ref) > eps;\n");
+  emit(&ctx, "  case 7u: return (a > ref) || (fabs(a - ref) <= eps);\n");
+  emit(&ctx, "  default: return true;\n");
+  emit(&ctx, "  }\n");
+  emit(&ctx, "}\n\n");
+
   /* Input struct (interpolants from VS) */
   emit(&ctx, "struct PS_In_%08x {\n", bytecode_hash);
   emit(&ctx, "  float4 position [[position]];\n");
@@ -1203,7 +1229,8 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
     emit(&ctx, ",\n    sampler samp%u [[sampler(%u)]]", d->reg_number, d->reg_number);
   }
 
-  emit(&ctx, ",\n    constant float4 *c [[buffer(0)]]) {\n");
+  emit(&ctx, ",\n    constant float4 *c [[buffer(0)]]");
+  emit(&ctx, ",\n    constant dx9mt_ps_params &dx_params [[buffer(1)]]) {\n");
 
   /* Declare temp registers */
   for (uint32_t i = 0; i <= prog->max_temp_reg; ++i) {
@@ -1241,6 +1268,13 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   for (uint32_t i = 0; i < prog->instruction_count; ++i) {
     emit_instruction(&ctx, &prog->instructions[i]);
   }
+
+  /* Fixed-function alpha test on the color0 result */
+  emit(&ctx, "\n  if (dx_params.alpha_test_enable != 0u &&\n");
+  emit(&ctx, "      !dx9mt_alpha_pass(oC0.w, dx_params.alpha_func, "
+             "dx_params.alpha_ref)) {\n");
+  emit(&ctx, "    discard_fragment();\n");
+  emit(&ctx, "  }\n");
 
   /* Return */
   if (needs_output_struct) {
