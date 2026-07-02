@@ -177,6 +177,12 @@ typedef struct dx9mt_metal_ipc_header {
   uint32_t present_render_target_id;
   uint32_t bulk_data_offset;
   uint32_t bulk_data_used;
+  /* Writer-side drop accounting: draws omitted from this frame (missing or
+   * unfittable mandatory payloads, capacity clamp) and texture payloads that
+   * did not fit. Lets the viewer report ground truth about what the writer
+   * failed to ship instead of guessing from per-draw skip heuristics. */
+  uint32_t draws_dropped;
+  uint32_t tex_payloads_dropped;
 } dx9mt_metal_ipc_header;
 
 /* Back-compat alias for code that only reads the header */

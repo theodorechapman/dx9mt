@@ -88,6 +88,7 @@ enum {
   D3DFMT_A8R8G8B8 = 21,
   D3DFMT_X8R8G8B8 = 22,
   D3DFMT_A8 = 28,
+  D3DFMT_A16B16G16R16 = 36,
   D3DFMT_A16B16G16R16F = 113,
   D3DFMT_R32F = 114,
   D3DFMT_DXT1 = ('D' | ('X' << 8) | ('T' << 16) | ('1' << 24)),
@@ -597,6 +598,7 @@ typedef struct dx9mt_frame_diag {
   uint32_t missing_shader_bytecode;
   uint32_t invalid_shader_bytecode;
   uint32_t missing_stage_texture;
+  uint32_t missing_constants;
   uint32_t shader_translation_failed;
   uint32_t translated_pso_failed;
   uint32_t skipped_empty_geometry;
@@ -631,8 +633,9 @@ static uint32_t dx9mt_diag_skipped_total(const dx9mt_frame_diag *diag) {
   return diag->missing_primary_rt + diag->missing_draw_rt +
          diag->missing_target_texture + diag->missing_decl +
          diag->missing_shader_bytecode + diag->invalid_shader_bytecode +
-         diag->missing_stage_texture + diag->shader_translation_failed +
-         diag->translated_pso_failed + diag->skipped_empty_geometry;
+         diag->missing_stage_texture + diag->missing_constants +
+         diag->shader_translation_failed + diag->translated_pso_failed +
+         diag->skipped_empty_geometry;
 }
 
 static void dx9mt_diag_summary(uint32_t frame_id, const dx9mt_frame_diag *diag) {
@@ -656,13 +659,15 @@ static void dx9mt_diag_summary(uint32_t frame_id, const dx9mt_frame_diag *diag) 
       "frame %u diagnostics: translated=%u skipped=%u missing_primary_rt=%u "
       "missing_draw_rt=%u missing_target_texture=%u missing_decl=%u "
       "missing_shader_bytecode=%u invalid_shader_bytecode=%u "
-      "missing_stage_texture=%u shader_translation_failed=%u "
+      "missing_stage_texture=%u missing_constants=%u "
+      "shader_translation_failed=%u "
       "translated_pso_failed=%u skipped_empty_geometry=%u",
       frame_id, diag->drawn_translated, skipped_total,
       diag->missing_primary_rt, diag->missing_draw_rt,
       diag->missing_target_texture, diag->missing_decl,
       diag->missing_shader_bytecode, diag->invalid_shader_bytecode,
-      diag->missing_stage_texture, diag->shader_translation_failed,
+      diag->missing_stage_texture, diag->missing_constants,
+      diag->shader_translation_failed,
       diag->translated_pso_failed, diag->skipped_empty_geometry);
 }
 
@@ -1206,6 +1211,9 @@ static MTLPrimitiveType d3d_prim_to_mtl(uint32_t d3d_type) {
     return MTLPrimitiveTypeTriangle;
   case D3DPT_TRIANGLESTRIP:
     return MTLPrimitiveTypeTriangleStrip;
+  case D3DPT_TRIANGLEFAN:
+    /* No Metal fans; the draw path re-indexes fan windows into lists. */
+    return MTLPrimitiveTypeTriangle;
   default:
     return MTLPrimitiveTypeTriangle;
   }
@@ -1231,6 +1239,8 @@ static MTLPixelFormat d3d_texture_format_to_mtl(uint32_t format) {
     return MTLPixelFormatBGRA8Unorm;
   case D3DFMT_A8:
     return MTLPixelFormatR8Unorm;
+  case D3DFMT_A16B16G16R16:
+    return MTLPixelFormatRGBA16Unorm;
   case D3DFMT_A16B16G16R16F:
     return MTLPixelFormatRGBA16Float;
   case D3DFMT_R32F:
@@ -1263,7 +1273,7 @@ static uint32_t d3d_texture_min_row_pitch(uint32_t format, uint32_t width) {
   if (format == D3DFMT_A8) {
     return width;
   }
-  if (format == D3DFMT_A16B16G16R16F) {
+  if (format == D3DFMT_A16B16G16R16 || format == D3DFMT_A16B16G16R16F) {
     return width * 8u;
   }
   if (format == D3DFMT_R32F) {
@@ -2067,6 +2077,9 @@ static void ensure_geometry_pso(uint32_t stride,
   vd = [[MTLVertexDescriptor alloc] init];
 
   for (uint16_t i = 0; i < elem_count; ++i) {
+    if (elems[i].stream != 0) {
+      continue;
+    }
     if (elems[i].usage == D3DDECLUSAGE_POSITION && elems[i].usage_index == 0) {
       vd.attributes[0].format = decl_type_to_mtl(elems[i].type);
       vd.attributes[0].offset = elems[i].offset;
@@ -2376,6 +2389,7 @@ static const char *d3d_fmt_name(uint32_t fmt) {
   case 21: return "A8R8G8B8";
   case 22: return "X8R8G8B8";
   case 28: return "A8";
+  case 36: return "A16B16G16R16";
   case 113: return "A16B16G16R16F";
   case 114: return "R32F";
   case 101: return "INDEX16";
@@ -2550,6 +2564,9 @@ static id<MTLRenderPipelineState> create_translated_pso(
   MTLVertexDescriptor *vd = [[MTLVertexDescriptor alloc] init];
   /* Map vertex elements using attribute index = register number based on usage */
   for (uint16_t e = 0; e < elem_count; ++e) {
+    /* Only stream 0 is captured and bound; applying another stream's
+     * offsets against the stream-0 buffer would fetch garbage. */
+    if (elems[e].stream != 0) continue;
     MTLVertexFormat fmt = decl_type_to_mtl(elems[e].type);
     if (fmt == MTLVertexFormatInvalid) continue;
     /* For translated shaders: attribute index matches v# register.
@@ -3318,6 +3335,13 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         pso_key ^= ((uint64_t)d->rs_blendop << 24) |
                    ((uint64_t)d->rs_colorwriteenable << 16);
         pso_key ^= (uint64_t)draw_target_texture.pixelFormat << 8;
+        /* The vertex declaration layout is baked into the PSO's vertex
+         * descriptor -- two draws sharing shaders/stride but with different
+         * element offsets must not share a pipeline. */
+        pso_key ^= hash_decl_key(stride, elems, decl_count, textured,
+                                 d->rs_alpha_blend_enable, d->rs_src_blend,
+                                 d->rs_dest_blend, d->rs_blendop,
+                                 d->rs_colorwriteenable);
 
         translated_pso = create_translated_pso(
             vs_func, ps_func, vs_hash, ps_hash, elems, decl_count, stride,
@@ -3453,6 +3477,56 @@ static void render_frame(const volatile unsigned char *ipc_base) {
 
       index_count = d3d_index_count(d->primitive_type, d->primitive_count);
 
+      /* Metal has no triangle fans -- re-index the fan window into a list. */
+      uint32_t draw_start_index = d->start_index;
+      if (d->primitive_type == D3DPT_TRIANGLEFAN) {
+        uint32_t isz = (mtl_index_type == MTLIndexTypeUInt32) ? 4u : 2u;
+        uint64_t fan_end =
+            ((uint64_t)d->start_index + d->primitive_count + 2u) * isz;
+        uint32_t list_count = d->primitive_count * 3u;
+        void *converted;
+        if (list_count == 0 || fan_end > d->ib_bulk_size) {
+          ++diag.skipped_empty_geometry;
+          dx9mt_diag_detail(
+              &diag, hdr->frame_id, i,
+              "triangle fan window out of bounds start=%u prims=%u ib=%u",
+              d->start_index, d->primitive_count, d->ib_bulk_size);
+          continue;
+        }
+        converted = malloc((size_t)list_count * isz);
+        if (!converted) {
+          ++diag.skipped_empty_geometry;
+          continue;
+        }
+        if (isz == 4) {
+          const uint32_t *fan_src = (const uint32_t *)ib_data + d->start_index;
+          uint32_t *fan_dst = (uint32_t *)converted;
+          for (uint32_t t = 0; t < d->primitive_count; ++t) {
+            fan_dst[t * 3 + 0] = fan_src[0];
+            fan_dst[t * 3 + 1] = fan_src[t + 1];
+            fan_dst[t * 3 + 2] = fan_src[t + 2];
+          }
+        } else {
+          const uint16_t *fan_src = (const uint16_t *)ib_data + d->start_index;
+          uint16_t *fan_dst = (uint16_t *)converted;
+          for (uint32_t t = 0; t < d->primitive_count; ++t) {
+            fan_dst[t * 3 + 0] = fan_src[0];
+            fan_dst[t * 3 + 1] = fan_src[t + 1];
+            fan_dst[t * 3 + 2] = fan_src[t + 2];
+          }
+        }
+        ib_buf = [s_device newBufferWithBytes:converted
+                                       length:(NSUInteger)list_count * isz
+                                      options:MTLResourceStorageModeShared];
+        free(converted);
+        if (!ib_buf) {
+          ++diag.skipped_empty_geometry;
+          continue;
+        }
+        index_count = list_count;
+        draw_start_index = 0;
+      }
+
       if (use_scene_blit_fallback) {
         struct {
           float dst_rect[4];
@@ -3487,32 +3561,46 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         continue;
       }
 
+      /*
+       * Fail closed on missing shader constants: translated shaders index
+       * the full c[] range, so binding a small placeholder means the GPU
+       * reads out of bounds (garbage WVP -> exploded geometry, garbage PS
+       * constants -> wrong colors). A skipped draw is strictly less wrong
+       * than a garbage draw.
+       */
+      if (!use_compat_textured_tint) {
+        if (d->vs_constants_size == 0 ||
+            !dx9mt_ipc_bulk_range_valid(bulk_off, bulk_used,
+                                        d->vs_constants_bulk_offset,
+                                        d->vs_constants_size)) {
+          ++diag.missing_constants;
+          dx9mt_diag_detail(&diag, hdr->frame_id, i,
+                            "missing VS constants size=%u off=%u",
+                            d->vs_constants_size, d->vs_constants_bulk_offset);
+          continue;
+        }
+        if (d->ps_constants_size == 0 ||
+            !dx9mt_ipc_bulk_range_valid(bulk_off, bulk_used,
+                                        d->ps_constants_bulk_offset,
+                                        d->ps_constants_size)) {
+          ++diag.missing_constants;
+          dx9mt_diag_detail(&diag, hdr->frame_id, i,
+                            "missing PS constants size=%u off=%u",
+                            d->ps_constants_size, d->ps_constants_bulk_offset);
+          continue;
+        }
+      }
+
       [encoder setRenderPipelineState:use_compat_textured_tint ? geometry_pso
                                                               : translated_pso];
       [encoder setVertexBuffer:vb_buf offset:d->stream0_offset atIndex:0];
       if (!use_compat_textured_tint) {
-        if (d->vs_constants_size > 0 &&
-            dx9mt_ipc_bulk_range_valid(bulk_off, bulk_used,
-                                       d->vs_constants_bulk_offset,
-                                       d->vs_constants_size)) {
-          const void *vs_data =
-              (const void *)(ipc_base + bulk_off + d->vs_constants_bulk_offset);
-          [encoder setVertexBytes:vs_data length:d->vs_constants_size atIndex:1];
-        } else {
-          static const float zero[4] = {0, 0, 0, 0};
-          [encoder setVertexBytes:zero length:sizeof(zero) atIndex:1];
-        }
-        if (d->ps_constants_size > 0 &&
-            dx9mt_ipc_bulk_range_valid(bulk_off, bulk_used,
-                                       d->ps_constants_bulk_offset,
-                                       d->ps_constants_size)) {
-          const void *ps_data =
-              (const void *)(ipc_base + bulk_off + d->ps_constants_bulk_offset);
-          [encoder setFragmentBytes:ps_data length:d->ps_constants_size atIndex:0];
-        } else {
-          static const float zero[4] = {0, 0, 0, 0};
-          [encoder setFragmentBytes:zero length:sizeof(zero) atIndex:0];
-        }
+        const void *vs_data =
+            (const void *)(ipc_base + bulk_off + d->vs_constants_bulk_offset);
+        const void *ps_data =
+            (const void *)(ipc_base + bulk_off + d->ps_constants_bulk_offset);
+        [encoder setVertexBytes:vs_data length:d->vs_constants_size atIndex:1];
+        [encoder setFragmentBytes:ps_data length:d->ps_constants_size atIndex:0];
         for (uint32_t s = 0; s < DX9MT_MAX_PS_SAMPLERS; ++s) {
           [encoder setFragmentTexture:stage_textures[s] atIndex:s];
           [encoder setFragmentSamplerState:stage_samplers[s] atIndex:s];
@@ -3610,7 +3698,7 @@ static void render_frame(const volatile unsigned char *ipc_base) {
                           indexCount:index_count
                            indexType:mtl_index_type
                          indexBuffer:ib_buf
-                   indexBufferOffset:d->start_index *
+                   indexBufferOffset:(NSUInteger)draw_start_index *
                                     (mtl_index_type == MTLIndexTypeUInt32 ? 4
                                                                          : 2)
                        instanceCount:1
@@ -3637,6 +3725,12 @@ static void render_frame(const volatile unsigned char *ipc_base) {
       }
     }
 
+    if (hdr->draws_dropped || hdr->tex_payloads_dropped) {
+      viewer_logf("ERROR",
+                  "frame %u writer dropped draws=%u tex_payloads=%u",
+                  hdr->frame_id, hdr->draws_dropped,
+                  hdr->tex_payloads_dropped);
+    }
     dx9mt_diag_summary(hdr->frame_id, &diag);
     dx9mt_log_cohort_summary(hdr->frame_id, cohort_counts, &diag);
 

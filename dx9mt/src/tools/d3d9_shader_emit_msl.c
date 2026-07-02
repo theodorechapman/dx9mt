@@ -201,20 +201,6 @@ static const char *zero_literal_for_count(int count) {
   }
 }
 
-static int dst_width_for_reg(const dx9mt_sm_register *r) {
-  int width;
-
-  if (!r) {
-    return 4;
-  }
-  if (r->type == DX9MT_SM_REG_DEPTHOUT) {
-    return 1;
-  }
-
-  width = mask_count(r->write_mask);
-  return width > 0 ? width : 4;
-}
-
 static uint8_t reg_available_width(const emit_ctx *ctx,
                                    const dx9mt_sm_register *r) {
   if (!ctx || !r) {
@@ -392,7 +378,6 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
   char s2[DX9MT_MSL_EXPR_BUFSZ];
   char rhs[DX9MT_MSL_RHS_BUFSZ];
   int rhs_is_scalar = 0;
-  int dst_width = 4;
 
   int has_dst = 1;
   switch (inst->opcode) {
@@ -406,12 +391,11 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
   if (has_dst) {
     reg_name(dst, sizeof(dst), &inst->dst, ctx);
     wmask_str(wm, inst->dst.write_mask);
-    dst_width = dst_width_for_reg(&inst->dst);
   }
 
   for (int i = 0; i < inst->num_sources && i < 3; ++i) {
     char *tgt = (i == 0) ? s0 : (i == 1) ? s1 : s2;
-    src_expr(tgt, 128, &inst->src[i], ctx);
+    src_expr(tgt, DX9MT_MSL_EXPR_BUFSZ, &inst->src[i], ctx);
   }
 
   int do_sat = (has_dst && (inst->dst.result_modifier & DX9MT_SM_RMOD_SATURATE));
@@ -420,39 +404,33 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
   case DX9MT_SM_OP_NOP:
     return;
 
+  /*
+   * Component-wise ops build a FULL 4-wide RHS (each lane from its own
+   * swizzle component) and the store selects the write-mask lanes:
+   *   add r0.yzw, a, b  ->  r0.yzw = (a4 + b4).yzw
+   * D3D semantics: destination component k receives source swizzle
+   * component k. Narrowing sources to the first mask_count() components
+   * (the old scheme) mis-assigned every mask that isn't a .x/.xy/.xyz
+   * prefix -- 22% of all instructions in FNV's shipped shaders.
+   */
   case DX9MT_SM_OP_MOV:
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s", s0);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_ADD:
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s + %s", s0, s1);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_SUB:
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s - %s", s0, s1);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_MUL:
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s * %s", s0, s1);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_MAD:
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
-    src_expr_width(s2, sizeof(s2), &inst->src[2], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "%s * %s + %s", s0, s1, s2);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_DP3:
@@ -482,36 +460,22 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
     break;
 
   case DX9MT_SM_OP_MIN:
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "min(%s, %s)", s0, s1);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_MAX:
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "max(%s, %s)", s0, s1);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
-  case DX9MT_SM_OP_SLT: {
-    int mc = mask_count(inst->dst.write_mask);
-    const char *ft = float_type_for_count(mc);
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, mc);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, mc);
-    snprintf(rhs, sizeof(rhs), "select(%s(0.0), %s(1.0), (%s < %s))", ft, ft, s0, s1);
+  case DX9MT_SM_OP_SLT:
+    snprintf(rhs, sizeof(rhs),
+             "select(float4(0.0), float4(1.0), (%s < %s))", s0, s1);
     break;
-  }
 
-  case DX9MT_SM_OP_SGE: {
-    int mc = mask_count(inst->dst.write_mask);
-    const char *ft = float_type_for_count(mc);
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, mc);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, mc);
-    snprintf(rhs, sizeof(rhs), "select(%s(0.0), %s(1.0), (%s >= %s))", ft, ft, s0, s1);
+  case DX9MT_SM_OP_SGE:
+    snprintf(rhs, sizeof(rhs),
+             "select(float4(0.0), float4(1.0), (%s >= %s))", s0, s1);
     break;
-  }
 
   case DX9MT_SM_OP_EXP:
     src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 1);
@@ -526,15 +490,11 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
     break;
 
   case DX9MT_SM_OP_FRC:
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "fract(%s)", s0);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_ABS:
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "abs(%s)", s0);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
   case DX9MT_SM_OP_NRM: {
@@ -547,24 +507,14 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
 
   case DX9MT_SM_OP_LRP:
     /* lrp dst, f, a, b = mix(b, a, f) = f*(a-b)+b */
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, dst_width);
-    src_expr_width(s2, sizeof(s2), &inst->src[2], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "mix(%s, %s, %s)", s2, s1, s0);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
-  case DX9MT_SM_OP_CMP: {
+  case DX9MT_SM_OP_CMP:
     /* cmp dst, src0, src1, src2: per-component (src0 >= 0) ? src1 : src2 */
-    int mc = mask_count(inst->dst.write_mask);
-    const char *ft = float_type_for_count(mc);
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, mc);
-    src_expr_width(s1, sizeof(s1), &inst->src[1], ctx, mc);
-    src_expr_width(s2, sizeof(s2), &inst->src[2], ctx, mc);
     snprintf(rhs, sizeof(rhs),
-             "select(%s, %s, %s >= %s(0.0))", s2, s1, s0, ft);
+             "select(%s, %s, %s >= float4(0.0))", s2, s1, s0);
     break;
-  }
 
   case DX9MT_SM_OP_POW:
     src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, 1);
@@ -607,9 +557,11 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
     snprintf(rhs, sizeof(rhs), "float4(1.0, _d, _s, 1.0)");
     /* We'll close the brace after the assignment */
     if (do_sat)
-      emit(ctx, "    %s%s = saturate(%s);\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = saturate((%s)%s);\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     else
-      emit(ctx, "    %s%s = %s;\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = (%s)%s;\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     emit(ctx, "  }\n");
     return;
   }
@@ -638,15 +590,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
 
   case DX9MT_SM_OP_MOVA:
     /* mova a0, src: integer part of src -> address register */
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx,
-                   dst_width == 1 ? 1 : dst_width);
-    if (dst_width == 1) {
-      snprintf(rhs, sizeof(rhs), "floor(%s + 0.5)", s0);
-      rhs_is_scalar = 1;
-    } else {
-      snprintf(rhs, sizeof(rhs), "floor(%s + %s(0.5))", s0,
-               float_type_for_count(dst_width));
-    }
+    snprintf(rhs, sizeof(rhs), "floor(%s + float4(0.5))", s0);
     break;
 
   case DX9MT_SM_OP_M4x4: {
@@ -661,9 +605,11 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
              "float4(dot(_mv, c[%u]), dot(_mv, c[%u]), dot(_mv, c[%u]), dot(_mv, c[%u]))",
              cn, cn+1, cn+2, cn+3);
     if (do_sat)
-      emit(ctx, "    %s%s = saturate(%s);\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = saturate((%s)%s);\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     else
-      emit(ctx, "    %s%s = %s;\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = (%s)%s;\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     emit(ctx, "  }\n");
     return;
   }
@@ -676,9 +622,11 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
              "float4(dot(_mv, c[%u]), dot(_mv, c[%u]), dot(_mv, c[%u]), 1.0)",
              cn, cn+1, cn+2);
     if (do_sat)
-      emit(ctx, "    %s%s = saturate(%s);\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = saturate((%s)%s);\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     else
-      emit(ctx, "    %s%s = %s;\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = (%s)%s;\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     emit(ctx, "  }\n");
     return;
   }
@@ -691,9 +639,11 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
              "float4(dot(_mv, c[%u].xyz), dot(_mv, c[%u].xyz), dot(_mv, c[%u].xyz), dot(_mv, c[%u].xyz))",
              cn, cn+1, cn+2, cn+3);
     if (do_sat)
-      emit(ctx, "    %s%s = saturate(%s);\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = saturate((%s)%s);\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     else
-      emit(ctx, "    %s%s = %s;\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = (%s)%s;\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     emit(ctx, "  }\n");
     return;
   }
@@ -706,9 +656,11 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
              "float4(dot(_mv, c[%u].xyz), dot(_mv, c[%u].xyz), dot(_mv, c[%u].xyz), 1.0)",
              cn, cn+1, cn+2);
     if (do_sat)
-      emit(ctx, "    %s%s = saturate(%s);\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = saturate((%s)%s);\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     else
-      emit(ctx, "    %s%s = %s;\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = (%s)%s;\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     emit(ctx, "  }\n");
     return;
   }
@@ -721,9 +673,11 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
              "float4(dot(_mv, c[%u].xyz), dot(_mv, c[%u].xyz), 0.0, 1.0)",
              cn, cn+1);
     if (do_sat)
-      emit(ctx, "    %s%s = saturate(%s);\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = saturate((%s)%s);\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     else
-      emit(ctx, "    %s%s = %s;\n", dst, wm, rhs);
+      emit(ctx, "    %s%s = (%s)%s;\n", dst, wm,
+           rhs, (inst->dst.write_mask & 0xF) != 0xF ? wm : "");
     emit(ctx, "  }\n");
     return;
   }
@@ -763,6 +717,42 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
              samp_num, samp_num, coord_expr, lod_expr);
     break;
   }
+
+  case DX9MT_SM_OP_TEXLDD: {
+    /* texldd dst, coord, sampler, ddx, ddy: explicit-gradient sample */
+    uint16_t samp_num = inst->src[1].number;
+    char coord_expr[DX9MT_MSL_EXPR_BUFSZ];
+    char ddx_expr[DX9MT_MSL_EXPR_BUFSZ];
+    char ddy_expr[DX9MT_MSL_EXPR_BUFSZ];
+    int coord_width = 2;
+    const char *grad = "gradient2d";
+    if (samp_num < 16 &&
+        ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_CUBE) {
+      coord_width = 3;
+      grad = "gradientcube";
+    } else if (samp_num < 16 &&
+               ctx->sampler_type_map[samp_num] == DX9MT_SM_SAMP_VOLUME) {
+      coord_width = 3;
+      grad = "gradient3d";
+    }
+    src_expr_width(coord_expr, sizeof(coord_expr), &inst->src[0], ctx,
+                   coord_width);
+    src_expr_width(ddx_expr, sizeof(ddx_expr), &inst->src[2], ctx,
+                   coord_width);
+    src_expr_width(ddy_expr, sizeof(ddy_expr), &inst->src[3], ctx,
+                   coord_width);
+    snprintf(rhs, sizeof(rhs), "tex%u.sample(samp%u, %s, %s(%s, %s))",
+             samp_num, samp_num, coord_expr, grad, ddx_expr, ddy_expr);
+    break;
+  }
+
+  case DX9MT_SM_OP_DSX:
+    snprintf(rhs, sizeof(rhs), "dfdx(%s)", s0);
+    break;
+
+  case DX9MT_SM_OP_DSY:
+    snprintf(rhs, sizeof(rhs), "dfdy(%s)", s0);
+    break;
 
   case DX9MT_SM_OP_TEXKILL:
     emit(ctx, "  if (any(%s.xyz < float3(0.0))) discard_fragment();\n", dst);
@@ -818,9 +808,7 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
 
   case DX9MT_SM_OP_SGN:
     /* sgn dst, src0, src1(scratch), src2(scratch) -- only src0 matters */
-    src_expr_width(s0, sizeof(s0), &inst->src[0], ctx, dst_width);
     snprintf(rhs, sizeof(rhs), "sign(%s)", s0);
-    rhs_is_scalar = (dst_width == 1);
     break;
 
   default:
@@ -828,58 +816,62 @@ static void emit_instruction(emit_ctx *ctx, const dx9mt_sm_instruction *inst) {
     return;
   }
 
-  /* Broadcast scalar RHS to match destination width when needed.
-   * Single-component write mask: scalar is fine.
-   * Multi-component: need floatN() wrapper so types match. */
-  char final_rhs[DX9MT_MSL_RHS_BUFSZ];
-  if (rhs_is_scalar && has_dst) {
-    int mc = dst_width;
-    if (mc == 1)
-      snprintf(final_rhs, sizeof(final_rhs), "%s", rhs);
-    else if (mc == 2)
-      snprintf(final_rhs, sizeof(final_rhs), "float2(%s)", rhs);
-    else if (mc == 3)
-      snprintf(final_rhs, sizeof(final_rhs), "float3(%s)", rhs);
-    else
-      snprintf(final_rhs, sizeof(final_rhs), "float4(%s)", rhs);
-  } else {
-    snprintf(final_rhs, sizeof(final_rhs), "%s", rhs);
-  }
+  /*
+   * Store. Vector RHS values are full 4-wide; the write mask selects the
+   * SAME components on both sides so destination component k always
+   * receives RHS component k (D3D write-mask semantics):
+   *   r0.yzw = (rhs4).yzw
+   * A scalar RHS broadcasts, which is mask-shape independent. Scalar
+   * destination registers (oDepth/oFog/oPts) take the first masked
+   * component.
+   */
+  {
+    uint8_t mask = inst->dst.write_mask & 0xF;
+    int dst_is_scalar_reg =
+        (inst->dst.type == DX9MT_SM_REG_DEPTHOUT) ||
+        (inst->dst.type == DX9MT_SM_REG_RASTOUT && inst->dst.number != 0);
+    char final_rhs[DX9MT_MSL_RHS_BUFSZ];
+    char wm2[8];
 
-  /* Truncate vector RHS to match write-mask width when needed.
-   * E.g. dst.xy = float4_val → dst.xy = (float4_val).xy
-   * Scalar RHS (from replicate swizzle) broadcasts naturally in MSL. */
-  if (!rhs_is_scalar && has_dst && dst_width < 4) {
-    int mc = dst_width;
-    int rhs_width = 4;
-    if (inst->num_sources == 1) {
-      const uint8_t *sw = inst->src[0].swizzle;
-      if (sw[0] == sw[1] && sw[1] == sw[2] && sw[2] == sw[3])
-        rhs_width = 1;
-    } else if (inst->num_sources >= 2) {
-      int all_scalar = 1;
-      for (int i = 0; i < inst->num_sources && i < 3; ++i) {
-        const uint8_t *sw = inst->src[i].swizzle;
-        if (!(sw[0] == sw[1] && sw[1] == sw[2] && sw[2] == sw[3])) {
-          all_scalar = 0;
-          break;
-        }
+    if (mask == 0) {
+      mask = 0xF;
+    }
+    wmask_str(wm2, mask);
+
+    if (dst_is_scalar_reg) {
+      if (rhs_is_scalar) {
+        snprintf(final_rhs, sizeof(final_rhs), "%s", rhs);
+      } else {
+        static const char comp_letter[] = "xyzw";
+        int first = (mask & 1) ? 0 : (mask & 2) ? 1 : (mask & 4) ? 2 : 3;
+        snprintf(final_rhs, sizeof(final_rhs), "(%s).%c", rhs,
+                 comp_letter[first]);
       }
-      if (all_scalar) rhs_width = 1;
+      if (do_sat)
+        emit(ctx, "  %s = saturate(%s);\n", dst, final_rhs);
+      else
+        emit(ctx, "  %s = %s;\n", dst, final_rhs);
+      return;
     }
-    if (mc < rhs_width) {
-      static const char *trunc_swiz[] = {"", ".x", ".xy", ".xyz", ""};
-      char tmp[DX9MT_MSL_RHS_BUFSZ];
-      snprintf(tmp, sizeof(tmp), "(%s)%s", final_rhs, trunc_swiz[mc]);
-      snprintf(final_rhs, sizeof(final_rhs), "%s", tmp);
-    }
-  }
 
-  /* Standard assignment with optional saturation */
-  if (do_sat)
-    emit(ctx, "  %s%s = saturate(%s);\n", dst, wm, final_rhs);
-  else
-    emit(ctx, "  %s%s = %s;\n", dst, wm, final_rhs);
+    if (rhs_is_scalar) {
+      int mc = mask_count(mask);
+      if (mc <= 1)
+        snprintf(final_rhs, sizeof(final_rhs), "%s", rhs);
+      else
+        snprintf(final_rhs, sizeof(final_rhs), "%s(%s)",
+                 float_type_for_count(mc), rhs);
+    } else if (mask == 0xF) {
+      snprintf(final_rhs, sizeof(final_rhs), "%s", rhs);
+    } else {
+      snprintf(final_rhs, sizeof(final_rhs), "(%s)%s", rhs, wm2);
+    }
+
+    if (do_sat)
+      emit(ctx, "  %s%s = saturate(%s);\n", dst, wm2, final_rhs);
+    else
+      emit(ctx, "  %s%s = %s;\n", dst, wm2, final_rhs);
+  }
 }
 
 /* ------------------------------------------------------------------ */

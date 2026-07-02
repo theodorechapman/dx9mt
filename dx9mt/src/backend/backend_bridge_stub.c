@@ -261,6 +261,12 @@ static uint32_t dx9mt_backend_hash_u32(uint32_t hash, uint32_t value) {
   return hash;
 }
 
+#ifdef _WIN32
+static uint64_t dx9mt_backend_align16_u64(uint64_t value) {
+  return (value + 15u) & ~(uint64_t)15u;
+}
+#endif
+
 static uint32_t dx9mt_backend_hash_upload_ref(uint32_t hash,
                                               const dx9mt_upload_ref *ref) {
   if (!ref) {
@@ -1283,9 +1289,13 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
     uint32_t bulk_used = 0;
     dx9mt_metal_ipc_draw *ipc_draws;
     uint32_t i;
+    uint32_t out_count = 0;
+    uint32_t ipc_draws_dropped = 0;
+    uint32_t ipc_tex_payloads_dropped = 0;
 
     if (draw_count > DX9MT_METAL_IPC_MAX_DRAWS) {
       draw_count = DX9MT_METAL_IPC_MAX_DRAWS;
+      ipc_draws_dropped = g_frame_replay_state->draw_stored - draw_count;
     }
 
     /*
@@ -1305,9 +1315,48 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
 
     for (i = 0; i < draw_count; ++i) {
       const dx9mt_backend_draw_command *cmd = &g_frame_replay_state->draws[i];
-      dx9mt_metal_ipc_draw *d = &ipc_draws[i];
+      dx9mt_metal_ipc_draw *d;
       const void *data;
 
+      if (cmd->command_type == DX9MT_METAL_IPC_COMMAND_DRAW) {
+        /*
+         * Fail closed: a draw that cannot ship every payload the viewer
+         * requires (geometry, declaration, constants, bytecode) is dropped
+         * and counted here instead of being emitted half-complete. A
+         * half-complete draw either gets skipped by the viewer anyway or --
+         * worse -- renders with garbage shader inputs.
+         */
+        uint32_t decl_bytes = (uint32_t)cmd->vertex_decl_count * 8u;
+        uint64_t mandatory =
+            dx9mt_backend_align16_u64(cmd->vertex_data_size) +
+            dx9mt_backend_align16_u64(cmd->index_data_size) +
+            dx9mt_backend_align16_u64(decl_bytes) +
+            dx9mt_backend_align16_u64(cmd->constants_vs.size) +
+            dx9mt_backend_align16_u64(cmd->constants_ps.size) +
+            dx9mt_backend_align16_u64(cmd->vs_bytecode.size) +
+            dx9mt_backend_align16_u64(cmd->ps_bytecode.size);
+
+        if (cmd->vertex_data_size == 0 ||
+            !dx9mt_frontend_upload_resolve(&cmd->vertex_data) ||
+            cmd->index_data_size == 0 ||
+            !dx9mt_frontend_upload_resolve(&cmd->index_data) ||
+            (cmd->vertex_decl_count > 0 &&
+             !dx9mt_frontend_upload_resolve(&cmd->vertex_decl_data)) ||
+            (cmd->vertex_decl_count == 0 && cmd->fvf == 0) ||
+            !dx9mt_frontend_upload_resolve(&cmd->constants_vs) ||
+            !dx9mt_frontend_upload_resolve(&cmd->constants_ps) ||
+            cmd->vs_bytecode.size < 8 ||
+            !dx9mt_frontend_upload_resolve(&cmd->vs_bytecode) ||
+            cmd->ps_bytecode.size < 8 ||
+            !dx9mt_frontend_upload_resolve(&cmd->ps_bytecode) ||
+            (uint64_t)bulk_offset + bulk_used + mandatory >
+                DX9MT_METAL_IPC_SIZE) {
+          ++ipc_draws_dropped;
+          continue;
+        }
+      }
+
+      d = &ipc_draws[out_count];
       memset(d, 0, sizeof(*d));
       d->command_type = cmd->command_type;
       d->primitive_type = cmd->primitive_type;
@@ -1468,6 +1517,8 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
           memcpy(ipc_base + bulk_offset + bulk_used, data,
                  cmd->tex_data[s].size);
           bulk_used += (cmd->tex_data[s].size + 15u) & ~15u;
+        } else if (cmd->tex_data[s].size > 0) {
+          ++ipc_tex_payloads_dropped;
         }
       }
 
@@ -1493,6 +1544,15 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
                cmd->ps_bytecode.size);
         bulk_used += (cmd->ps_bytecode.size + 15u) & ~15u;
       }
+
+      ++out_count;
+    }
+
+    if (ipc_draws_dropped || ipc_tex_payloads_dropped) {
+      dx9mt_logf("backend",
+                 "ipc frame=%u dropped draws=%u tex_payloads=%u bulk_used=%u",
+                 frame_id, ipc_draws_dropped, ipc_tex_payloads_dropped,
+                 bulk_used);
     }
 
     g_metal_ipc_ptr->width = g_present_target.width;
@@ -1502,7 +1562,9 @@ int dx9mt_backend_bridge_present(uint32_t frame_id) {
     g_metal_ipc_ptr->clear_flags = snapshot.last_clear_flags;
     g_metal_ipc_ptr->clear_z = snapshot.last_clear_z;
     g_metal_ipc_ptr->clear_stencil = snapshot.last_clear_stencil;
-    g_metal_ipc_ptr->draw_count = draw_count;
+    g_metal_ipc_ptr->draw_count = out_count;
+    g_metal_ipc_ptr->draws_dropped = ipc_draws_dropped;
+    g_metal_ipc_ptr->tex_payloads_dropped = ipc_tex_payloads_dropped;
     g_metal_ipc_ptr->replay_hash = snapshot.replay_hash;
     g_metal_ipc_ptr->frame_id = frame_id;
     g_metal_ipc_ptr->present_render_target_id =

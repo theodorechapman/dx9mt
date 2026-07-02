@@ -87,6 +87,9 @@ static int opcode_src_count(uint16_t op) {
   case DX9MT_SM_OP_TEXKILL: return 0; /* dst only */
   case DX9MT_SM_OP_TEXLD:   return 2; /* coord, sampler */
   case DX9MT_SM_OP_TEXLDL:  return 2; /* coord, sampler */
+  case DX9MT_SM_OP_TEXLDD:  return 4; /* coord, sampler, ddx, ddy */
+  case DX9MT_SM_OP_DSX:     return 1;
+  case DX9MT_SM_OP_DSY:     return 1;
   case DX9MT_SM_OP_CMP:     return 3;
   case DX9MT_SM_OP_DP2ADD:  return 3;
   /* Flow control (no dst/src in normal sense) */
@@ -229,6 +232,30 @@ static void track_register_usage(dx9mt_sm_program *prog,
 /* Main parser                                                         */
 /* ------------------------------------------------------------------ */
 
+/*
+ * SM2+ instruction tokens encode their operand DWORD count in bits [27:24].
+ * Use it as an oracle: if our decode consumed a different number of tokens,
+ * our opcode table disagrees with the compiler that produced this bytecode
+ * and everything after this instruction would be desynced garbage. Failing
+ * the whole shader keeps a mistranslation from ever reaching the GPU -- a
+ * skipped draw beats exploded geometry.
+ */
+static int dx9mt_sm_operand_len_mismatch(dx9mt_sm_program *out, uint16_t opcode,
+                                         uint32_t encoded_len,
+                                         uint32_t consumed, uint32_t at) {
+  if (out->major_version < 2) {
+    return 0;
+  }
+  if (consumed == encoded_len) {
+    return 0;
+  }
+  snprintf(out->error_msg, sizeof(out->error_msg),
+           "opcode %u operand mismatch at dword %u: consumed=%u encoded=%u",
+           opcode, at, consumed, encoded_len);
+  out->has_error = 1;
+  return -1;
+}
+
 static dx9mt_sm_def_entry *find_or_alloc_def(dx9mt_sm_program *prog,
                                              uint16_t reg_type,
                                              uint16_t reg_number) {
@@ -277,6 +304,8 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
   while (pos < dword_count) {
     uint32_t instr_token = bytecode[pos];
     uint16_t opcode = (uint16_t)(instr_token & 0xFFFFu);
+    uint32_t encoded_len = (instr_token >> 24) & 0xFu;
+    uint32_t operands_start;
 
     /* End marker */
     if (opcode == DX9MT_SM_OP_END) {
@@ -298,10 +327,7 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
     }
 
     pos++; /* consume instruction token */
-
-    /* Instruction length from bits [27:24] (SM2+: additional DWORDs) */
-    /* For SM2/3, the instruction length is encoded in the instruction token
-     * for certain opcodes. But in practice, we count dst + srcs. */
+    operands_start = pos;
 
     /* DCL: semantic_token + register_token */
     if (opcode == DX9MT_SM_OP_DCL) {
@@ -355,6 +381,11 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         out->has_error = 1;
         return -1;
       }
+      if (dx9mt_sm_operand_len_mismatch(out, opcode, encoded_len,
+                                        pos - operands_start,
+                                        operands_start)) {
+        return -1;
+      }
       continue;
     }
 
@@ -382,6 +413,11 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         memcpy(def->values.f, &bytecode[pos], 16);
       }
       pos += 4;
+      if (dx9mt_sm_operand_len_mismatch(out, opcode, encoded_len,
+                                        pos - operands_start,
+                                        operands_start)) {
+        return -1;
+      }
       continue;
     }
 
@@ -409,6 +445,11 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         memcpy(def->values.i, &bytecode[pos], 16);
       }
       pos += 4;
+      if (dx9mt_sm_operand_len_mismatch(out, opcode, encoded_len,
+                                        pos - operands_start,
+                                        operands_start)) {
+        return -1;
+      }
       continue;
     }
 
@@ -436,6 +477,11 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
         def->values.b = bytecode[pos];
       }
       pos += 1;
+      if (dx9mt_sm_operand_len_mismatch(out, opcode, encoded_len,
+                                        pos - operands_start,
+                                        operands_start)) {
+        return -1;
+      }
       continue;
     }
 
@@ -461,6 +507,11 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
       inst->num_sources = 2;
       inst->src[0] = decode_src(bytecode[pos++]);
       inst->src[1] = decode_src(bytecode[pos++]);
+      if (dx9mt_sm_operand_len_mismatch(out, opcode, encoded_len,
+                                        pos - operands_start,
+                                        operands_start)) {
+        return -1;
+      }
       continue;
     }
 
@@ -484,6 +535,11 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
       inst->opcode = opcode;
       inst->num_sources = 1;
       inst->src[0] = decode_src(bytecode[pos++]);
+      if (dx9mt_sm_operand_len_mismatch(out, opcode, encoded_len,
+                                        pos - operands_start,
+                                        operands_start)) {
+        return -1;
+      }
       continue;
     }
 
@@ -500,11 +556,20 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
       memset(inst, 0, sizeof(*inst));
       inst->opcode = opcode;
       inst->num_sources = 0;
+      if (dx9mt_sm_operand_len_mismatch(out, opcode, encoded_len,
+                                        pos - operands_start,
+                                        operands_start)) {
+        return -1;
+      }
       continue;
     }
 
     /* Regular arithmetic/texture instructions */
     int src_count = opcode_src_count(opcode);
+    if (opcode == DX9MT_SM_OP_SINCOS && out->major_version == 2) {
+      /* SM2 sincos carries two extra macro-constant sources. */
+      src_count = 3;
+    }
     if (src_count < 0) {
       /* Unknown opcode -- try to skip using instruction length if encoded */
       /* SM3.0 encodes additional length in bits [27:24] for some opcodes,
@@ -593,6 +658,11 @@ int dx9mt_sm_parse(const uint32_t *bytecode, uint32_t dword_count,
       track_register_usage(out, &inst->src[s], 0);
       if (out->has_error) return -1;
     }
+
+    if (dx9mt_sm_operand_len_mismatch(out, opcode, encoded_len,
+                                      pos - operands_start, operands_start)) {
+      return -1;
+    }
   }
 
   /* If no explicit color outputs counted for PS, default to 1 */
@@ -663,6 +733,9 @@ static const char *opcode_name(uint16_t op) {
   case DX9MT_SM_OP_TEXKILL: return "texkill";
   case DX9MT_SM_OP_TEXLD:   return "texld";
   case DX9MT_SM_OP_TEXLDL:  return "texldl";
+  case DX9MT_SM_OP_TEXLDD:  return "texldd";
+  case DX9MT_SM_OP_DSX:     return "dsx";
+  case DX9MT_SM_OP_DSY:     return "dsy";
   case DX9MT_SM_OP_CMP:     return "cmp";
   case DX9MT_SM_OP_DP2ADD:  return "dp2add";
   case DX9MT_SM_OP_REP:     return "rep";

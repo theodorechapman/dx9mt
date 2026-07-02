@@ -3,7 +3,10 @@
 
 #include "d3d9_shader_parse.h"
 
-#define DX9MT_MSL_MAX_SOURCE (32 * 1024)
+/* Sized for FNV's largest pixel shaders (~1500 instructions) with the
+ * full-width expression style; the result struct lives on the stack in the
+ * viewer's translate path, which is fine at this size on the main thread. */
+#define DX9MT_MSL_MAX_SOURCE (256 * 1024)
 
 typedef struct dx9mt_msl_emit_result {
   char source[DX9MT_MSL_MAX_SOURCE];

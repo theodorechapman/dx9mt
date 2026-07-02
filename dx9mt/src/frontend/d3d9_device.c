@@ -134,6 +134,7 @@ struct dx9mt_surface {
   WINBOOL lockable;
   unsigned char *sysmem;
   UINT pitch;
+  DWORD lock_flags;
 };
 
 struct dx9mt_swapchain {
@@ -581,15 +582,27 @@ static void dx9mt_frontend_upload_begin_frame(uint32_t frame_id) {
   g_frontend_upload_state->next_offset = 0;
 }
 
-static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
-                                                   const void *data,
-                                                   uint32_t size) {
+/*
+ * Reserve a writable range in the current frame's upload slot. Returns a
+ * zero-ref (and NULL *out_ptr) on overflow or allocation failure.
+ *
+ * Slot overflow returns a zero-ref instead of silently wrapping to offset 0.
+ * Wrapping would overwrite earlier uploads from the same frame, causing the
+ * backend to read corrupted data with no error. The backend validates upload
+ * refs and drops draws with zero-size refs, so overflow surfaces cleanly in
+ * logs rather than as silent visual corruption.
+ */
+static dx9mt_upload_ref dx9mt_frontend_upload_reserve(uint32_t frame_id,
+                                                      uint32_t size,
+                                                      void **out_ptr) {
   dx9mt_upload_ref ref;
   uint32_t aligned_size;
-  unsigned char *slot_base;
 
   memset(&ref, 0, sizeof(ref));
-  if (!data || size == 0 || size > DX9MT_UPLOAD_BYTES_PER_SLOT) {
+  if (out_ptr) {
+    *out_ptr = NULL;
+  }
+  if (!out_ptr || size == 0 || size > DX9MT_UPLOAD_BYTES_PER_SLOT) {
     return ref;
   }
 
@@ -599,18 +612,10 @@ static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
   }
 
   dx9mt_frontend_upload_begin_frame(frame_id);
+  if (!g_frontend_upload_state) {
+    return ref;
+  }
 
-  /*
-   * Slot overflow: if this allocation doesn't fit in the remaining space,
-   * return a zero-ref instead of silently wrapping to offset 0. Wrapping
-   * would overwrite earlier constant uploads from the same frame, causing
-   * the backend to read corrupted shader constant data with no error.
-   *
-   * At ~19 draws/frame * 8KB constants = ~152KB per frame this won't trigger
-   * for FNV (slot is 1MB), but a heavier game could hit it. The backend
-   * validates upload refs and will reject draws with zero-size refs, so this
-   * surfaces cleanly in logs rather than producing silent visual corruption.
-   */
   if (g_frontend_upload_state->next_offset >
       DX9MT_UPLOAD_BYTES_PER_SLOT - aligned_size) {
     static LONG overflow_counter = 0;
@@ -624,13 +629,50 @@ static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
     return ref;
   }
 
-  slot_base = g_frontend_upload_state->slots[g_frontend_upload_state->slot_index];
-  memcpy(slot_base + g_frontend_upload_state->next_offset, data, size);
+  *out_ptr = g_frontend_upload_state->slots[g_frontend_upload_state->slot_index] +
+             g_frontend_upload_state->next_offset;
   ref.arena_index = g_frontend_upload_state->slot_index;
   ref.offset = g_frontend_upload_state->next_offset;
   ref.size = size;
   g_frontend_upload_state->next_offset += aligned_size;
   return ref;
+}
+
+static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
+                                                   const void *data,
+                                                   uint32_t size) {
+  dx9mt_upload_ref ref;
+  void *dst = NULL;
+
+  if (!data) {
+    memset(&ref, 0, sizeof(ref));
+    return ref;
+  }
+
+  ref = dx9mt_frontend_upload_reserve(frame_id, size, &dst);
+  if (dst) {
+    memcpy(dst, data, size);
+  }
+  return ref;
+}
+
+static uint32_t dx9mt_prim_index_count(uint32_t primitive_type,
+                                       uint32_t prim_count) {
+  switch (primitive_type) {
+  case D3DPT_POINTLIST:
+    return prim_count;
+  case D3DPT_LINELIST:
+    return prim_count * 2u;
+  case D3DPT_LINESTRIP:
+    return prim_count + 1u;
+  case D3DPT_TRIANGLELIST:
+    return prim_count * 3u;
+  case D3DPT_TRIANGLESTRIP:
+  case D3DPT_TRIANGLEFAN:
+    return prim_count + 2u;
+  default:
+    return 0;
+  }
 }
 
 static uint32_t dx9mt_hash_texture_stage_state(const dx9mt_device *self) {
@@ -810,6 +852,9 @@ static UINT dx9mt_bytes_per_pixel(D3DFORMAT format) {
     return 2;
   case D3DFMT_A8:
     return 1;
+  case D3DFMT_A16B16G16R16:
+  case D3DFMT_A16B16G16R16F:
+    return 8;
   default:
     return 4;
   }
@@ -1615,9 +1660,7 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
                                               DWORD flags) {
   dx9mt_surface *self = dx9mt_surface_from_iface(iface);
   uint32_t size;
-
-  (void)rect;
-  (void)flags;
+  SIZE_T byte_offset = 0;
 
   if (!locked_rect) {
     return D3DERR_INVALIDCALL;
@@ -1625,6 +1668,25 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
 
   if (!self->lockable) {
     return D3DERR_INVALIDCALL;
+  }
+
+  if (rect) {
+    if (!dx9mt_rect_valid_for_surface(rect, &self->desc)) {
+      return D3DERR_INVALIDCALL;
+    }
+    if (dx9mt_format_is_block_compressed(self->desc.Format)) {
+      /* Block-compressed locks must be 4x4-aligned; pBits addresses blocks. */
+      if ((rect->left & 3) || (rect->top & 3)) {
+        return D3DERR_INVALIDCALL;
+      }
+      byte_offset = (SIZE_T)(rect->top / 4) * self->pitch +
+                    (SIZE_T)(rect->left / 4) *
+                        dx9mt_format_block_bytes(self->desc.Format);
+    } else {
+      byte_offset =
+          (SIZE_T)rect->top * self->pitch +
+          (SIZE_T)rect->left * dx9mt_bytes_per_pixel(self->desc.Format);
+    }
   }
 
   if (!self->sysmem) {
@@ -1636,14 +1698,18 @@ static HRESULT WINAPI dx9mt_surface_LockRect(IDirect3DSurface9 *iface,
     }
   }
 
+  self->lock_flags = flags;
   locked_rect->Pitch = (INT)self->pitch;
-  locked_rect->pBits = self->sysmem;
+  locked_rect->pBits = self->sysmem + byte_offset;
   return D3D_OK;
 }
 
 static HRESULT WINAPI dx9mt_surface_UnlockRect(IDirect3DSurface9 *iface) {
   dx9mt_surface *self = dx9mt_surface_from_iface(iface);
-  dx9mt_surface_mark_container_dirty(self);
+  if (!(self->lock_flags & D3DLOCK_READONLY)) {
+    dx9mt_surface_mark_container_dirty(self);
+  }
+  self->lock_flags = 0;
   return D3D_OK;
 }
 
@@ -5477,13 +5543,119 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
         self->indices ? dx9mt_ib_from_iface(self->indices) : NULL;
     dx9mt_vertex_decl *decl =
         self->vertex_decl ? dx9mt_vdecl_from_iface(self->vertex_decl) : NULL;
+    WINBOOL windowed = FALSE;
 
-    if (vb && vb->data && vb->desc.Size > 0) {
+    /*
+     * Windowed upload: send only the byte ranges this draw reads instead of
+     * the whole buffers, so every IPC frame stays fully self-contained while
+     * dense scenes fit the arena/IPC ceilings.
+     *
+     * The vertex window is derived from the ACTUAL index values, never from
+     * MinVertexIndex/NumVertices: those parameters are hints that real GPUs
+     * ignore, and FNV passes hints that do not bound the real indices --
+     * clamping to the hinted range shredded world geometry into wedges
+     * converging on window vertex 0. Index values are rebased against the
+     * scanned minimum during the copy, so the wire draw always uses
+     * base_vertex=0 / start_index=0 / stream0_offset=0 and every rebased
+     * index is in-window by construction. Whole-buffer upload remains the
+     * fallback when the ranges don't fit the bound buffers.
+     */
+    if (vb && vb->data && ib && ib->data) {
+      uint32_t stride = self->stream_strides[0];
+      uint32_t index_size = (ib->desc.Format == D3DFMT_INDEX32) ? 4u : 2u;
+      uint32_t index_count = dx9mt_prim_index_count(primitive_type, prim_count);
+      uint64_t ib_offset = (uint64_t)start_index * index_size;
+      uint64_t ib_size = (uint64_t)index_count * index_size;
+
+      /* Only window triangle primitives: the viewer's index-count math
+       * assumes triangles, and a windowed IB holds exactly index_count
+       * entries -- a mismatch there would read past the window. */
+      if (primitive_type >= D3DPT_TRIANGLELIST &&
+          primitive_type <= D3DPT_TRIANGLEFAN && stride > 0 &&
+          index_count > 0 && ib_offset + ib_size <= ib->desc.Size) {
+        uint32_t actual_min = UINT32_MAX;
+        uint32_t actual_max = 0;
+        uint32_t k;
+        int64_t first_vertex;
+        uint64_t span;
+        uint64_t vb_offset;
+        uint64_t vb_needed;
+
+        if (index_size == 4) {
+          const uint32_t *scan =
+              (const uint32_t *)(ib->data + (size_t)ib_offset);
+          for (k = 0; k < index_count; ++k) {
+            uint32_t v = scan[k];
+            if (v < actual_min) actual_min = v;
+            if (v > actual_max) actual_max = v;
+          }
+        } else {
+          const uint16_t *scan =
+              (const uint16_t *)(ib->data + (size_t)ib_offset);
+          for (k = 0; k < index_count; ++k) {
+            uint32_t v = scan[k];
+            if (v < actual_min) actual_min = v;
+            if (v > actual_max) actual_max = v;
+          }
+        }
+
+        first_vertex = (int64_t)base_vertex_index + (int64_t)actual_min;
+        span = (uint64_t)actual_max - actual_min + 1u;
+        vb_offset = (uint64_t)self->stream_offsets[0] +
+                    (uint64_t)first_vertex * stride;
+        vb_needed = span * stride;
+
+        if (first_vertex >= 0 && vb_offset + vb_needed <= vb->desc.Size) {
+          void *ib_dst = NULL;
+          /* Pad by one vertex so attributes with offset+size > stride stay
+           * in bounds for the last vertex, clamped to the source buffer. */
+          uint64_t vb_size = vb_needed + stride;
+          if (vb_offset + vb_size > vb->desc.Size) {
+            vb_size = vb->desc.Size - vb_offset;
+          }
+
+          packet.vertex_data = dx9mt_frontend_upload_copy(
+              self->frame_id, vb->data + (size_t)vb_offset, (uint32_t)vb_size);
+          packet.vertex_data_size = (uint32_t)vb_size;
+
+          packet.index_data = dx9mt_frontend_upload_reserve(
+              self->frame_id, (uint32_t)ib_size, &ib_dst);
+          if (ib_dst) {
+            if (index_size == 4) {
+              const uint32_t *src =
+                  (const uint32_t *)(ib->data + (size_t)ib_offset);
+              uint32_t *dst = (uint32_t *)ib_dst;
+              for (k = 0; k < index_count; ++k) {
+                dst[k] = src[k] - actual_min;
+              }
+            } else {
+              const uint16_t *src =
+                  (const uint16_t *)(ib->data + (size_t)ib_offset);
+              uint16_t *dst = (uint16_t *)ib_dst;
+              for (k = 0; k < index_count; ++k) {
+                dst[k] = (uint16_t)(src[k] - actual_min);
+              }
+            }
+          }
+          packet.index_data_size = (uint32_t)ib_size;
+          packet.index_format = (uint32_t)ib->desc.Format;
+
+          packet.base_vertex = 0;
+          packet.min_vertex_index = 0;
+          packet.num_vertices = (uint32_t)span;
+          packet.start_index = 0;
+          packet.stream0_offset = 0;
+          windowed = TRUE;
+        }
+      }
+    }
+
+    if (!windowed && vb && vb->data && vb->desc.Size > 0) {
       packet.vertex_data = dx9mt_frontend_upload_copy(
           self->frame_id, vb->data, vb->desc.Size);
       packet.vertex_data_size = vb->desc.Size;
     }
-    if (ib && ib->data && ib->desc.Size > 0) {
+    if (!windowed && ib && ib->data && ib->desc.Size > 0) {
       packet.index_data = dx9mt_frontend_upload_copy(
           self->frame_id, ib->data, ib->desc.Size);
       packet.index_data_size = ib->desc.Size;
