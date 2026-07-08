@@ -1139,6 +1139,12 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   emit(&ctx, "  uint alpha_test_enable;\n");
   emit(&ctx, "  uint alpha_func;\n");
   emit(&ctx, "  float alpha_ref;\n");
+  emit(&ctx, "  uint fog_enable;\n");
+  emit(&ctx, "  uint fog_mode;\n");
+  emit(&ctx, "  float fog_start;\n");
+  emit(&ctx, "  float fog_end;\n");
+  emit(&ctx, "  float fog_density;\n");
+  emit(&ctx, "  float4 fog_color;\n");
   emit(&ctx, "};\n");
   emit(&ctx, "static inline bool dx9mt_alpha_pass(float a, uint func, float ref) {\n");
   emit(&ctx, "  constexpr float eps = 1.0 / 255.0;\n");
@@ -1274,6 +1280,26 @@ int dx9mt_msl_emit_ps(const dx9mt_sm_program *prog, uint32_t bytecode_hash,
   emit(&ctx, "      !dx9mt_alpha_pass(oC0.w, dx_params.alpha_func, "
              "dx_params.alpha_ref)) {\n");
   emit(&ctx, "    discard_fragment();\n");
+  emit(&ctx, "  }\n");
+
+  /*
+   * Fixed-function table fog: D3D9 applies it after the pixel shader for
+   * SM <= 2.0, and Gamebryo's world shaders rely on it (W-fog: start/end
+   * are view-space distances, recovered as 1/position.w). Blends RGB only.
+   */
+  emit(&ctx, "  if (dx_params.fog_enable != 0u) {\n");
+  emit(&ctx, "    float dxfog_d = 1.0 / max(in.position.w, 1e-6);\n");
+  emit(&ctx, "    float dxfog_f = 1.0;\n");
+  emit(&ctx, "    if (dx_params.fog_mode == 3u) {\n");
+  emit(&ctx, "      dxfog_f = saturate((dx_params.fog_end - dxfog_d) /\n");
+  emit(&ctx, "          max(dx_params.fog_end - dx_params.fog_start, 1e-6));\n");
+  emit(&ctx, "    } else if (dx_params.fog_mode == 1u) {\n");
+  emit(&ctx, "      dxfog_f = exp(-dx_params.fog_density * dxfog_d);\n");
+  emit(&ctx, "    } else if (dx_params.fog_mode == 2u) {\n");
+  emit(&ctx, "      float dxfog_e = dx_params.fog_density * dxfog_d;\n");
+  emit(&ctx, "      dxfog_f = exp(-dxfog_e * dxfog_e);\n");
+  emit(&ctx, "    }\n");
+  emit(&ctx, "    oC0.xyz = mix(dx_params.fog_color.xyz, oC0.xyz, dxfog_f);\n");
   emit(&ctx, "  }\n");
 
   /* Return */

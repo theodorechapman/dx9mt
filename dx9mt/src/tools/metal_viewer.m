@@ -218,6 +218,23 @@ static size_t s_frame_snapshot_capacity;
 /* RB3 Phase 3: shader translation caches */
 static NSMutableDictionary *s_vs_func_cache;  /* bytecode_hash -> id<MTLFunction> or NSNull */
 static NSMutableDictionary *s_ps_func_cache;
+/* shader_id -> @[hash, function-or-NSNull]: skips per-draw bytecode hashing.
+ * Shader objects are immutable and ids are never reused within a game run;
+ * flushed when frame_id regresses (game restarted under a running viewer). */
+static NSMutableDictionary *s_vs_id_cache;
+static NSMutableDictionary *s_ps_id_cache;
+static uint32_t s_last_seen_frame_id;
+
+/*
+ * Per-frame shared geometry buffer: the whole IPC bulk region is copied
+ * ONCE into a reused MTLBuffer and every draw binds into it by offset,
+ * replacing thousands of per-draw newBufferWithBytes allocations. A ring
+ * of 3 plus a 3-slot frame semaphore (classic Metal triple buffering)
+ * keeps the CPU from overwriting a buffer the GPU is still reading.
+ */
+static id<MTLBuffer> s_geo_ring[3];
+static uint32_t s_geo_ring_index;
+static dispatch_semaphore_t s_frame_semaphore;
 static NSMutableDictionary *s_translated_pso_cache;  /* combined_key -> id<MTLRenderPipelineState> */
 static NSMutableDictionary *s_vs_interface_cache;    /* bytecode_hash -> NSString */
 static NSMutableDictionary *s_ps_interface_cache;
@@ -2207,6 +2224,8 @@ static int init_metal(void) {
   s_texture_rt_overrides = [[NSMutableDictionary alloc] init];
   s_vs_func_cache = [[NSMutableDictionary alloc] init];
   s_ps_func_cache = [[NSMutableDictionary alloc] init];
+  s_vs_id_cache = [[NSMutableDictionary alloc] init];
+  s_ps_id_cache = [[NSMutableDictionary alloc] init];
   s_translated_pso_cache = [[NSMutableDictionary alloc] init];
   s_vs_interface_cache = [[NSMutableDictionary alloc] init];
   s_ps_interface_cache = [[NSMutableDictionary alloc] init];
@@ -2898,6 +2917,13 @@ static void render_frame(const volatile unsigned char *ipc_base) {
     return;
   }
 
+  if (hdr->frame_id < s_last_seen_frame_id) {
+    /* Game restarted while the viewer kept running: shader ids reset. */
+    [s_vs_id_cache removeAllObjects];
+    [s_ps_id_cache removeAllObjects];
+  }
+  s_last_seen_frame_id = hdr->frame_id;
+
   @autoreleasepool {
     id<CAMetalDrawable> drawable = [s_metal_layer nextDrawable];
     if (!drawable) {
@@ -2907,6 +2933,35 @@ static void render_frame(const volatile unsigned char *ipc_base) {
     id<MTLCommandBuffer> cmd_buf = [s_queue commandBuffer];
     if (!cmd_buf) {
       return;
+    }
+
+    /* Triple-buffer pacing: at most 3 frames in flight; every path past
+     * this point must commit cmd_buf so the completion handler fires. */
+    if (!s_frame_semaphore) {
+      s_frame_semaphore = dispatch_semaphore_create(3);
+    }
+    dispatch_semaphore_wait(s_frame_semaphore, DISPATCH_TIME_FOREVER);
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+      (void)cb;
+      dispatch_semaphore_signal(s_frame_semaphore);
+    }];
+
+    /* One bulk copy per frame into the ring's shared geometry buffer. */
+    id<MTLBuffer> geo_buf = nil;
+    if (bulk_used > 0) {
+      uint32_t geo_index = s_geo_ring_index++ % 3u;
+      geo_buf = s_geo_ring[geo_index];
+      if (!geo_buf || geo_buf.length < bulk_used) {
+        NSUInteger cap = ((NSUInteger)bulk_used + (4u << 20) - 1) &
+                         ~(NSUInteger)((4u << 20) - 1);
+        geo_buf = [s_device newBufferWithLength:cap
+                                        options:MTLResourceStorageModeShared];
+        s_geo_ring[geo_index] = geo_buf;
+      }
+      if (geo_buf) {
+        memcpy([geo_buf contents], (const void *)(ipc_base + bulk_off),
+               bulk_used);
+      }
     }
 
     /* Clear color from the game's Clear() call */
@@ -2971,7 +3026,10 @@ static void render_frame(const volatile unsigned char *ipc_base) {
       int textured = 0;
       int use_compat_textured_tint = 0;
       int use_scene_blit_fallback = 0;
-      if (d->command_type == DX9MT_METAL_IPC_COMMAND_DRAW) {
+      /* Cohort accounting hashes both shaders' bytecode per draw -- only
+       * pay for it on frames whose cohort summary can actually be logged. */
+      if (d->command_type == DX9MT_METAL_IPC_COMMAND_DRAW &&
+          (hdr->frame_id < 10 || (hdr->frame_id % 120) == 0)) {
         dx9mt_cohort_add(cohort_counts, ipc_base, bulk_off, hdr->bulk_data_used,
                          d);
       }
@@ -3314,10 +3372,39 @@ static void render_frame(const volatile unsigned char *ipc_base) {
           continue;
         }
 
-        vs_hash = dx9mt_sm_bytecode_hash(vs_bc, vs_dwords);
-        ps_hash = dx9mt_sm_bytecode_hash(ps_bc, ps_dwords);
-        vs_func = translate_and_compile_vs(vs_bc, vs_dwords, vs_hash);
-        ps_func = translate_and_compile_ps(ps_bc, ps_dwords, ps_hash);
+        /* Shader objects are immutable, so once a shader id has been
+         * hashed+compiled, later draws skip re-hashing the bytecode
+         * (previously two full bytecode hashes on every draw). */
+        NSArray *vs_ent = d->vertex_shader_id
+            ? [s_vs_id_cache objectForKey:@(d->vertex_shader_id)] : nil;
+        NSArray *ps_ent = d->pixel_shader_id
+            ? [s_ps_id_cache objectForKey:@(d->pixel_shader_id)] : nil;
+        if (vs_ent) {
+          vs_hash = [vs_ent[0] unsignedIntValue];
+          vs_func = vs_ent[1] == (id)[NSNull null] ? nil : vs_ent[1];
+        } else {
+          vs_hash = dx9mt_sm_bytecode_hash(vs_bc, vs_dwords);
+          vs_func = translate_and_compile_vs(vs_bc, vs_dwords, vs_hash);
+          if (d->vertex_shader_id) {
+            [s_vs_id_cache
+                setObject:@[ @(vs_hash), vs_func ? (id)vs_func
+                                                 : (id)[NSNull null] ]
+                   forKey:@(d->vertex_shader_id)];
+          }
+        }
+        if (ps_ent) {
+          ps_hash = [ps_ent[0] unsignedIntValue];
+          ps_func = ps_ent[1] == (id)[NSNull null] ? nil : ps_ent[1];
+        } else {
+          ps_hash = dx9mt_sm_bytecode_hash(ps_bc, ps_dwords);
+          ps_func = translate_and_compile_ps(ps_bc, ps_dwords, ps_hash);
+          if (d->pixel_shader_id) {
+            [s_ps_id_cache
+                setObject:@[ @(ps_hash), ps_func ? (id)ps_func
+                                                 : (id)[NSNull null] ]
+                   forKey:@(d->pixel_shader_id)];
+          }
+        }
         if (!vs_func || !ps_func) {
           ++diag.shader_translation_failed;
           dx9mt_diag_detail(
@@ -3391,8 +3478,9 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         }
       }
 
-      /* Create Metal buffers from IPC bulk data */
-      if (!dx9mt_ipc_bulk_range_valid(bulk_off, bulk_used, d->vb_bulk_offset,
+      /* Geometry lives in the per-frame shared buffer; draws bind by offset. */
+      if (!geo_buf ||
+          !dx9mt_ipc_bulk_range_valid(bulk_off, bulk_used, d->vb_bulk_offset,
                                       d->vb_bulk_size) ||
           !dx9mt_ipc_bulk_range_valid(bulk_off, bulk_used, d->ib_bulk_offset,
                                       d->ib_bulk_size)) {
@@ -3404,32 +3492,10 @@ static void render_frame(const volatile unsigned char *ipc_base) {
             d->ib_bulk_size, bulk_used);
         continue;
       }
-      const void *vb_data = (const void *)(ipc_base + bulk_off + d->vb_bulk_offset);
       const void *ib_data = (const void *)(ipc_base + bulk_off + d->ib_bulk_offset);
 
-      id<MTLBuffer> vb_buf =
-          [s_device newBufferWithBytes:vb_data
-                               length:d->vb_bulk_size
-                              options:MTLResourceStorageModeShared];
-      if (!vb_buf) {
-        ++diag.skipped_empty_geometry;
-        dx9mt_diag_detail(&diag, hdr->frame_id, i,
-                          "failed to create vertex buffer len=%u",
-                          d->vb_bulk_size);
-        continue;
-      }
-
-      id<MTLBuffer> ib_buf =
-          [s_device newBufferWithBytes:ib_data
-                               length:d->ib_bulk_size
-                              options:MTLResourceStorageModeShared];
-      if (!ib_buf) {
-        ++diag.skipped_empty_geometry;
-        dx9mt_diag_detail(&diag, hdr->frame_id, i,
-                          "failed to create index buffer len=%u",
-                          d->ib_bulk_size);
-        continue;
-      }
+      id<MTLBuffer> draw_ib_buf = geo_buf;
+      NSUInteger draw_ib_base = d->ib_bulk_offset;
 
       /* Set viewport from draw entry */
       if (d->viewport_width > 0 && d->viewport_height > 0) {
@@ -3515,14 +3581,15 @@ static void render_frame(const volatile unsigned char *ipc_base) {
             fan_dst[t * 3 + 2] = fan_src[t + 2];
           }
         }
-        ib_buf = [s_device newBufferWithBytes:converted
-                                       length:(NSUInteger)list_count * isz
-                                      options:MTLResourceStorageModeShared];
+        draw_ib_buf = [s_device newBufferWithBytes:converted
+                                            length:(NSUInteger)list_count * isz
+                                           options:MTLResourceStorageModeShared];
         free(converted);
-        if (!ib_buf) {
+        if (!draw_ib_buf) {
           ++diag.skipped_empty_geometry;
           continue;
         }
+        draw_ib_base = 0;
         index_count = list_count;
         draw_start_index = 0;
       }
@@ -3593,22 +3660,43 @@ static void render_frame(const volatile unsigned char *ipc_base) {
 
       [encoder setRenderPipelineState:use_compat_textured_tint ? geometry_pso
                                                               : translated_pso];
-      [encoder setVertexBuffer:vb_buf offset:d->stream0_offset atIndex:0];
+      [encoder setVertexBuffer:geo_buf
+                        offset:(NSUInteger)d->vb_bulk_offset + d->stream0_offset
+                       atIndex:0];
       if (!use_compat_textured_tint) {
         const void *vs_data =
             (const void *)(ipc_base + bulk_off + d->vs_constants_bulk_offset);
         const void *ps_data =
             (const void *)(ipc_base + bulk_off + d->ps_constants_bulk_offset);
-        /* Per-draw dynamic state for the emulated D3D9 alpha test; every
-         * translated PS declares this at fragment buffer(1). */
+        /* Per-draw dynamic state for the emulated D3D9 alpha test and
+         * fixed-function table fog; every translated PS declares this at
+         * fragment buffer(1). Layout must match the emitted MSL struct
+         * (float4 at offset 32). */
         struct {
           uint32_t alpha_test_enable;
           uint32_t alpha_func;
           float alpha_ref;
+          uint32_t fog_enable;
+          uint32_t fog_mode;
+          float fog_start;
+          float fog_end;
+          float fog_density;
+          float fog_color[4];
         } dx_params = {
             d->rs_alpha_test_enable ? 1u : 0u,
             d->rs_alpha_func,
             (float)(d->rs_alpha_ref & 0xFFu) / 255.0f,
+            (d->rs_fogenable && d->rs_fogtablemode != 0) ? 1u : 0u,
+            d->rs_fogtablemode,
+            d->rs_fogstart,
+            d->rs_fogend,
+            d->rs_fogdensity,
+            {
+                ((d->rs_fogcolor >> 16) & 0xFFu) / 255.0f,
+                ((d->rs_fogcolor >> 8) & 0xFFu) / 255.0f,
+                (d->rs_fogcolor & 0xFFu) / 255.0f,
+                ((d->rs_fogcolor >> 24) & 0xFFu) / 255.0f,
+            },
         };
         [encoder setVertexBytes:vs_data length:d->vs_constants_size atIndex:1];
         [encoder setFragmentBytes:ps_data length:d->ps_constants_size atIndex:0];
@@ -3709,8 +3797,9 @@ static void render_frame(const volatile unsigned char *ipc_base) {
       [encoder drawIndexedPrimitives:d3d_prim_to_mtl(d->primitive_type)
                           indexCount:index_count
                            indexType:mtl_index_type
-                         indexBuffer:ib_buf
-                   indexBufferOffset:(NSUInteger)draw_start_index *
+                         indexBuffer:draw_ib_buf
+                   indexBufferOffset:draw_ib_base +
+                                    (NSUInteger)draw_start_index *
                                     (mtl_index_type == MTLIndexTypeUInt32 ? 4
                                                                          : 2)
                        instanceCount:1
@@ -3780,6 +3869,10 @@ static void render_frame(const volatile unsigned char *ipc_base) {
         active_rt_id = 0;
       }
       if (!encoder) {
+        /* Commit so the completion handler fires and the frame semaphore
+         * slot is returned; bailing without committing would deadlock the
+         * triple-buffer pacing after three such failures. */
+        [cmd_buf commit];
         return;
       }
 

@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <assert.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -52,26 +53,44 @@ static WINBOOL dx9mt_should_log_method_sample(LONG *counter, LONG first_n,
 
 static LONG g_object_id_counters[DX9MT_OBJECT_KIND_VERTEX_DECL + 1];
 
-#define DX9MT_LOG_ONCE_CAPACITY 1024u
+/*
+ * O(1) open-addressed log-dedup set. This runs on hot per-draw diagnostic
+ * paths (e.g. the texture "not dirty" skip fires for nearly every textured
+ * stage of every draw) -- a linear scan here cost milliseconds per frame.
+ *
+ * The set only ever fills (keys are never removed), so saturation MUST fail
+ * toward silence: a full probe window returns "already logged". An earlier
+ * version overwrote a slot and returned TRUE instead, which made hot keys
+ * evict each other every frame once the table saturated -- 127k log lines
+ * in one run and ~96 ms/frame of log I/O.
+ */
+#define DX9MT_LOG_ONCE_CAPACITY 4096u
+
 static uint64_t g_log_once_keys[DX9MT_LOG_ONCE_CAPACITY];
-static uint32_t g_log_once_cursor;
 
 static WINBOOL dx9mt_log_once_u64(uint64_t key) {
+  uint32_t idx;
   uint32_t i;
 
   if (key == 0) {
     return TRUE;
   }
 
-  for (i = 0; i < DX9MT_LOG_ONCE_CAPACITY; ++i) {
-    if (g_log_once_keys[i] == key) {
+  idx = (uint32_t)((key ^ (key >> 32)) * 2654435761u) %
+        DX9MT_LOG_ONCE_CAPACITY;
+  for (i = 0; i < 16u; ++i) {
+    uint32_t slot = (idx + i) % DX9MT_LOG_ONCE_CAPACITY;
+    if (g_log_once_keys[slot] == key) {
       return FALSE;
+    }
+    if (g_log_once_keys[slot] == 0) {
+      g_log_once_keys[slot] = key;
+      return TRUE;
     }
   }
 
-  g_log_once_keys[g_log_once_cursor % DX9MT_LOG_ONCE_CAPACITY] = key;
-  ++g_log_once_cursor;
-  return TRUE;
+  /* Probe window full: suppress. Losing a diagnostic line beats spam. */
+  return FALSE;
 }
 
 typedef struct dx9mt_frontend_upload_state {
@@ -181,6 +200,12 @@ struct dx9mt_vertex_shader {
   dx9mt_device *device;
   DWORD *byte_code;
   UINT dword_count;
+  /* Per-frame bytecode upload dedup: the blob is immutable, so within one
+   * frame every draw shares the first upload's arena ref. Refs never
+   * outlive their frame (a frame_id mismatch forces a fresh upload), so
+   * frames stay self-contained. */
+  uint32_t bytecode_upload_frame_id;
+  dx9mt_upload_ref bytecode_upload_ref;
 };
 
 struct dx9mt_pixel_shader {
@@ -190,6 +215,8 @@ struct dx9mt_pixel_shader {
   dx9mt_device *device;
   DWORD *byte_code;
   UINT dword_count;
+  uint32_t bytecode_upload_frame_id;
+  dx9mt_upload_ref bytecode_upload_ref;
 };
 
 struct dx9mt_texture {
@@ -539,10 +566,16 @@ enum dx9mt_texture_upload_skip_reason {
   DX9MT_TEX_SKIP_UPLOAD_COPY_FAILED = 7,
 };
 
+/*
+ * Detail formatting is lazy: the dedup check runs FIRST so the common
+ * repeated-skip case pays no snprintf. This function is on per-draw paths.
+ */
 static void dx9mt_log_texture_upload_skip(
     uint32_t stage, dx9mt_object_id texture_id, uint32_t generation,
-    enum dx9mt_texture_upload_skip_reason reason, const char *detail) {
+    enum dx9mt_texture_upload_skip_reason reason, const char *fmt, ...) {
   uint64_t key;
+  char detail[256];
+  va_list ap;
 
   key = ((uint64_t)texture_id << 16) ^ ((uint64_t)generation << 4) ^
         (uint64_t)reason;
@@ -550,11 +583,17 @@ static void dx9mt_log_texture_upload_skip(
     return;
   }
 
+  detail[0] = '\0';
+  if (fmt) {
+    va_start(ap, fmt);
+    vsnprintf(detail, sizeof(detail), fmt, ap);
+    va_end(ap);
+  }
+
   dx9mt_logf(
       "texdiag",
       "stage=%u tex_id=%u generation=%u reason=%u %s",
-      stage, texture_id, generation, (unsigned)reason,
-      detail ? detail : "");
+      stage, texture_id, generation, (unsigned)reason, detail);
 }
 
 static uint32_t dx9mt_hash_u32(uint32_t hash, uint32_t value) {
@@ -654,6 +693,84 @@ static dx9mt_upload_ref dx9mt_frontend_upload_copy(uint32_t frame_id,
     memcpy(dst, data, size);
   }
   return ref;
+}
+
+/*
+ * Frame-time instrumentation, accumulated per 120-frame window and logged
+ * next to the backend's present line, so one run answers "how much of the
+ * frame is dx9mt vs the game". QPC maps to mach_absolute_time under Wine;
+ * a handful of calls per draw is nanoseconds against millisecond buckets.
+ * game_ms in the log = frame - draws - present = engine + everything else.
+ */
+typedef struct dx9mt_perf_window {
+  uint64_t frame_ticks;
+  uint64_t draw_ticks;
+  uint64_t state_hash_ticks;
+  uint64_t upload_ticks;
+  uint64_t submit_ticks;
+  uint64_t present_ticks;
+  uint64_t api_ticks; /* non-draw entry points (SetRenderState etc.) */
+  uint64_t last_present_qpc;
+  uint32_t draw_calls;
+  uint32_t api_calls;
+  uint32_t frames;
+} dx9mt_perf_window;
+
+static dx9mt_perf_window g_perf;
+static double g_perf_ms_per_tick;
+
+static uint64_t dx9mt_perf_now(void) {
+  LARGE_INTEGER li;
+  QueryPerformanceCounter(&li);
+  return (uint64_t)li.QuadPart;
+}
+
+static double dx9mt_perf_ms(uint64_t ticks) {
+  if (g_perf_ms_per_tick == 0.0) {
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    g_perf_ms_per_tick =
+        freq.QuadPart ? 1000.0 / (double)freq.QuadPart : 0.0;
+  }
+  return (double)ticks * g_perf_ms_per_tick;
+}
+
+static void dx9mt_perf_log_window(uint32_t frame_id) {
+  double frames;
+  double frame_avg;
+  double draw_avg;
+  double present_avg;
+  double api_avg;
+
+  if (g_perf.frames == 0) {
+    return;
+  }
+  frames = (double)g_perf.frames;
+  frame_avg = dx9mt_perf_ms(g_perf.frame_ticks) / frames;
+  draw_avg = dx9mt_perf_ms(g_perf.draw_ticks) / frames;
+  present_avg = dx9mt_perf_ms(g_perf.present_ticks) / frames;
+  api_avg = dx9mt_perf_ms(g_perf.api_ticks) / frames;
+  dx9mt_logf(
+      "perf",
+      "frame=%u n=%u frame_ms=%.2f draw_ms=%.2f (hash=%.2f upload=%.2f submit=%.2f) present_ms=%.2f api_ms=%.2f api_calls/frame=%u game_ms=%.2f draws/frame=%u",
+      frame_id, g_perf.frames, frame_avg, draw_avg,
+      dx9mt_perf_ms(g_perf.state_hash_ticks) / frames,
+      dx9mt_perf_ms(g_perf.upload_ticks) / frames,
+      dx9mt_perf_ms(g_perf.submit_ticks) / frames, present_avg, api_avg,
+      g_perf.api_calls / g_perf.frames,
+      frame_avg - draw_avg - present_avg - api_avg,
+      g_perf.draw_calls / g_perf.frames);
+
+  g_perf.frame_ticks = 0;
+  g_perf.draw_ticks = 0;
+  g_perf.state_hash_ticks = 0;
+  g_perf.upload_ticks = 0;
+  g_perf.submit_ticks = 0;
+  g_perf.present_ticks = 0;
+  g_perf.api_ticks = 0;
+  g_perf.draw_calls = 0;
+  g_perf.api_calls = 0;
+  g_perf.frames = 0;
 }
 
 static uint32_t dx9mt_prim_index_count(uint32_t primitive_type,
@@ -979,6 +1096,27 @@ static int dx9mt_frontend_soft_present_enabled(void) {
   }
 
   current = dx9mt_env_flag_enabled("DX9MT_FRONTEND_SOFT_PRESENT") ? 1 : 0;
+  InterlockedExchange(&cached, current);
+  return (int)current;
+}
+
+/*
+ * Per-draw state hashing (viewport/scissor/texture-stage/sampler/stream +
+ * the whole-packet draw-state hash) exists purely for log forensics --
+ * nothing downstream consumes the values for correctness. It cost 3.5-7 ms
+ * per dense frame (~17 COM calls + ~1000 hashed fields per draw), so it is
+ * opt-in via DX9MT_STATE_HASHES=1.
+ */
+static int dx9mt_state_hashes_enabled(void) {
+  static LONG cached = -1;
+  LONG current;
+
+  current = InterlockedCompareExchange(&cached, -1, -1);
+  if (current >= 0) {
+    return (int)current;
+  }
+
+  current = dx9mt_env_flag_enabled("DX9MT_STATE_HASHES") ? 1 : 0;
   InterlockedExchange(&cached, current);
   return (int)current;
 }
@@ -4335,8 +4473,23 @@ static HRESULT WINAPI dx9mt_device_Present(IDirect3DDevice9 *iface,
         dx9mt_device_resolve_present_window(self, dst_window_override));
   }
 
-  dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
-  hr = dx9mt_backend_bridge_present(self->frame_id) == 0 ? D3D_OK : D3DERR_DEVICELOST;
+  {
+    uint64_t perf_p0 = dx9mt_perf_now();
+    dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
+    hr = dx9mt_backend_bridge_present(self->frame_id) == 0 ? D3D_OK
+                                                           : D3DERR_DEVICELOST;
+    g_perf.present_ticks += dx9mt_perf_now() - perf_p0;
+
+    /* Wall frame time = Present-entry to Present-entry */
+    if (g_perf.last_present_qpc) {
+      g_perf.frame_ticks += perf_p0 - g_perf.last_present_qpc;
+      ++g_perf.frames;
+    }
+    g_perf.last_present_qpc = perf_p0;
+    if ((self->frame_id % 120u) == 0) {
+      dx9mt_perf_log_window(self->frame_id);
+    }
+  }
   if (SUCCEEDED(hr)) {
     HRESULT soft_hr = dx9mt_device_soft_present(self, dst_window_override);
     if (FAILED(soft_hr)) {
@@ -4857,7 +5010,7 @@ static HRESULT WINAPI dx9mt_device_Clear(IDirect3DDevice9 *iface,
   return D3D_OK;
 }
 
-static HRESULT WINAPI dx9mt_device_SetTransform(IDirect3DDevice9 *iface,
+static HRESULT WINAPI dx9mt_device_SetTransform_impl(IDirect3DDevice9 *iface,
                                                  D3DTRANSFORMSTATETYPE state,
                                                  const D3DMATRIX *matrix) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
@@ -4931,7 +5084,7 @@ static HRESULT WINAPI dx9mt_device_GetClipPlane(IDirect3DDevice9 *iface,
   return D3D_OK;
 }
 
-static HRESULT WINAPI dx9mt_device_SetRenderState(IDirect3DDevice9 *iface,
+static HRESULT WINAPI dx9mt_device_SetRenderState_impl(IDirect3DDevice9 *iface,
                                                    D3DRENDERSTATETYPE state,
                                                    DWORD value) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
@@ -4955,7 +5108,7 @@ static HRESULT WINAPI dx9mt_device_GetRenderState(IDirect3DDevice9 *iface,
   return D3D_OK;
 }
 
-static HRESULT WINAPI dx9mt_device_SetTexture(IDirect3DDevice9 *iface,
+static HRESULT WINAPI dx9mt_device_SetTexture_impl(IDirect3DDevice9 *iface,
                                                DWORD stage,
                                                IDirect3DBaseTexture9 *texture) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
@@ -4988,7 +5141,7 @@ static HRESULT WINAPI dx9mt_device_GetTexture(IDirect3DDevice9 *iface,
   return D3D_OK;
 }
 
-static HRESULT WINAPI dx9mt_device_SetTextureStageState(
+static HRESULT WINAPI dx9mt_device_SetTextureStageState_impl(
     IDirect3DDevice9 *iface, DWORD stage, D3DTEXTURESTAGESTATETYPE type,
     DWORD value) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
@@ -5013,7 +5166,7 @@ static HRESULT WINAPI dx9mt_device_GetTextureStageState(
   return D3D_OK;
 }
 
-static HRESULT WINAPI dx9mt_device_SetSamplerState(IDirect3DDevice9 *iface,
+static HRESULT WINAPI dx9mt_device_SetSamplerState_impl(IDirect3DDevice9 *iface,
                                                     DWORD sampler,
                                                     D3DSAMPLERSTATETYPE type,
                                                     DWORD value) {
@@ -5323,7 +5476,6 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
     dx9mt_surface *surface;
     uint32_t upload_size;
     WINBOOL should_upload;
-    char detail[256];
 
     packet->sampler_min_filter[stage] = self->sampler_states[stage][D3DSAMP_MINFILTER];
     packet->sampler_mag_filter[stage] = self->sampler_states[stage][D3DSAMP_MAGFILTER];
@@ -5340,21 +5492,22 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
 
     type = IDirect3DBaseTexture9_GetType(base_texture);
     if (type != D3DRTYPE_TEXTURE) {
-      snprintf(detail, sizeof(detail),
-               "unsupported texture type=%u stage=%u", (unsigned)type, stage);
       dx9mt_log_texture_upload_skip(stage, texture_id, 0,
-                                    DX9MT_TEX_SKIP_UNSUPPORTED_TYPE, detail);
+                                    DX9MT_TEX_SKIP_UNSUPPORTED_TYPE,
+                                    "unsupported texture type=%u stage=%u",
+                                    (unsigned)type, stage);
       continue;
     }
 
     texture = dx9mt_texture_from_iface((IDirect3DTexture9 *)base_texture);
     if (!texture || texture->levels == 0 || !texture->surfaces) {
-      snprintf(detail, sizeof(detail),
-               "missing metadata levels=%u surfaces=%s stage=%u",
-               texture ? texture->levels : 0u,
-               (texture && texture->surfaces) ? "yes" : "no", stage);
-      dx9mt_log_texture_upload_skip(stage, texture_id, texture ? texture->generation : 0,
-                                    DX9MT_TEX_SKIP_MISSING_METADATA, detail);
+      dx9mt_log_texture_upload_skip(stage, texture_id,
+                                    texture ? texture->generation : 0,
+                                    DX9MT_TEX_SKIP_MISSING_METADATA,
+                                    "missing metadata levels=%u surfaces=%s stage=%u",
+                                    texture ? texture->levels : 0u,
+                                    (texture && texture->surfaces) ? "yes" : "no",
+                                    stage);
       continue;
     }
 
@@ -5363,13 +5516,11 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
       level = 0;
     }
     if (!texture->surfaces[level]) {
-      snprintf(detail, sizeof(detail),
-               "missing level surface level=%u levels=%u stage=%u", level,
-               texture->levels, stage);
       dx9mt_log_texture_upload_skip(stage, texture->object_id,
                                     texture->generation,
                                     DX9MT_TEX_SKIP_MISSING_LEVEL_SURFACE,
-                                    detail);
+                                    "missing level surface level=%u levels=%u stage=%u",
+                                    level, texture->levels, stage);
       continue;
     }
     surface = dx9mt_surface_from_iface(texture->surfaces[level]);
@@ -5388,25 +5539,24 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
     packet->tex_pitch[stage] = surface->pitch;
 
     if (!surface->sysmem) {
-      snprintf(detail, sizeof(detail),
-               "no sysmem copy level=%u usage=0x%08x fmt=%u stage=%u surf_id=%u",
-               level, (unsigned)surface->desc.Usage,
-               (unsigned)surface->desc.Format, stage, surface->object_id);
       dx9mt_log_texture_upload_skip(stage, texture->object_id,
                                     texture->generation,
-                                    DX9MT_TEX_SKIP_NO_SYSMEM, detail);
+                                    DX9MT_TEX_SKIP_NO_SYSMEM,
+                                    "no sysmem copy level=%u usage=0x%08x fmt=%u stage=%u surf_id=%u",
+                                    level, (unsigned)surface->desc.Usage,
+                                    (unsigned)surface->desc.Format, stage,
+                                    surface->object_id);
       continue;
     }
 
     upload_size = dx9mt_surface_upload_size(surface);
     if (upload_size == 0) {
-      snprintf(detail, sizeof(detail),
-               "zero upload size level=%u pitch=%u size=%ux%u stage=%u",
-               level, surface->pitch, surface->desc.Width, surface->desc.Height,
-               stage);
       dx9mt_log_texture_upload_skip(stage, texture->object_id,
                                     texture->generation,
-                                    DX9MT_TEX_SKIP_ZERO_UPLOAD_SIZE, detail);
+                                    DX9MT_TEX_SKIP_ZERO_UPLOAD_SIZE,
+                                    "zero upload size level=%u pitch=%u size=%ux%u stage=%u",
+                                    level, surface->pitch, surface->desc.Width,
+                                    surface->desc.Height, stage);
       continue;
     }
 
@@ -5419,14 +5569,18 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
       should_upload = TRUE;
     }
     if (!should_upload) {
-      snprintf(detail, sizeof(detail),
-               "no upload this frame stage=%u last_gen=%u current_gen=%u last_frame=%u current_frame=%u refresh_interval=%u",
-               stage, texture->last_upload_generation, texture->generation,
-               texture->last_upload_frame_id, self->frame_id,
-               DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL);
+      /* The normal steady state for every textured stage of every draw;
+       * logging is dedup-gated and lazily formatted so this path stays
+       * cheap. */
       dx9mt_log_texture_upload_skip(stage, texture->object_id,
                                     texture->generation,
-                                    DX9MT_TEX_SKIP_NOT_DIRTY, detail);
+                                    DX9MT_TEX_SKIP_NOT_DIRTY,
+                                    "no upload this frame stage=%u last_gen=%u current_gen=%u last_frame=%u current_frame=%u refresh_interval=%u",
+                                    stage, texture->last_upload_generation,
+                                    texture->generation,
+                                    texture->last_upload_frame_id,
+                                    self->frame_id,
+                                    DX9MT_TEXTURE_UPLOAD_REFRESH_INTERVAL);
       continue;
     }
 
@@ -5436,13 +5590,12 @@ dx9mt_device_fill_draw_texture_stages(dx9mt_device *self,
       texture->last_upload_generation = texture->generation;
       texture->last_upload_frame_id = self->frame_id;
     } else {
-      snprintf(detail, sizeof(detail),
-               "upload copy failed stage=%u size=%u frame=%u arena_slot=%u",
-               stage, upload_size, self->frame_id,
-               self->frame_id % DX9MT_UPLOAD_ARENA_SLOTS);
       dx9mt_log_texture_upload_skip(stage, texture->object_id,
                                     texture->generation,
-                                    DX9MT_TEX_SKIP_UPLOAD_COPY_FAILED, detail);
+                                    DX9MT_TEX_SKIP_UPLOAD_COPY_FAILED,
+                                    "upload copy failed stage=%u size=%u frame=%u arena_slot=%u",
+                                    stage, upload_size, self->frame_id,
+                                    self->frame_id % DX9MT_UPLOAD_ARENA_SLOTS);
     }
   }
 }
@@ -5453,6 +5606,8 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
     UINT start_index, UINT prim_count) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   dx9mt_packet_draw_indexed packet;
+  uint64_t perf_t0 = dx9mt_perf_now();
+  uint64_t perf_t;
 
   memset(&packet, 0, sizeof(packet));
   packet.header.type = DX9MT_PACKET_DRAW_INDEXED;
@@ -5487,11 +5642,17 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
   packet.fvf = self->fvf;
   packet.stream0_offset = self->stream_offsets[0];
   packet.stream0_stride = self->stream_strides[0];
-  packet.viewport_hash = dx9mt_hash_viewport(&self->viewport);
-  packet.scissor_hash = dx9mt_hash_rect(&self->scissor_rect);
-  packet.texture_stage_hash = dx9mt_hash_texture_stage_state(self);
-  packet.sampler_state_hash = dx9mt_hash_sampler_state(self);
-  packet.stream_binding_hash = dx9mt_hash_stream_bindings(self);
+  if (dx9mt_state_hashes_enabled()) {
+    perf_t = dx9mt_perf_now();
+    packet.viewport_hash = dx9mt_hash_viewport(&self->viewport);
+    packet.scissor_hash = dx9mt_hash_rect(&self->scissor_rect);
+    packet.texture_stage_hash = dx9mt_hash_texture_stage_state(self);
+    packet.sampler_state_hash = dx9mt_hash_sampler_state(self);
+    packet.stream_binding_hash = dx9mt_hash_stream_bindings(self);
+    g_perf.state_hash_ticks += dx9mt_perf_now() - perf_t;
+  }
+
+  perf_t = dx9mt_perf_now();
   if (self->vs_const_dirty || self->vs_const_last_ref.size == 0) {
     self->vs_const_last_ref = dx9mt_frontend_upload_copy(
         self->frame_id, &self->vs_const_f[0][0], DX9MT_DRAW_SHADER_CONSTANT_BYTES);
@@ -5512,13 +5673,23 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
     dx9mt_pixel_shader *ps = self->pixel_shader
         ? dx9mt_pshader_from_iface(self->pixel_shader) : NULL;
     if (vs && vs->byte_code && vs->dword_count > 0) {
-      packet.vs_bytecode = dx9mt_frontend_upload_copy(
-          self->frame_id, vs->byte_code, vs->dword_count * sizeof(DWORD));
+      if (vs->bytecode_upload_frame_id != self->frame_id ||
+          vs->bytecode_upload_ref.size == 0) {
+        vs->bytecode_upload_ref = dx9mt_frontend_upload_copy(
+            self->frame_id, vs->byte_code, vs->dword_count * sizeof(DWORD));
+        vs->bytecode_upload_frame_id = self->frame_id;
+      }
+      packet.vs_bytecode = vs->bytecode_upload_ref;
       packet.vs_bytecode_dwords = vs->dword_count;
     }
     if (ps && ps->byte_code && ps->dword_count > 0) {
-      packet.ps_bytecode = dx9mt_frontend_upload_copy(
-          self->frame_id, ps->byte_code, ps->dword_count * sizeof(DWORD));
+      if (ps->bytecode_upload_frame_id != self->frame_id ||
+          ps->bytecode_upload_ref.size == 0) {
+        ps->bytecode_upload_ref = dx9mt_frontend_upload_copy(
+            self->frame_id, ps->byte_code, ps->dword_count * sizeof(DWORD));
+        ps->bytecode_upload_frame_id = self->frame_id;
+      }
+      packet.ps_bytecode = ps->bytecode_upload_ref;
       packet.ps_bytecode_dwords = ps->dword_count;
     }
   }
@@ -5681,10 +5852,20 @@ static HRESULT WINAPI dx9mt_device_DrawIndexedPrimitive(
   }
 
   dx9mt_device_fill_draw_texture_stages(self, &packet);
+  g_perf.upload_ticks += dx9mt_perf_now() - perf_t;
 
-  packet.state_block_hash = dx9mt_hash_draw_state(&packet);
+  if (dx9mt_state_hashes_enabled()) {
+    perf_t = dx9mt_perf_now();
+    packet.state_block_hash = dx9mt_hash_draw_state(&packet);
+    g_perf.state_hash_ticks += dx9mt_perf_now() - perf_t;
+  }
 
+  perf_t = dx9mt_perf_now();
   dx9mt_backend_bridge_submit_packets(&packet.header, (uint32_t)sizeof(packet));
+  g_perf.submit_ticks += dx9mt_perf_now() - perf_t;
+
+  g_perf.draw_ticks += dx9mt_perf_now() - perf_t0;
+  ++g_perf.draw_calls;
   return D3D_OK;
 }
 
@@ -5695,7 +5876,7 @@ static HRESULT WINAPI dx9mt_device_CreateVertexDeclaration(
   return dx9mt_vdecl_create(self, elements, declaration);
 }
 
-static HRESULT WINAPI dx9mt_device_SetVertexDeclaration(
+static HRESULT WINAPI dx9mt_device_SetVertexDeclaration_impl(
     IDirect3DDevice9 *iface, IDirect3DVertexDeclaration9 *decl) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   if (self->vertex_decl == decl) {
@@ -5754,7 +5935,7 @@ static HRESULT WINAPI dx9mt_device_CreateVertexShader(
   return hr;
 }
 
-static HRESULT WINAPI dx9mt_device_SetVertexShader(IDirect3DDevice9 *iface,
+static HRESULT WINAPI dx9mt_device_SetVertexShader_impl(IDirect3DDevice9 *iface,
                                                     IDirect3DVertexShader9 *shader) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   if (self->vertex_shader == shader) {
@@ -5781,7 +5962,7 @@ static HRESULT WINAPI dx9mt_device_GetVertexShader(
   return D3D_OK;
 }
 
-static HRESULT WINAPI dx9mt_device_SetVertexShaderConstantF(
+static HRESULT WINAPI dx9mt_device_SetVertexShaderConstantF_impl(
     IDirect3DDevice9 *iface, UINT reg_idx, const float *data, UINT count) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   if (!data || reg_idx + count > DX9MT_MAX_SHADER_FLOAT_CONSTANTS) {
@@ -5848,7 +6029,7 @@ static HRESULT WINAPI dx9mt_device_GetVertexShaderConstantB(
   return D3D_OK;
 }
 
-static HRESULT WINAPI dx9mt_device_SetStreamSource(
+static HRESULT WINAPI dx9mt_device_SetStreamSource_impl(
     IDirect3DDevice9 *iface, UINT stream_number,
     IDirect3DVertexBuffer9 *stream_data, UINT offset_in_bytes, UINT stride) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
@@ -5909,7 +6090,7 @@ static HRESULT WINAPI dx9mt_device_GetStreamSourceFreq(IDirect3DDevice9 *iface,
   return D3D_OK;
 }
 
-static HRESULT WINAPI dx9mt_device_SetIndices(IDirect3DDevice9 *iface,
+static HRESULT WINAPI dx9mt_device_SetIndices_impl(IDirect3DDevice9 *iface,
                                                IDirect3DIndexBuffer9 *index_data) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   if (self->indices == index_data) {
@@ -5947,7 +6128,7 @@ static HRESULT WINAPI dx9mt_device_CreatePixelShader(
   return hr;
 }
 
-static HRESULT WINAPI dx9mt_device_SetPixelShader(IDirect3DDevice9 *iface,
+static HRESULT WINAPI dx9mt_device_SetPixelShader_impl(IDirect3DDevice9 *iface,
                                                    IDirect3DPixelShader9 *shader) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   if (self->pixel_shader == shader) {
@@ -5974,7 +6155,7 @@ static HRESULT WINAPI dx9mt_device_GetPixelShader(IDirect3DDevice9 *iface,
   return D3D_OK;
 }
 
-static HRESULT WINAPI dx9mt_device_SetPixelShaderConstantF(
+static HRESULT WINAPI dx9mt_device_SetPixelShaderConstantF_impl(
     IDirect3DDevice9 *iface, UINT reg_idx, const float *data, UINT count) {
   dx9mt_device *self = dx9mt_device_from_iface(iface);
   if (!data || reg_idx + count > DX9MT_MAX_SHADER_FLOAT_CONSTANTS) {
@@ -6039,6 +6220,92 @@ static HRESULT WINAPI dx9mt_device_GetPixelShaderConstantB(
 
   memcpy(data, &self->ps_const_b[reg_idx], count * sizeof(WINBOOL));
   return D3D_OK;
+}
+
+/*
+ * Timed wrappers around the hot state-setting entry points. The game issues
+ * thousands of these between draws; api_ms in the perf log separates their
+ * cost from genuine engine work (game_ms). The vtbl points at the wrappers.
+ */
+#define DX9MT_TIMED_API_BODY(call)                                            \
+  do {                                                                        \
+    uint64_t perf_api_t0 = dx9mt_perf_now();                                  \
+    HRESULT perf_api_hr = (call);                                             \
+    g_perf.api_ticks += dx9mt_perf_now() - perf_api_t0;                       \
+    ++g_perf.api_calls;                                                       \
+    return perf_api_hr;                                                       \
+  } while (0)
+
+static HRESULT WINAPI dx9mt_device_SetTransform(IDirect3DDevice9 *iface,
+                                                 D3DTRANSFORMSTATETYPE state,
+                                                 const D3DMATRIX *matrix) {
+  DX9MT_TIMED_API_BODY(dx9mt_device_SetTransform_impl(iface, state, matrix));
+}
+
+static HRESULT WINAPI dx9mt_device_SetRenderState(IDirect3DDevice9 *iface,
+                                                   D3DRENDERSTATETYPE state,
+                                                   DWORD value) {
+  DX9MT_TIMED_API_BODY(dx9mt_device_SetRenderState_impl(iface, state, value));
+}
+
+static HRESULT WINAPI dx9mt_device_SetTexture(IDirect3DDevice9 *iface,
+                                               DWORD stage,
+                                               IDirect3DBaseTexture9 *texture) {
+  DX9MT_TIMED_API_BODY(dx9mt_device_SetTexture_impl(iface, stage, texture));
+}
+
+static HRESULT WINAPI dx9mt_device_SetTextureStageState(
+    IDirect3DDevice9 *iface, DWORD stage, D3DTEXTURESTAGESTATETYPE type,
+    DWORD value) {
+  DX9MT_TIMED_API_BODY(
+      dx9mt_device_SetTextureStageState_impl(iface, stage, type, value));
+}
+
+static HRESULT WINAPI dx9mt_device_SetSamplerState(IDirect3DDevice9 *iface,
+                                                    DWORD sampler,
+                                                    D3DSAMPLERSTATETYPE type,
+                                                    DWORD value) {
+  DX9MT_TIMED_API_BODY(
+      dx9mt_device_SetSamplerState_impl(iface, sampler, type, value));
+}
+
+static HRESULT WINAPI dx9mt_device_SetVertexDeclaration(
+    IDirect3DDevice9 *iface, IDirect3DVertexDeclaration9 *decl) {
+  DX9MT_TIMED_API_BODY(dx9mt_device_SetVertexDeclaration_impl(iface, decl));
+}
+
+static HRESULT WINAPI dx9mt_device_SetVertexShader(IDirect3DDevice9 *iface,
+                                                    IDirect3DVertexShader9 *shader) {
+  DX9MT_TIMED_API_BODY(dx9mt_device_SetVertexShader_impl(iface, shader));
+}
+
+static HRESULT WINAPI dx9mt_device_SetVertexShaderConstantF(
+    IDirect3DDevice9 *iface, UINT reg_idx, const float *data, UINT count) {
+  DX9MT_TIMED_API_BODY(
+      dx9mt_device_SetVertexShaderConstantF_impl(iface, reg_idx, data, count));
+}
+
+static HRESULT WINAPI dx9mt_device_SetStreamSource(
+    IDirect3DDevice9 *iface, UINT stream_number,
+    IDirect3DVertexBuffer9 *stream_data, UINT offset_in_bytes, UINT stride) {
+  DX9MT_TIMED_API_BODY(dx9mt_device_SetStreamSource_impl(
+      iface, stream_number, stream_data, offset_in_bytes, stride));
+}
+
+static HRESULT WINAPI dx9mt_device_SetIndices(IDirect3DDevice9 *iface,
+                                               IDirect3DIndexBuffer9 *index_data) {
+  DX9MT_TIMED_API_BODY(dx9mt_device_SetIndices_impl(iface, index_data));
+}
+
+static HRESULT WINAPI dx9mt_device_SetPixelShader(IDirect3DDevice9 *iface,
+                                                   IDirect3DPixelShader9 *shader) {
+  DX9MT_TIMED_API_BODY(dx9mt_device_SetPixelShader_impl(iface, shader));
+}
+
+static HRESULT WINAPI dx9mt_device_SetPixelShaderConstantF(
+    IDirect3DDevice9 *iface, UINT reg_idx, const float *data, UINT count) {
+  DX9MT_TIMED_API_BODY(
+      dx9mt_device_SetPixelShaderConstantF_impl(iface, reg_idx, data, count));
 }
 
 static HRESULT WINAPI dx9mt_device_CreateQuery(IDirect3DDevice9 *iface,

@@ -21,7 +21,7 @@ export WINEPREFIX
 export WINEDLLOVERRIDES
 
 .DEFAULT_GOAL := run
-.PHONY: run show-logs analyze-logs test clear dx9mt-build dx9mt-test install-dx9mt-fnv configure-fnv-dx9mt-override show-fnv-dx9mt-override wine-restart
+.PHONY: run run-wined3d run-msync run-msync-wined3d show-logs analyze-logs test clear dx9mt-build dx9mt-test install-dx9mt-fnv configure-fnv-dx9mt-override show-fnv-dx9mt-override wine-restart
 
 wine-restart:
 	@echo "Restarting wineserver"; \
@@ -77,6 +77,68 @@ run: install-dx9mt-fnv
 	cd "$(FNV_DIR)" && \
 	MVK_CONFIG_LOG_LEVEL=0 DX9MT_LOG_PATH="$(DX9MT_RUNTIME_LOG)" WINEDLLOVERRIDES="$(WINEDLLOVERRIDES)" \
 	"$(WINE)" nvse_loader.exe 2>&1 | tee "$(DX9MT_RUNTIME_LOG)"
+
+# msync A/B: same game + dx9mt DLL, hosted in the CrossOver-FOSS 23.7.1 wine
+# build (LGPL sources published by CodeWeavers + the LGPL marzent msync
+# patch), which has the fast Mach-semaphore NT-sync path that upstream Wine
+# on macOS lacks. Uses its own prefix (Wine 8 core must not touch the Wine 11
+# prefix); the game dir is shared into it via symlink, saves/INI via the
+# host-Documents symlink. WINEMSYNC=1 is the switch under test.
+CX_WINE_DIR := $(CURDIR)/wine-crossover/Wine-Crossover-23.7.1-1/Contents/Resources/wine
+MSYNC_WINEPREFIX := $(CURDIR)/wineprefix-msync
+
+run-msync: dx9mt-build
+	@set -e; \
+	test -x "$(CX_WINE_DIR)/bin/wine" || (echo "missing wine-crossover at $(CX_WINE_DIR)" && exit 1); \
+	install -m 0644 "$(DX9MT_DLL)" "$(FNV_DIR)/d3d9.dll"; \
+	pkill -f dx9mt_metal_viewer 2>/dev/null || true; \
+	mkdir -p "$(DX9MT_OUTPUT_DIR)" "$(DX9MT_SESSION_DIR)-msync"; \
+	ln -sfn "$(DX9MT_SESSION_DIR)-msync" "$(DX9MT_LATEST_DIR)"; \
+	: > "$(DX9MT_SESSION_DIR)-msync/dx9mt_runtime.log"; \
+	echo "Session output dir: $(DX9MT_SESSION_DIR)-msync"; \
+	echo "Creating Metal IPC shared file"; \
+	dd if=/dev/zero of="$(DX9MT_METAL_IPC_FILE)" bs=1048576 count=256 >/dev/null 2>&1; \
+	if [ -x "$(DX9MT_METAL_VIEWER)" ]; then \
+		echo "Launching Metal viewer"; \
+		DX9MT_OUTPUT_DIR="$(DX9MT_SESSION_DIR)-msync" "$(DX9MT_METAL_VIEWER)" & \
+		echo "Metal viewer pid $$!"; \
+		sleep 1; \
+	fi; \
+	echo "Launching FNV via NVSE on wine-crossover 23.7.1 with WINEMSYNC=1"; \
+	cd "$(FNV_DIR)" && \
+	WINEPREFIX="$(MSYNC_WINEPREFIX)" WINEMSYNC=1 WINEESYNC=0 \
+	MVK_CONFIG_LOG_LEVEL=0 DX9MT_LOG_PATH="$(DX9MT_SESSION_DIR)-msync/dx9mt_runtime.log" \
+	WINEDLLOVERRIDES="dxsetup.exe=d" \
+	"$(CX_WINE_DIR)/bin/wine" nvse_loader.exe 2>&1 | tee -a "$(DX9MT_SESSION_DIR)-msync/dx9mt_runtime.log"
+
+# Head-to-head on the msync stack: builtin wined3d (GL path; the FOSS build
+# has no D3DMetal) on the same wine-crossover + WINEMSYNC=1 environment as
+# run-msync, so the only variable is the D3D9 layer.
+run-msync-wined3d:
+	@set -e; \
+	test -x "$(CX_WINE_DIR)/bin/wine" || (echo "missing wine-crossover at $(CX_WINE_DIR)" && exit 1); \
+	mkdir -p "$(DX9MT_OUTPUT_DIR)" "$(DX9MT_SESSION_DIR)-msync-wined3d"; \
+	echo "Session output dir: $(DX9MT_SESSION_DIR)-msync-wined3d"; \
+	echo "Launching FNV via NVSE on wine-crossover wined3d with WINEMSYNC=1"; \
+	cd "$(FNV_DIR)" && \
+	WINEPREFIX="$(MSYNC_WINEPREFIX)" WINEMSYNC=1 WINEESYNC=0 \
+	MVK_CONFIG_LOG_LEVEL=0 WINEDLLOVERRIDES="dxsetup.exe=d;d3d9=b" \
+	WINEDEBUG=-all,+timestamp,+fps \
+	"$(CX_WINE_DIR)/bin/wine" nvse_loader.exe 2>&1 | tee "$(DX9MT_SESSION_DIR)-msync-wined3d/wined3d_fps.log"
+
+# Baseline benchmark: run FNV on Wine's builtin d3d9 (wined3d) instead of
+# dx9mt. The env override outranks the registry AppDefaults entry, so the
+# installed native d3d9.dll is simply ignored. WINEDEBUG=+fps makes wined3d
+# log swapchain fps every ~1.5s; +timestamp prefixes wall-clock seconds so
+# tools/plot_fps.py can graph it.
+run-wined3d:
+	@set -e; \
+	mkdir -p "$(DX9MT_OUTPUT_DIR)" "$(DX9MT_SESSION_DIR)-wined3d"; \
+	echo "Session output dir: $(DX9MT_SESSION_DIR)-wined3d"; \
+	echo "Launching FNV via NVSE on builtin wined3d (fps log: $(DX9MT_SESSION_DIR)-wined3d/wined3d_fps.log)"; \
+	cd "$(FNV_DIR)" && \
+	MVK_CONFIG_LOG_LEVEL=0 WINEDLLOVERRIDES="dxsetup.exe=d;d3d9=b" WINEDEBUG=-all,+timestamp,+fps \
+	"$(WINE)" nvse_loader.exe 2>&1 | tee "$(DX9MT_SESSION_DIR)-wined3d/wined3d_fps.log"
 
 show-logs:
 	@echo "== dx9mt runtime log: $(DX9MT_RUNTIME_LOG) =="; \
